@@ -293,6 +293,27 @@ class PyodideCodeRunner {
             'conduitPyodideReady', false, String(e && e.message ? e.message : e));
         });
 
+      // Mirrors the Open WebUI browser worker: route matplotlib figures to a
+      // base64 data URI printed on stdout (the server detects these and turns
+      // them into uploaded images). Only applied when the snippet touches
+      // matplotlib so non-plot code stays lightweight.
+      const MPL_PREAMBLE = `
+import os
+import base64
+from io import BytesIO
+os.environ["MPLBACKEND"] = "AGG"
+import matplotlib.pyplot
+def show(*, block=None):
+    buf = BytesIO()
+    matplotlib.pyplot.savefig(buf, format="png")
+    buf.seek(0)
+    img_str = base64.b64encode(buf.read()).decode('utf-8')
+    matplotlib.pyplot.clf()
+    buf.close()
+    print(f"data:image/png;base64,{img_str}")
+matplotlib.pyplot.show = show
+`;
+
       window.__conduitRunPython = async (code) => {
         const pyodide = await readyPromise;
         let stdout = "";
@@ -302,6 +323,15 @@ class PyodideCodeRunner {
         pyodide.setStdout({ batched: (m) => { stdout += m + "\\n"; } });
         pyodide.setStderr({ batched: (m) => { stderr += m + "\\n"; } });
         try {
+          if (code.indexOf("matplotlib") !== -1) {
+            try {
+              await pyodide.loadPackage("matplotlib");
+              await pyodide.runPythonAsync(MPL_PREAMBLE);
+            } catch (e) {
+              // If matplotlib can't be loaded, fall through; the user's own
+              // import will surface the real error during execution.
+            }
+          }
           try {
             await pyodide.loadPackagesFromImports(code);
           } catch (e) {
