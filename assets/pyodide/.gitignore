@@ -1,0 +1,5 @@
+# Bundled Pyodide distribution is large (10 MB+ core, much more with packages)
+# and is fetched on demand via tool/fetch_pyodide.dart — do not commit binaries.
+*
+!.gitignore
+!README.md

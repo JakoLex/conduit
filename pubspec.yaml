@@ -133,6 +133,7 @@ flutter:
     - assets/flutter_tex.js
     - assets/flutter_tex.css
     - assets/vad/
+    - assets/pyodide/
 
   fonts:
     - family: Geist Sans
