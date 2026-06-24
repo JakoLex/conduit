@@ -78,7 +78,8 @@ class SettingsService {
       PreferenceKeys.notificationSoundAlways;
   static const String _notificationInAppBannerKey =
       PreferenceKeys.notificationInAppBanner;
-  static const String _notificationSystemKey = PreferenceKeys.notificationSystem;
+  static const String _notificationSystemKey =
+      PreferenceKeys.notificationSystem;
   static const String _notificationChatEnabledKey =
       PreferenceKeys.notificationChatEnabled;
   static const String _notificationChannelEnabledKey =
@@ -308,6 +309,12 @@ class SettingsService {
     await _putOrRemove(
       PreferenceKeys.ttsVoice,
       (settings.ttsVoice?.isNotEmpty ?? false) ? settings.ttsVoice : null,
+    );
+    await _putOrRemove(
+      PreferenceKeys.ttsVoiceName,
+      (settings.ttsVoiceName?.isNotEmpty ?? false)
+          ? settings.ttsVoiceName
+          : null,
     );
     await _putOrRemove(
       PreferenceKeys.ttsServerVoiceId,
@@ -607,7 +614,9 @@ class SettingsService {
       socketTransportMode:
           PreferencesStore.get<String>(_socketTransportModeKey) ?? 'ws',
       quickPills: PreferencesStore.getStringList(_quickPillsKey) ?? const [],
-      chatWebSearchEnabled: PreferencesStore.get<bool>(_chatWebSearchEnabledKey),
+      chatWebSearchEnabled: PreferencesStore.get<bool>(
+        _chatWebSearchEnabledKey,
+      ),
       chatImageGenerationEnabled: PreferencesStore.get<bool>(
         _chatImageGenerationEnabledKey,
       ),
@@ -616,13 +625,15 @@ class SettingsService {
       ),
       sendOnEnter: PreferencesStore.get<bool>(_sendOnEnterKey) ?? false,
       ttsVoice: PreferencesStore.get<String>(PreferenceKeys.ttsVoice),
+      ttsVoiceName: PreferencesStore.get<String>(PreferenceKeys.ttsVoiceName),
       ttsSpeechRate:
           PreferencesStore.get<num>(PreferenceKeys.ttsSpeechRate)?.toDouble() ??
           0.5,
       ttsPitch:
           PreferencesStore.get<num>(PreferenceKeys.ttsPitch)?.toDouble() ?? 1.0,
       ttsVolume:
-          PreferencesStore.get<num>(PreferenceKeys.ttsVolume)?.toDouble() ?? 1.0,
+          PreferencesStore.get<num>(PreferenceKeys.ttsVolume)?.toDouble() ??
+          1.0,
       ttsEngine: _parseTtsEngine(
         PreferencesStore.get<String>(PreferenceKeys.ttsEngine),
       ),
@@ -695,6 +706,7 @@ class AppSettings {
   final SttPreference sttPreference;
   final String? sttLanguageCode;
   final String? ttsVoice;
+  final String? ttsVoiceName;
   final double ttsSpeechRate;
   final double ttsPitch;
   final double ttsVolume;
@@ -733,6 +745,7 @@ class AppSettings {
     this.sttPreference = SttPreference.deviceOnly,
     this.sttLanguageCode,
     this.ttsVoice,
+    this.ttsVoiceName,
     this.ttsSpeechRate = 0.5,
     this.ttsPitch = 1.0,
     this.ttsVolume = 1.0,
@@ -772,6 +785,7 @@ class AppSettings {
     SttPreference? sttPreference,
     Object? sttLanguageCode = const _DefaultValue(),
     Object? ttsVoice = const _DefaultValue(),
+    Object? ttsVoiceName = const _DefaultValue(),
     double? ttsSpeechRate,
     double? ttsPitch,
     double? ttsVolume,
@@ -819,6 +833,9 @@ class AppSettings {
           ? this.sttLanguageCode
           : sttLanguageCode as String?,
       ttsVoice: ttsVoice is _DefaultValue ? this.ttsVoice : ttsVoice as String?,
+      ttsVoiceName: ttsVoiceName is _DefaultValue
+          ? this.ttsVoiceName
+          : ttsVoiceName as String?,
       ttsSpeechRate: ttsSpeechRate ?? this.ttsSpeechRate,
       ttsPitch: ttsPitch ?? this.ttsPitch,
       ttsVolume: ttsVolume ?? this.ttsVolume,
@@ -870,6 +887,7 @@ class AppSettings {
         other.sttLanguageCode == sttLanguageCode &&
         other.sendOnEnter == sendOnEnter &&
         other.ttsVoice == ttsVoice &&
+        other.ttsVoiceName == ttsVoiceName &&
         other.ttsSpeechRate == ttsSpeechRate &&
         other.ttsPitch == ttsPitch &&
         other.ttsVolume == ttsVolume &&
@@ -911,6 +929,7 @@ class AppSettings {
       sttLanguageCode,
       sendOnEnter,
       ttsVoice,
+      ttsVoiceName,
       ttsSpeechRate,
       ttsPitch,
       ttsVolume,
@@ -1172,6 +1191,16 @@ class AppSettingsNotifier extends _$AppSettingsNotifier {
     await SettingsService.saveSettings(state);
   }
 
+  Future<void> setTtsVoiceName(String? name) async {
+    state = state.copyWith(ttsVoiceName: name);
+    await SettingsService.saveSettings(state);
+  }
+
+  Future<void> setTtsDeviceVoiceSelection(String? id, String? name) async {
+    state = state.copyWith(ttsVoice: id, ttsVoiceName: name);
+    await SettingsService.saveSettings(state);
+  }
+
   Future<void> setTtsSpeechRate(double rate) async {
     state = state.copyWith(ttsSpeechRate: rate);
     await SettingsService.saveSettings(state);
@@ -1192,6 +1221,13 @@ class AppSettingsNotifier extends _$AppSettingsNotifier {
     await SettingsService.saveSettings(state);
   }
 
+  Future<void> setTtsEngineSelection(TtsEngine engine) async {
+    state = engine == TtsEngine.server
+        ? state.copyWith(ttsEngine: engine, ttsVoice: null, ttsVoiceName: null)
+        : state.copyWith(ttsEngine: engine);
+    await SettingsService.saveSettings(state);
+  }
+
   Future<void> setTtsServerVoiceName(String? name) async {
     state = state.copyWith(ttsServerVoiceName: name);
     await SettingsService.saveSettings(state);
@@ -1199,6 +1235,11 @@ class AppSettingsNotifier extends _$AppSettingsNotifier {
 
   Future<void> setTtsServerVoiceId(String? id) async {
     state = state.copyWith(ttsServerVoiceId: id);
+    await SettingsService.saveSettings(state);
+  }
+
+  Future<void> setTtsServerVoiceSelection(String? id, String? name) async {
+    state = state.copyWith(ttsServerVoiceId: id, ttsServerVoiceName: name);
     await SettingsService.saveSettings(state);
   }
 
