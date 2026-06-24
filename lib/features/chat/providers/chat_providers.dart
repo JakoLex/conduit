@@ -33,6 +33,7 @@ import '../../../core/services/settings_service.dart';
 import '../../../core/services/socket_service.dart';
 import '../../../core/services/streaming_response_controller.dart';
 import '../../../core/services/performance_profiler.dart';
+import '../../../core/services/pyodide_code_runner.dart';
 import '../../../core/services/worker_manager.dart';
 import '../../../core/utils/debug_logger.dart';
 import '../../../core/utils/json_normalization.dart';
@@ -4778,6 +4779,9 @@ Future<void> durableSend(
   final codeInterpreterEnabled =
       ref.read(codeInterpreterEnabledProvider) &&
       ref.read(codeInterpreterAvailableProvider);
+  if (codeInterpreterEnabled) {
+    PyodideCodeRunner.instance.warmUp();
+  }
 
   final existingMessages = ref.read(chatMessagesProvider);
   final parentId = _resolveOpenWebUiParentIdForNewUserMessage(existingMessages);
@@ -5610,6 +5614,11 @@ Future<void> _sendMessageInternal(
   final codeInterpreterEnabled =
       ref.read(codeInterpreterEnabledProvider) &&
       ref.read(codeInterpreterAvailableProvider);
+  if (codeInterpreterEnabled) {
+    // Boot the on-device Pyodide runtime now so it's ready before the model
+    // emits its first execute:python event.
+    PyodideCodeRunner.instance.warmUp();
+  }
 
   // Get selected toggle filter IDs
   final selectedFilterIds = ref.read(selectedFilterIdsProvider);

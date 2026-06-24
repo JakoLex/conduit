@@ -81,6 +81,11 @@ class CodeInterpreterEnabledNotifier extends Notifier<bool> {
           .read(appSettingsProvider.notifier)
           .setChatCodeInterpreterEnabled(value),
     );
+    // Pre-boot the on-device Pyodide runtime so the first execute:python
+    // event doesn't pay the cold-start cost while the server awaits the ack.
+    if (value) {
+      PyodideCodeRunner.instance.warmUp();
+    }
   }
 }
 

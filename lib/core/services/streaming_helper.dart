@@ -14,6 +14,7 @@ import '../../core/utils/tool_calls_parser.dart';
 import 'background_streaming_handler.dart';
 import 'chat_completion_transport.dart';
 import 'navigation_service.dart';
+import 'pyodide_code_runner.dart';
 
 import '../../shared/widgets/themed_dialogs.dart';
 import '../../shared/theme/theme_extensions.dart';
@@ -2887,6 +2888,43 @@ ActiveChatStream attachUnifiedChunkedStreaming({
             }();
           } else {
             ack(false);
+          }
+        }
+      } else if (type == 'execute:python' && payload != null) {
+        if (!matchesCurrentStreamSession(incomingSessionId)) {
+          return;
+        }
+        // Pyodide code-interpreter engine: the backend delegates Python
+        // execution to the client (same as the web app). Run it on-device via
+        // the headless Pyodide runtime and ack {stdout, stderr, result}.
+        if (ack != null) {
+          final map = _asStringMap(payload);
+          final code = map?['code']?.toString() ?? '';
+          DebugLogger.info(
+            'execute:python received',
+            scope: 'tools/pyodide',
+            data: {'codeChars': code.length},
+          );
+          if (code.trim().isEmpty) {
+            try {
+              ack(const PyodidePythonResult().toAck());
+            } catch (_) {}
+          } else {
+            () async {
+              final result = await PyodideCodeRunner.instance.run(code);
+              DebugLogger.info(
+                'execute:python completed',
+                scope: 'tools/pyodide',
+                data: {
+                  'stdoutChars': result.stdout.length,
+                  'stderrChars': result.stderr.length,
+                  'hasError': result.error != null,
+                },
+              );
+              try {
+                ack(result.toAck());
+              } catch (_) {}
+            }();
           }
         }
       } else if (type == 'execute' && payload != null) {
