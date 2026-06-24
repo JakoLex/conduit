@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import '../utils/debug_logger.dart';
@@ -38,6 +39,10 @@ class PyodidePythonResult {
 /// property of the pyodide code-interpreter engine while still producing real
 /// `stdout`/`stderr` in the native client.
 ///
+/// Pyodide is loaded from a bundled offline distribution under `assets/pyodide`
+/// when present (served via an in-app localhost server), otherwise from the
+/// jsDelivr CDN. See `tool/fetch_pyodide.dart` to populate the offline assets.
+///
 /// Execution is serialized: a single headless WebView hosts one Pyodide
 /// instance and runs snippets one at a time. A run that exceeds its timeout
 /// tears the WebView down (a runaway sync loop blocks the JS thread and cannot
@@ -49,10 +54,23 @@ class PyodideCodeRunner {
   static final PyodideCodeRunner instance = PyodideCodeRunner._();
 
   /// Pinned Pyodide release. Bump deliberately — the indexURL is derived from
-  /// the script location so the version must exist on the jsDelivr CDN.
+  /// the script location so the version must exist on the jsDelivr CDN (and,
+  /// for offline use, the bundled assets must match this version). Keep in sync
+  /// with `tool/fetch_pyodide.dart`.
   static const String _pyodideVersion = 'v0.26.4';
   static const String _cdnBase =
       'https://cdn.jsdelivr.net/pyodide/$_pyodideVersion/full/';
+
+  /// Flutter asset directory holding a bundled Pyodide distribution. Populated
+  /// by `tool/fetch_pyodide.dart`; absent by default (the runtime then falls
+  /// back to [_cdnBase]).
+  static const String _assetDir = 'assets/pyodide';
+  static const String _assetProbe = '$_assetDir/pyodide.js';
+
+  /// Port for the in-app localhost server that serves the bundled assets to the
+  /// WebView (Pyodide resolves its wasm/stdlib relative to the page origin, so
+  /// the assets must be reachable over http, not file://).
+  static const int _localhostPort = 8459;
 
   static const Duration _defaultTimeout = Duration(seconds: 60);
   static const Duration _bootTimeout = Duration(seconds: 90);
@@ -60,6 +78,13 @@ class PyodideCodeRunner {
   HeadlessInAppWebView? _webView;
   InAppWebViewController? _controller;
   Completer<void>? _ready;
+
+  InAppLocalhostServer? _localhostServer;
+  String? _resolvedBaseUrl;
+
+  /// Set when booting from bundled localhost assets fails, pinning all
+  /// subsequent boots to the CDN for the rest of the process.
+  bool _forceCdn = false;
 
   /// Serializes runs so a single Pyodide instance handles one snippet at a
   /// time. Chained so the next run waits for the previous to settle.
@@ -169,6 +194,62 @@ class PyodideCodeRunner {
     }
   }
 
+  /// Resolves the origin Pyodide is loaded from. Prefers a bundled offline
+  /// distribution under [_assetDir] (served over an in-app localhost server);
+  /// transparently falls back to the jsDelivr CDN when the assets are absent
+  /// or the localhost server can't start. Cached after the first resolution.
+  Future<String> _resolveBaseUrl() async {
+    final cached = _resolvedBaseUrl;
+    if (cached != null) return cached;
+
+    String base = _cdnBase;
+    if (!_forceCdn && await _hasBundledAssets()) {
+      try {
+        // Empty documentRoot so the served path equals the rootBundle asset
+        // key exactly: the server loads `documentRoot + uriPathWithoutSlash`,
+        // and `'' + 'assets/pyodide/pyodide.js'` is the real asset key (the
+        // default './' would yield './assets/...', which rootBundle rejects).
+        final server = InAppLocalhostServer(
+          port: _localhostPort,
+          documentRoot: '',
+        );
+        await server.start();
+        _localhostServer = server;
+        base = 'http://localhost:$_localhostPort/$_assetDir/';
+        DebugLogger.info(
+          'pyodide using bundled offline assets',
+          scope: 'tools/pyodide',
+          data: {'baseUrl': base},
+        );
+      } catch (error) {
+        DebugLogger.warning(
+          'pyodide-localhost-start-failed',
+          scope: 'tools/pyodide',
+          data: {'error': error.toString()},
+        );
+        base = _cdnBase;
+      }
+    } else {
+      DebugLogger.info(
+        'pyodide using CDN (no bundled assets)',
+        scope: 'tools/pyodide',
+        data: {'baseUrl': base},
+      );
+    }
+
+    _resolvedBaseUrl = base;
+    return base;
+  }
+
+  Future<bool> _hasBundledAssets() async {
+    try {
+      await rootBundle.load(_assetProbe);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<InAppWebViewController> _ensureReady() async {
     final existingController = _controller;
     final existingReady = _ready;
@@ -189,10 +270,12 @@ class PyodideCodeRunner {
     final ready = Completer<void>();
     _ready = ready;
 
+    final baseUrl = await _resolveBaseUrl();
+
     final webView = HeadlessInAppWebView(
       initialData: InAppWebViewInitialData(
         data: _bootstrapHtml,
-        baseUrl: WebUri(_cdnBase),
+        baseUrl: WebUri(baseUrl),
         mimeType: 'text/html',
         encoding: 'utf8',
       ),
@@ -240,8 +323,23 @@ class PyodideCodeRunner {
         scope: 'tools/pyodide',
         error: error,
         stackTrace: stackTrace,
+        data: {'baseUrl': baseUrl},
       );
       await _teardown();
+      // If booting from bundled localhost assets failed (e.g. Android cleartext
+      // policy blocks http://localhost), permanently fall back to the CDN so
+      // the next attempt doesn't keep hitting the same wall.
+      if (baseUrl != _cdnBase) {
+        _forceCdn = true;
+        _resolvedBaseUrl = null;
+        final server = _localhostServer;
+        _localhostServer = null;
+        if (server != null) {
+          try {
+            await server.close();
+          } catch (_) {}
+        }
+      }
       rethrow;
     }
 
@@ -264,13 +362,25 @@ class PyodideCodeRunner {
     }
   }
 
-  /// Releases the hidden WebView and Pyodide runtime. Safe to call when idle;
-  /// the next [run] transparently re-boots.
-  Future<void> dispose() => _teardown();
+  /// Releases the hidden WebView, Pyodide runtime, and the bundled-asset
+  /// localhost server. Safe to call when idle; the next [run] transparently
+  /// re-boots.
+  Future<void> dispose() async {
+    await _teardown();
+    final server = _localhostServer;
+    _localhostServer = null;
+    _resolvedBaseUrl = null;
+    if (server != null) {
+      try {
+        await server.close();
+      } catch (_) {}
+    }
+  }
 
-  /// HTML document hosting Pyodide. Served from [_cdnBase] so `pyodide.js` and
-  /// its assets resolve same-origin (no CORS) and `loadPyodide()` auto-detects
-  /// its indexURL. Exposes `window.__conduitRunPython(code)` returning
+  /// HTML document hosting Pyodide. Served from the resolved base URL (bundled
+  /// localhost assets or [_cdnBase]) so `pyodide.js` and its assets resolve
+  /// same-origin (no CORS) and `loadPyodide()` auto-detects its indexURL.
+  /// Exposes `window.__conduitRunPython(code)` returning
   /// `{stdout, stderr, result, error}`.
   static const String _bootstrapHtml = '''
 <!DOCTYPE html>
