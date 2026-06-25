@@ -578,6 +578,19 @@ class InlineRenderer {
       return const <InlineSpan>[];
     }
 
+    // Safety net: a LaTeX placeholder can reach a raw-text path — e.g. inside
+    // emphasis/strong/del (rendered via `_renderStyled` → textContent), link
+    // labels, or mentions — where it would otherwise leak as the literal
+    // `LATEX_INLINE_n` token. Restore it here, keeping the inherited
+    // (italic/bold/…) style on the surrounding text.
+    if (latexPreprocessor.containsPlaceholder(text)) {
+      return _renderRawWithPlaceholders(text, currentStyle);
+    }
+
+    return _renderPlainSpan(text, currentStyle);
+  }
+
+  List<InlineSpan> _renderPlainSpan(String text, TextStyle currentStyle) {
     // Always emit a single opacity-1 base span. The streaming fade is reapplied
     // later by [applyFadeOpacity] using the recorded range, so the offset walk
     // here stays decoupled from any opacity decision while remaining
@@ -592,6 +605,40 @@ class InlineRenderer {
       isWidgetSpan: false,
     );
     return [span];
+  }
+
+  /// Renders [text] containing LaTeX placeholder tokens into interleaved text
+  /// spans (in [currentStyle]) and LaTeX widget spans. Text segments use
+  /// [_renderPlainSpan] directly to avoid re-entering the placeholder check.
+  List<InlineSpan> _renderRawWithPlaceholders(
+    String text,
+    TextStyle currentStyle,
+  ) {
+    final segments = latexPreprocessor.splitOnPlaceholders(text);
+    final spans = <InlineSpan>[];
+    for (final segment in segments) {
+      if (!segment.isLatex) {
+        if (segment.content.isNotEmpty) {
+          spans.addAll(_renderPlainSpan(segment.content, currentStyle));
+        }
+        continue;
+      }
+      // Keep the streaming-fade offset aligned with the document-wide
+      // textContent coordinate space, which still holds the placeholder token.
+      _visibleTextOffset += segment.placeholderLength;
+      spans.add(
+        WidgetSpan(
+          alignment: PlaceholderAlignment.middle,
+          child: LatexPreprocessor.buildLatexWidget(
+            segment.content,
+            textStyle: currentStyle,
+            isBlock: segment.isBlock,
+            startupFuture: latexStartupFuture,
+          ),
+        ),
+      );
+    }
+    return spans;
   }
 
   WidgetSpan _buildFadableWidgetSpan({
