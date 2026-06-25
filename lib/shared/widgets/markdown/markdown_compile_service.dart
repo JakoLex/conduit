@@ -642,6 +642,7 @@ CompiledMarkdownNode _compileNodeFromMarkdownNode(
           ? _buildCompiledDetailsData(
               attributes: attributes,
               children: compiledChildren,
+              latexPreprocessor: latexPreprocessor,
             )
           : null,
       attributes: attributes,
@@ -934,6 +935,7 @@ CompiledMarkdownDetailsBlock _buildCompiledDetailsBlock(
 CompiledMarkdownDetailsData _buildCompiledDetailsData({
   required Map<String, String> attributes,
   required List<CompiledMarkdownNode> children,
+  required LatexPreprocessor latexPreprocessor,
 }) {
   var summaryText = '';
   var bodyStartIndex = 0;
@@ -941,12 +943,19 @@ CompiledMarkdownDetailsData _buildCompiledDetailsData({
   if (children.isNotEmpty) {
     final firstChild = children.first;
     if (firstChild is CompiledMarkdownElement && firstChild.tag == 'summary') {
-      summaryText = firstChild.textContent.trim();
+      // Restore LaTeX placeholders: the summary is shown as raw text and the
+      // body is re-compiled in isolation, so orphaned tokens would otherwise
+      // leak as `LATEX_INLINE_n`.
+      summaryText = latexPreprocessor
+          .restorePlaceholders(firstChild.textContent)
+          .trim();
       bodyStartIndex = 1;
     }
   }
 
-  final bodyMarkdown = _decodeDetailAttribute(attributes['body_markdown']);
+  final bodyMarkdown = latexPreprocessor.restorePlaceholders(
+    _decodeDetailAttribute(attributes['body_markdown']),
+  );
   final type = attributes['type']?.trim() ?? '';
   final name = attributes['name']?.trim() ?? '';
   final done = attributes['done'];

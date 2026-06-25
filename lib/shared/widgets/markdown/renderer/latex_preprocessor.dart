@@ -147,6 +147,30 @@ class LatexPreprocessor {
   bool containsPlaceholder(String text) =>
       text.contains(_blockPrefix) || text.contains(_inlinePrefix);
 
+  /// Restores placeholder tokens in [text] back to dollar-delimited LaTeX
+  /// (`$tex$` for inline, `$$tex$$` for block).
+  ///
+  /// Needed when a substring of the extracted document is captured and later
+  /// re-compiled by a *different* [LatexPreprocessor] — e.g. the body and
+  /// summary of reasoning / tool-call `<details>` blocks, whose markdown is
+  /// re-parsed in [LatexPreprocessor]-unaware isolation. Without this, those
+  /// nested placeholders are orphaned (the new preprocessor never registered
+  /// their keys) and leak as raw `LATEX_INLINE_n` text. Restoring lets the
+  /// re-compile re-extract the original expressions cleanly.
+  String restorePlaceholders(String text) {
+    if (!containsPlaceholder(text)) {
+      return text;
+    }
+    var result = text;
+    _blockExpressions.forEach((key, tex) {
+      result = result.replaceAll(key, '\$\$$tex\$\$');
+    });
+    _inlineExpressions.forEach((key, tex) {
+      result = result.replaceAll(key, '\$$tex\$');
+    });
+    return result;
+  }
+
   /// Splits [text] on LaTeX placeholders into segments.
   ///
   /// Each segment is either plain text or a LaTeX expression
