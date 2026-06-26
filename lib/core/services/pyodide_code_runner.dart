@@ -72,8 +72,13 @@ class PyodideCodeRunner {
   /// the assets must be reachable over http, not file://).
   static const int _localhostPort = 8459;
 
-  static const Duration _defaultTimeout = Duration(seconds: 60);
-  static const Duration _bootTimeout = Duration(seconds: 90);
+  // Overall deadline for a single execution (boot + run). Kept under the
+  // server's event-call timeout so we always ack a result rather than letting
+  // the request lapse into a "Client Session disconnected" error.
+  static const Duration _defaultTimeout = Duration(seconds: 40);
+  // Internal boot guard for warm-up (which runs outside [_runLocked]'s
+  // deadline). Kept at/under the run deadline.
+  static const Duration _bootTimeout = Duration(seconds: 38);
 
   HeadlessInAppWebView? _webView;
   InAppWebViewController? _controller;
@@ -142,45 +147,25 @@ class PyodideCodeRunner {
     }
 
     try {
-      final controller = await _ensureReady();
-      final callResult = await controller
-          .callAsyncJavaScript(
-            functionBody: 'return await window.__conduitRunPython(code);',
-            arguments: <String, dynamic>{'code': code},
-          )
-          .timeout(timeout);
-
-      if (callResult == null) {
-        return const PyodidePythonResult(
-          stderr: 'Python execution returned no result.\n',
-          error: 'no-result',
-        );
-      }
-      if (callResult.error != null) {
-        final message = callResult.error.toString();
-        return PyodidePythonResult(stderr: '$message\n', error: message);
-      }
-
-      final value = callResult.value;
-      final map = value is Map ? value : const <dynamic, dynamic>{};
-      return PyodidePythonResult(
-        stdout: map['stdout']?.toString() ?? '',
-        stderr: map['stderr']?.toString() ?? '',
-        result: map['result'],
-        error: map['error']?.toString(),
-      );
+      // The timeout wraps the WHOLE operation — boot (which may fetch ~10 MB of
+      // Pyodide from the CDN) AND execution — so we always ack the server before
+      // its own call times out. Otherwise the server reports the request as a
+      // dead session ("Client Session disconnected") in the code output.
+      return await _execute(code).timeout(timeout);
     } on TimeoutException {
-      // A runaway snippet blocks the JS thread; discard the instance so the
-      // next run boots a clean one.
+      // Boot or a runaway snippet exceeded the deadline; discard the instance so
+      // the next run starts clean, and return a clear, actionable error.
       await _teardown();
-      final message =
-          'Python execution timed out after ${timeout.inSeconds}s.';
       DebugLogger.warning(
         'pyodide-run-timeout',
         scope: 'tools/pyodide',
         data: {'timeoutSeconds': timeout.inSeconds},
       );
-      return PyodidePythonResult(stderr: '$message\n', error: message);
+      final message =
+          'Python did not respond within ${timeout.inSeconds}s. The on-device '
+          'runtime may be unable to download Pyodide (check connectivity, or '
+          'bundle it offline via tool/fetch_pyodide.dart).';
+      return PyodidePythonResult(stderr: '$message\n', error: 'timeout');
     } catch (error, stackTrace) {
       await _teardown();
       DebugLogger.error(
@@ -192,6 +177,36 @@ class PyodideCodeRunner {
       final message = 'Python execution failed: $error';
       return PyodidePythonResult(stderr: '$message\n', error: message);
     }
+  }
+
+  /// Boots the runtime if needed and runs [code], returning the parsed result.
+  /// Wrapped in a deadline by [_runLocked].
+  Future<PyodidePythonResult> _execute(String code) async {
+    final controller = await _ensureReady();
+    final callResult = await controller.callAsyncJavaScript(
+      functionBody: 'return await window.__conduitRunPython(code);',
+      arguments: <String, dynamic>{'code': code},
+    );
+
+    if (callResult == null) {
+      return const PyodidePythonResult(
+        stderr: 'Python execution returned no result.\n',
+        error: 'no-result',
+      );
+    }
+    if (callResult.error != null) {
+      final message = callResult.error.toString();
+      return PyodidePythonResult(stderr: '$message\n', error: message);
+    }
+
+    final value = callResult.value;
+    final map = value is Map ? value : const <dynamic, dynamic>{};
+    return PyodidePythonResult(
+      stdout: map['stdout']?.toString() ?? '',
+      stderr: map['stderr']?.toString() ?? '',
+      result: map['result'],
+      error: map['error']?.toString(),
+    );
   }
 
   /// Resolves the origin Pyodide is loaded from. Prefers a bundled offline

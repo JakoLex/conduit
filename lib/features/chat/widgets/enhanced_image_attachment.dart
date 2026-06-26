@@ -772,6 +772,13 @@ class _EnhancedImageAttachmentState
       return (value * devicePixelRatio).round().clamp(64, 2048);
     }
 
+    // For aspect-preserving fits (e.g. BoxFit.contain), constrain only the
+    // width so the decoder keeps the image's native ratio. Setting BOTH cache
+    // dimensions forces a decode to exactly that box, distorting the bitmap.
+    if (widget.fit != BoxFit.cover) {
+      return (width: normalize(constraints.maxWidth), height: null);
+    }
+
     return (
       width: normalize(constraints.maxWidth),
       height: normalize(constraints.maxHeight),
