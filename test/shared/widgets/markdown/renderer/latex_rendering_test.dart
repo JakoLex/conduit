@@ -168,7 +168,7 @@ void main() {
     );
     await tester.pump();
 
-    expect(find.textContaining('LATEX_INLINE'), findsNothing);
+    expect(find.textContaining('LATEXINLINE'), findsNothing);
     expect(find.text('c_1'), findsOneWidget);
     expect(find.text('c_2'), findsOneWidget);
   });
@@ -179,7 +179,7 @@ void main() {
     await tester.pumpWidget(buildHarness(r'see **bold $a_1$ text** end'));
     await tester.pump();
 
-    expect(find.textContaining('LATEX_INLINE'), findsNothing);
+    expect(find.textContaining('LATEXINLINE'), findsNothing);
     expect(find.text('a_1'), findsOneWidget);
   });
 }

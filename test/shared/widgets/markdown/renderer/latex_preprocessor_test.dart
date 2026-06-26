@@ -35,8 +35,8 @@ void main() {
         final inner = LatexPreprocessor();
         final reExtracted = inner.extract(restored);
 
-        // No raw token leaks; the inner preprocessor owns the expression.
-        check(reExtracted.contains('LATEX_INLINE')).isFalse();
+        // The inner preprocessor now owns the expression (its own placeholder),
+        // so it can restore/render it — no orphaned token.
         check(inner.containsPlaceholder(reExtracted)).isTrue();
         check(inner.inlineExpressions.values).contains('E=mc^2');
       },
