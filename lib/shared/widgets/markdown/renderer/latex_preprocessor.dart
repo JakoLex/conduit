@@ -1,4 +1,7 @@
+import 'package:adaptive_platform_ui/adaptive_platform_ui.dart';
+import 'package:conduit/l10n/app_localizations.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_tex/flutter_tex.dart';
 
 import '../../jovial_svg_image.dart';
@@ -279,7 +282,10 @@ class LatexPreprocessor {
             },
           );
 
-    return _wrapLatexWidget(math, isBlock: isBlock);
+    return _CopyableLatex(
+      tex: tex,
+      child: _wrapLatexWidget(math, isBlock: isBlock),
+    );
   }
 
   static Widget _wrapLatexWidget(Widget child, {required bool isBlock}) {
@@ -306,6 +312,38 @@ class LatexPreprocessor {
     if (match == null) return fontSize * 1.5;
     final exValue = double.tryParse(match.group(1)!) ?? 1.5;
     return exValue * fontSize * 0.5;
+  }
+}
+
+/// Wraps a rendered LaTeX widget so tapping it copies the LaTeX source to the
+/// clipboard (matching Open WebUI), with a brief confirmation toast.
+class _CopyableLatex extends StatelessWidget {
+  const _CopyableLatex({required this.tex, required this.child});
+
+  final String tex;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => _copy(context),
+      child: child,
+    );
+  }
+
+  void _copy(BuildContext context) {
+    final trimmed = tex.trim();
+    if (trimmed.isEmpty) return;
+    Clipboard.setData(ClipboardData(text: trimmed));
+    if (!context.mounted) return;
+    final l10n = AppLocalizations.of(context);
+    AdaptiveSnackBar.show(
+      context,
+      message: l10n?.copiedToClipboard ?? 'Copied to clipboard',
+      type: AdaptiveSnackBarType.success,
+      duration: const Duration(seconds: 2),
+    );
   }
 }
 

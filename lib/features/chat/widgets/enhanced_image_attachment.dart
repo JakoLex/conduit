@@ -544,6 +544,11 @@ class EnhancedImageAttachment extends ConsumerStatefulWidget {
   final bool disableAnimation;
   final Map<String, String>? httpHeaders;
 
+  /// How the bitmap is fitted into its box. Defaults to [BoxFit.cover] (used by
+  /// uniform multi-image grids); pass [BoxFit.contain] to preserve the image's
+  /// original aspect ratio (no cropping) for single, full-size attachments.
+  final BoxFit fit;
+
   const EnhancedImageAttachment({
     super.key,
     required this.attachmentId,
@@ -553,6 +558,7 @@ class EnhancedImageAttachment extends ConsumerStatefulWidget {
     this.isUserMessage = false,
     this.disableAnimation = false,
     this.httpHeaders,
+    this.fit = BoxFit.cover,
   });
 
   @override
@@ -962,7 +968,7 @@ class _EnhancedImageAttachmentState
     final imageWidget = CachedNetworkImage(
       key: ValueKey('image_${widget.attachmentId}'),
       imageUrl: _cachedImageData!,
-      fit: BoxFit.cover,
+      fit: widget.fit,
       cacheManager: cacheManager,
       httpHeaders: headers,
       memCacheWidth: dimensions.width,
@@ -1019,7 +1025,7 @@ class _EnhancedImageAttachmentState
     final imageWidget = Image.memory(
       key: ValueKey('image_${widget.attachmentId}'),
       bytes,
-      fit: BoxFit.cover,
+      fit: widget.fit,
       cacheWidth: dimensions.width,
       cacheHeight: dimensions.height,
       gaplessPlayback: true, // Prevents flashing during rebuilds
