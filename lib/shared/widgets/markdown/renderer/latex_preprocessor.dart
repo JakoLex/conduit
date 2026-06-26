@@ -47,8 +47,13 @@ class LatexPreprocessor {
   // Use zero-width spaces to avoid collisions with real
   // content. The prefix distinguishes block from inline.
 
-  static const _blockPrefix = '\u200B\u200BLATEX_BLOCK_';
-  static const _inlinePrefix = '\u200B\u200BLATEX_INLINE_';
+  // Placeholder tokens deliberately contain NO markdown-special characters
+  // (no `_`, `*`, etc). Underscores previously caused the markdown parser to
+  // tokenize the placeholder at the `_` positions while resolving emphasis
+  // (`*...*` / `**...**`), splitting it into fragments that no longer matched a
+  // known key, so inline math inside italic/bold leaked as the raw token.
+  static const _blockPrefix = '\u200B\u200BLATEXBLOCK';
+  static const _inlinePrefix = '\u200B\u200BLATEXINLINE';
   static const _suffix = '\u200B\u200B';
 
   // -- Pre-compiled regex patterns --
