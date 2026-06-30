@@ -31,6 +31,7 @@ import 'features/chat/providers/chat_providers.dart' show restoreDefaultModel;
 import 'features/tools/providers/tools_providers.dart';
 import 'core/utils/debug_logger.dart';
 import 'core/utils/system_ui_style.dart';
+import 'shared/widgets/markdown/renderer/latex_rendering_server.dart';
 import 'core/models/tool.dart';
 
 import 'package:conduit/l10n/app_localizations.dart';
@@ -731,6 +732,11 @@ class _ConduitAppState extends ConsumerState<ConduitApp> {
   void _initializeAppState() {
     DebugLogger.auth('init', scope: 'app');
     ref.read(appStartupFlowProvider.notifier).start();
+    // Warm the MathJax rendering server now (post first-frame) so LaTeX is
+    // ready before the first formula is shown. Without this the server starts
+    // lazily during the first render and the initial formulas could fall back
+    // to raw source until the app was restarted.
+    LatexRenderingServer.prewarm();
   }
 
   @override
