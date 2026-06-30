@@ -1,6 +1,13 @@
 {
   "@@locale": "ja",
   "appTitle": "Conduit",
+  "serverIncompatibleTitle": "サーバーは未対応です",
+  "serverIncompatibleMessage": "このサーバーは Open WebUI {serverVersion} を実行しており、このアプリが対応するバージョン（{maxVersion} まで）よりも新しいバージョンです。",
+  "serverIncompatibleResolution": "続行するには、サーバーを {maxVersion} 以前にダウングレードするか、対応を追加するアプリの更新をお待ちください。",
+  "serverIncompatibleConnectBlocked": "このサーバーは、このアプリが対応するバージョン（{maxVersion} まで）よりも新しいバージョンです。",
+  "serverIncompatibleRecheck": "サーバーを再確認",
+  "serverIncompatibleSwitchServer": "別のサーバーを使用",
+  "serverIncompatibleStillUnsupported": "このサーバーは、まだこのアプリが対応するバージョンよりも新しいバージョンです。",
   "@appTitle": {
     "description": "Application name displayed in the app and OS UI."
   },
@@ -1441,7 +1448,7 @@
   "@sttTranscriptionLanguage": {
     "description": "Title for the server speech-to-text language setting."
   },
-  "sttTranscriptionLanguageDescription": "Auto ではこのデバイスの言語を使用します。必要に応じて pl などのコードを入力してください。",
+  "sttTranscriptionLanguageDescription": "Auto ではこのデバイスの言語を使用します。必要に応じて en などのコードを入力してください。",
   "@sttTranscriptionLanguageDescription": {
     "description": "Description for the server speech-to-text language setting."
   },
@@ -1453,11 +1460,11 @@
   "@sttTranscriptionLanguageCustom": {
     "description": "Option label for entering an explicit speech-to-text language code."
   },
-  "sttTranscriptionLanguagePlaceholder": "ISO-639-1 コード（例: pl）",
+  "sttTranscriptionLanguagePlaceholder": "ISO-639-1 コード（例: en）",
   "@sttTranscriptionLanguagePlaceholder": {
     "description": "Placeholder for entering a two-letter speech-to-text language code."
   },
-  "sttTranscriptionLanguageInvalid": "pl などの 2 文字の言語コードを使用してください。",
+  "sttTranscriptionLanguageInvalid": "en などの 2 文字の言語コードを使用してください。",
   "@sttTranscriptionLanguageInvalid": {
     "description": "Validation message for invalid speech-to-text language codes."
   },

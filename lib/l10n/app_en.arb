@@ -29,6 +29,56 @@
   "@connectionIssueSubtitle": {
     "description": "Subtitle explaining available actions when the server cannot be reached"
   },
+  "serverIncompatibleTitle": "Server not supported",
+  "@serverIncompatibleTitle": {
+    "description": "Title shown when the connected Open WebUI server is newer than the app supports"
+  },
+  "serverIncompatibleMessage": "This server runs Open WebUI {serverVersion}, which is newer than this app supports (up to {maxVersion}).",
+  "@serverIncompatibleMessage": {
+    "description": "Explains that the server version is too new for the current app build",
+    "placeholders": {
+      "serverVersion": {
+        "type": "String",
+        "example": "0.11.0"
+      },
+      "maxVersion": {
+        "type": "String",
+        "example": "0.10.1"
+      }
+    }
+  },
+  "serverIncompatibleResolution": "To continue, downgrade your server to {maxVersion} or earlier, or wait for an app update that adds support.",
+  "@serverIncompatibleResolution": {
+    "description": "Tells the user how to resolve an unsupported server version",
+    "placeholders": {
+      "maxVersion": {
+        "type": "String",
+        "example": "0.10.1"
+      }
+    }
+  },
+  "serverIncompatibleConnectBlocked": "This server is newer than this app supports (up to {maxVersion}).",
+  "@serverIncompatibleConnectBlocked": {
+    "description": "Inline error on the connection form when the probed server version is too new",
+    "placeholders": {
+      "maxVersion": {
+        "type": "String",
+        "example": "0.10.1"
+      }
+    }
+  },
+  "serverIncompatibleRecheck": "Recheck server",
+  "@serverIncompatibleRecheck": {
+    "description": "Button that re-fetches the server version after a downgrade"
+  },
+  "serverIncompatibleSwitchServer": "Use a different server",
+  "@serverIncompatibleSwitchServer": {
+    "description": "Button that lets the user connect to a different server from the incompatibility gate"
+  },
+  "serverIncompatibleStillUnsupported": "This server is still newer than this app supports.",
+  "@serverIncompatibleStillUnsupported": {
+    "description": "Status shown after a recheck when the server version is still too new"
+  },
   "@pleaseCheckConnection": {
     "description": "Generic connectivity hint after an error."
   },
@@ -1449,23 +1499,23 @@
   "@sttTranscriptionLanguage": {
     "description": "Title for the server speech-to-text language setting."
   },
-  "sttTranscriptionLanguageDescription": "Use Auto to follow this device's language, or enter a code such as pl.",
+  "sttTranscriptionLanguageDescription": "Use Auto-detect to let the server infer the spoken language, or enter a code such as en.",
   "@sttTranscriptionLanguageDescription": {
     "description": "Description for the server speech-to-text language setting."
   },
-  "sttTranscriptionLanguageAuto": "Auto",
+  "sttTranscriptionLanguageAuto": "Auto-detect",
   "@sttTranscriptionLanguageAuto": {
-    "description": "Option label for using the device language as the server speech-to-text language hint."
+    "description": "Option label for omitting the server speech-to-text language hint so the backend auto-detects the spoken language."
   },
   "sttTranscriptionLanguageCustom": "Custom language code",
   "@sttTranscriptionLanguageCustom": {
     "description": "Option label for entering an explicit speech-to-text language code."
   },
-  "sttTranscriptionLanguagePlaceholder": "ISO-639-1 code, e.g. pl",
+  "sttTranscriptionLanguagePlaceholder": "ISO-639-1 code, e.g. en",
   "@sttTranscriptionLanguagePlaceholder": {
     "description": "Placeholder for entering a two-letter speech-to-text language code."
   },
-  "sttTranscriptionLanguageInvalid": "Use a two-letter language code like pl.",
+  "sttTranscriptionLanguageInvalid": "Use a two-letter language code like en.",
   "@sttTranscriptionLanguageInvalid": {
     "description": "Validation message for invalid speech-to-text language codes."
   },
