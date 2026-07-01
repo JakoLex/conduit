@@ -5,17 +5,17 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   group('ServerVersionCompat.isSupported', () {
     test('the max supported version itself is supported', () {
-      check(ServerVersionCompat.isSupported('0.10.1')).isTrue();
+      check(ServerVersionCompat.isSupported('0.10.2')).isTrue();
     });
 
     test('older versions are supported', () {
-      for (final v in ['0.10.0', '0.9.9', '0.6.5', '0.1.0', '0.0.1']) {
+      for (final v in ['0.10.1', '0.10.0', '0.9.9', '0.6.5', '0.1.0', '0.0.1']) {
         check(because: v, ServerVersionCompat.isSupported(v)).isTrue();
       }
     });
 
     test('newer patch / minor / major versions are unsupported', () {
-      for (final v in ['0.10.2', '0.11.0', '0.20.0', '1.0.0', '2.5.3']) {
+      for (final v in ['0.10.3', '0.11.0', '0.20.0', '1.0.0', '2.5.3']) {
         check(because: v, ServerVersionCompat.isSupported(v)).isFalse();
       }
     });
