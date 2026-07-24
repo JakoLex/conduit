@@ -108,6 +108,7 @@ class VoiceInputService {
   bool _usingServerStt = false;
   bool _usingNativeLocalStt = false;
   bool _nativeAccumulateResultsForCurrentListen = true;
+  String? _configuredLocaleId;
   String? _selectedLocaleId;
   List<LocaleName> _locales = const [];
   bool _usingFallbackLocales = false;
@@ -140,6 +141,11 @@ class VoiceInputService {
   Timer? _nativeDictationSettleTimer;
 
   bool get isSupportedPlatform => Platform.isAndroid || Platform.isIOS;
+  @protected
+  bool get usesAutomaticNativeLanguage => Platform.isAndroid;
+  @protected
+  String get deviceLocaleTag =>
+      WidgetsBinding.instance.platformDispatcher.locale.toLanguageTag();
   bool get hasServerStt => _api != null;
   SttPreference get preference => _preference;
   bool get prefersServerOnly => _preference == SttPreference.serverOnly;
@@ -159,9 +165,9 @@ class VoiceInputService {
 
   Future<bool> initialize({bool forceLocalStt = false}) async {
     if (!isSupportedPlatform) return false;
-    final deviceTag = WidgetsBinding.instance.platformDispatcher.locale
-        .toLanguageTag();
+    final deviceTag = deviceLocaleTag;
     _ensureFallbackLocale(deviceTag);
+    _resolveSelectedLocale(deviceTag);
 
     if (_isIosSimulator) {
       _localSttAvailable = false;
@@ -174,7 +180,7 @@ class VoiceInputService {
         forceLocalStt || _preference != SttPreference.serverOnly;
     if (shouldPrepareLocalStt && !_didAttemptLocalInitialization) {
       await _loadLocales(deviceTag);
-      await _initializeNativeLocalStt(deviceTag);
+      await _initializeNativeLocalStt();
       _localSttAvailable = _nativeLocalSttAvailable;
       _didAttemptLocalInitialization = true;
     }
@@ -183,7 +189,7 @@ class VoiceInputService {
     return true;
   }
 
-  Future<void> _initializeNativeLocalStt(String deviceTag) async {
+  Future<void> _initializeNativeLocalStt() async {
     if (!_nativeStt.isSupportedPlatform) {
       _nativeLocalSttAvailable = false;
       return;
@@ -191,7 +197,10 @@ class VoiceInputService {
 
     try {
       final availability = await _nativeStt.checkAvailability(
-        localeId: _selectedLocaleId ?? deviceTag,
+        // Android treats null as an automatic-language request when the
+        // installed recognizer can prove that switching is supported. Other
+        // platforms use the closest supported system locale selected below.
+        localeId: _selectedLocaleId,
         allowOnlineFallback: false,
       );
       _nativeLocalSttAvailable = availability.available;
@@ -289,7 +298,38 @@ class VoiceInputService {
   List<LocaleName> get locales => _locales;
 
   void setLocale(String? localeId) {
-    _selectedLocaleId = localeId;
+    final normalized = SettingsService.normalizeVoiceLocaleId(localeId);
+    if (_configuredLocaleId == normalized) {
+      return;
+    }
+
+    _configuredLocaleId = normalized;
+    _resolveSelectedLocale(deviceLocaleTag);
+    _didAttemptLocalInitialization = false;
+    _isInitialized = false;
+    _nativeLocalSttAvailable = false;
+    _localSttAvailable = false;
+  }
+
+  void _resolveSelectedLocale(
+    String deviceTag, {
+    String? nativeSystemLocaleId,
+  }) {
+    if (_configuredLocaleId == SettingsService.voiceLocaleSystemDefault) {
+      _selectedLocaleId =
+          SettingsService.normalizeVoiceLocaleId(deviceTag) ??
+          deviceTag.replaceAll('_', '-');
+      return;
+    }
+    if (_configuredLocaleId != null || usesAutomaticNativeLanguage) {
+      _selectedLocaleId = _configuredLocaleId;
+      return;
+    }
+
+    final systemTag = nativeSystemLocaleId?.trim();
+    _selectedLocaleId = _matchLocale(
+      systemTag == null || systemTag.isEmpty ? deviceTag : systemTag,
+    ).localeId;
   }
 
   Future<void> _loadLocales(String deviceTag) async {
@@ -310,19 +350,20 @@ class VoiceInputService {
           .map((loc) => LocaleName(loc.localeId, loc.name))
           .toList();
       _usingFallbackLocales = false;
+      _resolveSelectedLocale(
+        deviceTag,
+        nativeSystemLocaleId: nativeLocales.systemLocaleId,
+      );
 
-      final systemTag = nativeLocales.systemLocaleId;
-      final tagForMatch = (systemTag != null && systemTag.isNotEmpty)
-          ? systemTag
-          : deviceTag;
-
-      final match = _matchLocale(tagForMatch);
-      _selectedLocaleId = match.localeId;
-
-      debugPrint(
-        'VoiceInputService: deviceTag=$deviceTag, '
-        'systemLocale=$systemTag, '
-        'selectedLocaleId=$_selectedLocaleId',
+      DebugLogger.info(
+        'native-stt-locales-loaded',
+        scope: 'voice/stt',
+        data: {
+          'deviceLocale': deviceTag,
+          'systemLocale': nativeLocales.systemLocaleId,
+          'localeCount': _locales.length,
+          'automaticLanguage': _selectedLocaleId == null,
+        },
       );
     } catch (_) {
       // Some engines may not support locale listing
@@ -330,17 +371,15 @@ class VoiceInputService {
   }
 
   void _ensureFallbackLocale(String deviceTag) {
-    if (_locales.isNotEmpty && _selectedLocaleId != null) {
+    if (_locales.isNotEmpty) {
       return;
     }
     _usingFallbackLocales = true;
     if (deviceTag.isEmpty) {
       _locales = const [LocaleName('en_US', 'en_US')];
-      _selectedLocaleId = 'en_US';
       return;
     }
     _locales = [LocaleName(deviceTag, deviceTag)];
-    _selectedLocaleId = deviceTag;
   }
 
   LocaleName _matchLocale(String deviceTag) {
@@ -356,7 +395,10 @@ class VoiceInputService {
     final parts = normalizedDevice.split(RegExp('[-_]'));
     final primary = parts.isNotEmpty ? parts.first : normalizedDevice;
     for (final locale in _locales) {
-      if (locale.localeId.toLowerCase().startsWith('$primary-')) {
+      final normalizedLocale = locale.localeId.toLowerCase();
+      if (normalizedLocale == primary ||
+          normalizedLocale.startsWith('$primary-') ||
+          normalizedLocale.startsWith('${primary}_')) {
         return locale;
       }
     }
@@ -375,14 +417,32 @@ class VoiceInputService {
           ? 'Speech recognition failed'
           : message,
     );
-    _textStreamController?.addError(exception);
+    _reportRecognitionError(exception);
     unawaited(_stopListening());
+  }
+
+  void _reportRecognitionError(Object error) {
+    final textController = _textStreamController;
+    if (textController != null && !textController.isClosed) {
+      textController.addError(error);
+    }
+    final transcriptController = _transcriptEventController;
+    if (transcriptController != null && !transcriptController.isClosed) {
+      transcriptController.addError(error);
+    }
   }
 
   Future<bool> _ensureMicrophonePermission() async {
     try {
       final status = await Permission.microphone.status;
-      return status.isGranted;
+      if (status.isGranted) {
+        return true;
+      }
+      // On a fresh install iOS reports the "not determined" state as denied.
+      // Actively request so the system permission dialog is surfaced instead
+      // of silently failing the voice flow. A permanently denied permission
+      // simply returns its current status without re-prompting.
+      return await requestMicrophonePermission();
     } catch (_) {
       return false;
     }
@@ -631,7 +691,7 @@ class VoiceInputService {
         if (!_isListening) {
           return _textStreamController!.stream;
         }
-        _textStreamController?.addError(error);
+        _reportRecognitionError(error);
         await _stopListening();
       }
     } else if (shouldUseServer) {
@@ -649,7 +709,7 @@ class VoiceInputService {
           );
         } catch (error) {
           if (!_isListening) return;
-          _textStreamController?.addError(error);
+          _reportRecognitionError(error);
           await _stopListening();
         }
       });
@@ -665,7 +725,7 @@ class VoiceInputService {
         error = Exception('Speech recognition not available on this device');
       }
       Future.microtask(() {
-        _textStreamController?.addError(error);
+        _reportRecognitionError(error);
         unawaited(_stopListening());
       });
     }
@@ -727,8 +787,12 @@ class VoiceInputService {
       await _stopVadRecording();
       final samples = _vadPendingSamples;
       _vadPendingSamples = null;
-      final hasActiveTextConsumer = _textStreamController?.hasListener ?? false;
-      if (samples != null && samples.isNotEmpty && hasActiveTextConsumer) {
+      final shouldProcessSamples = _shouldProcessServerSamples(
+        hasTextConsumer: _textStreamController?.hasListener ?? false,
+        hasTranscriptEventConsumer:
+            _transcriptEventController?.hasListener ?? false,
+      );
+      if (samples != null && samples.isNotEmpty && shouldProcessSamples) {
         await _processVadSamples(samples);
       }
     } else {
@@ -876,20 +940,14 @@ class VoiceInputService {
         try {
           await _stopVadRecording();
         } catch (_) {}
-        try {
-          await _startLocalRecognition(
-            allowOnlineFallback: !prefersDeviceOnly,
-            iosAudioSessionManagedExternally: iosAudioSessionManagedExternally,
-            nativeAccumulateResults: _nativeAccumulateResultsForCurrentListen,
-          );
-          return;
-        } catch (fallbackError) {
-          _textStreamController?.addError(fallbackError);
-          rethrow;
-        }
+        await _startLocalRecognition(
+          allowOnlineFallback: !prefersDeviceOnly,
+          iosAudioSessionManagedExternally: iosAudioSessionManagedExternally,
+          nativeAccumulateResults: _nativeAccumulateResultsForCurrentListen,
+        );
+        return;
       }
 
-      _textStreamController?.addError(error);
       rethrow;
     }
   }
@@ -917,7 +975,7 @@ class VoiceInputService {
 
     await _vadErrorSub?.cancel();
     _vadErrorSub = vad.onError.listen((message) {
-      _textStreamController?.addError(Exception(message));
+      _reportRecognitionError(Exception(message));
       if (_isListening) {
         unawaited(_stopListening());
       }
@@ -980,7 +1038,7 @@ class VoiceInputService {
         throw StateError('Empty transcription result');
       }
     } catch (error) {
-      _textStreamController?.addError(error);
+      _reportRecognitionError(error);
     }
   }
 
@@ -993,6 +1051,22 @@ class VoiceInputService {
     final frameDurationMs = (frameSamples / _vadSampleRate) * 1000;
     final frames = (milliseconds / frameDurationMs).ceil();
     return frames.clamp(_minVadRedemptionFrames, _maxVadRedemptionFrames);
+  }
+
+  static bool _shouldProcessServerSamples({
+    required bool hasTextConsumer,
+    required bool hasTranscriptEventConsumer,
+  }) => hasTextConsumer || hasTranscriptEventConsumer;
+
+  @visibleForTesting
+  static bool shouldProcessServerSamplesForTesting({
+    required bool hasTextConsumer,
+    required bool hasTranscriptEventConsumer,
+  }) {
+    return _shouldProcessServerSamples(
+      hasTextConsumer: hasTextConsumer,
+      hasTranscriptEventConsumer: hasTranscriptEventConsumer,
+    );
   }
 
   @visibleForTesting
@@ -1223,9 +1297,13 @@ final voiceInputServiceProvider = Provider<VoiceInputService>((ref) {
   final service = VoiceInputService(api: api, ref: ref);
   final currentSettings = ref.read(appSettingsProvider);
   service.updatePreference(currentSettings.sttPreference);
+  service.setLocale(currentSettings.voiceLocaleId);
   ref.listen<AppSettings>(appSettingsProvider, (previous, next) {
     if (previous?.sttPreference != next.sttPreference) {
       service.updatePreference(next.sttPreference);
+    }
+    if (previous?.voiceLocaleId != next.voiceLocaleId) {
+      service.setLocale(next.voiceLocaleId);
     }
   });
   ref.onDispose(service.dispose);
@@ -1274,7 +1352,14 @@ final voiceIntensityStreamProvider = StreamProvider<int>((ref) {
 final localVoiceRecognitionAvailableProvider = FutureProvider<bool>((
   ref,
 ) async {
+  final localeId = ref.watch(
+    appSettingsProvider.select((settings) => settings.voiceLocaleId),
+  );
   final service = ref.watch(voiceInputServiceProvider);
+  // Keep this probe keyed to the selected recognition language. The service
+  // itself is stable and mutates in place, so watching it alone would leave a
+  // cached result after the user changes locale in Audio Settings.
+  service.setLocale(localeId);
   final initialized = await service.initialize(forceLocalStt: true);
   if (!initialized) return false;
   if (service.hasLocalStt) return true;

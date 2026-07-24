@@ -21,14 +21,14 @@ void main() {
     });
 
     test('tolerates a leading v prefix', () {
-      check(ServerVersionCompat.isSupported('v0.10.1')).isTrue();
+      check(ServerVersionCompat.isSupported('v0.10.2')).isTrue();
       check(ServerVersionCompat.isSupported('v0.11.0')).isFalse();
     });
 
     test('strips pre-release / build metadata before comparing', () {
       // A pre-release of the max version is treated as the max version.
-      check(ServerVersionCompat.isSupported('0.10.1-dev')).isTrue();
-      check(ServerVersionCompat.isSupported('0.10.1+build.7')).isTrue();
+      check(ServerVersionCompat.isSupported('0.10.2-dev')).isTrue();
+      check(ServerVersionCompat.isSupported('0.10.2+build.7')).isTrue();
       // Metadata on a newer core still gates.
       check(ServerVersionCompat.isSupported('0.11.0-rc1')).isFalse();
     });
@@ -39,6 +39,10 @@ void main() {
       check(ServerVersionCompat.isSupported('1')).isFalse();
     });
 
+    test('the previous max (0.10.1) remains supported after the bump', () {
+      check(ServerVersionCompat.isSupported('0.10.1')).isTrue();
+    });
+
     test('fails open on null / empty / unparseable versions', () {
       for (final v in [null, '', '   ', 'nightly', 'unknown', 'abc.def']) {
         check(because: '$v', ServerVersionCompat.isSupported(v)).isTrue();
@@ -47,7 +51,7 @@ void main() {
 
     test('isUnsupported is the inverse of isSupported', () {
       check(ServerVersionCompat.isUnsupported('0.11.0')).isTrue();
-      check(ServerVersionCompat.isUnsupported('0.10.1')).isFalse();
+      check(ServerVersionCompat.isUnsupported('0.10.2')).isFalse();
       check(ServerVersionCompat.isUnsupported(null)).isFalse();
     });
 

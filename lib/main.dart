@@ -1,15 +1,19 @@
 import 'dart:async';
 import 'dart:developer' as developer;
 import 'package:adaptive_platform_ui/adaptive_platform_ui.dart';
+import 'package:flutter/foundation.dart'
+    show LicenseEntryWithLineBreaks, LicenseRegistry;
 import 'package:flutter_driver/driver_extension.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
-import 'package:pdfrx/pdfrx.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'core/widgets/error_boundary.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'core/providers/app_providers.dart';
+import 'core/network/conduit_user_agent.dart';
 import 'core/persistence/hive_bootstrap.dart';
 import 'core/persistence/hive_prefs_migrator.dart';
 import 'core/persistence/persistence_migrator.dart';
@@ -18,13 +22,14 @@ import 'core/persistence/preferences_store.dart';
 import 'core/router/app_router.dart';
 import 'core/services/native_sheet_bridge.dart';
 import 'core/services/native_sheet_hydration_service.dart';
+import 'core/services/navigation_service.dart';
 import 'core/services/performance_profiler.dart';
 import 'core/services/carplay_service.dart';
+import 'core/services/readiness_gated_secure_storage.dart';
 import 'core/services/settings_service.dart';
 import 'core/sync/request_completion_runner_provider.dart';
 import 'core/utils/tts_voice_utils.dart';
 import 'core/utils/current_localizations.dart';
-import 'features/auth/providers/unified_auth_providers.dart';
 import 'features/chat/services/request_completion_runner.dart';
 import 'features/chat/providers/text_to_speech_provider.dart';
 import 'features/chat/providers/chat_providers.dart' show restoreDefaultModel;
@@ -38,6 +43,7 @@ import 'package:conduit/l10n/app_localizations.dart';
 import 'core/services/quick_actions_service.dart';
 import 'core/providers/app_startup_providers.dart';
 import 'features/notifications/services/local_notification_service.dart';
+import 'shared/widgets/sign_out_options_dialog.dart';
 
 const bool _enableFlutterDriverExtension = bool.fromEnvironment(
   'ENABLE_FLUTTER_DRIVER_EXTENSION',
@@ -71,6 +77,28 @@ Locale? _localeFromNativeTag(String code) {
 
 developer.TimelineTask? _startupTimeline;
 
+Future<void> _configureUserAgent() async {
+  try {
+    final packageInfo = await PackageInfo.fromPlatform();
+    ConduitUserAgent.configure(appVersion: packageInfo.version);
+    _startupTimeline?.instant('user_agent_ready');
+  } catch (error, stackTrace) {
+    DebugLogger.error(
+      'user-agent-version-unavailable',
+      scope: 'app/startup',
+      error: error,
+      stackTrace: stackTrace,
+    );
+  }
+}
+
+void _registerBundledLicenses() {
+  LicenseRegistry.addLicense(() async* {
+    final notice = await rootBundle.loadString('THIRD_PARTY_NOTICES.md');
+    yield LicenseEntryWithLineBreaks(const ['Open WebUI icon'], notice);
+  });
+}
+
 void main() {
   if (_enableFlutterDriverExtension) {
     enableFlutterDriverExtension();
@@ -79,19 +107,15 @@ void main() {
   runZonedGuarded(
     () async {
       WidgetsFlutterBinding.ensureInitialized();
-      unawaited(
-        pdfrxFlutterInitialize().catchError((
-          Object error,
-          StackTrace stackTrace,
-        ) {
-          DebugLogger.error(
-            'pdf-engine-warmup',
-            scope: 'app/startup',
-            error: error,
-            stackTrace: stackTrace,
-          );
-        }),
-      );
+      // Measure the complete Dart-side startup path, including the first plugin
+      // calls. Package metadata is not required to paint the auth/theme shell;
+      // ConduitUserAgent has a safe fallback until this best-effort update lands.
+      _startupTimeline = developer.TimelineTask();
+      _startupTimeline!.start('app_startup');
+      _startupTimeline!.instant('bindings_initialized');
+      unawaited(_configureUserAgent());
+
+      _registerBundledLicenses();
       PerformanceProfiler.instance.attachFrameTimings();
 
       // Global error handlers
@@ -117,25 +141,9 @@ void main() {
         return true;
       };
 
-      // Start startup timeline instrumentation
-      _startupTimeline = developer.TimelineTask();
-      _startupTimeline!.start('app_startup');
-      _startupTimeline!.instant('bindings_initialized');
-
       // Edge-to-edge is now handled natively in MainActivity.kt for Android 15+
       // No need for SystemUiMode.edgeToEdge which is deprecated
       _startupTimeline?.instant('edge_to_edge_configured');
-
-      try {
-        await QuickActionsBootstrap.initialize();
-      } catch (error, stackTrace) {
-        DebugLogger.error(
-          'quick-actions-bootstrap',
-          scope: 'app/platform',
-          error: error,
-          stackTrace: stackTrace,
-        );
-      }
 
       const secureStorage = FlutterSecureStorage(
         aOptions: AndroidOptions(
@@ -152,26 +160,45 @@ void main() {
         ),
       );
 
-      // Warm up secure storage on cold start. iOS Keychain access can be slow
-      // on first read, which causes race conditions where auth token returns
-      // null even when it exists. This pre-warms the keychain connection.
+      // Start independent platform/file work together. Quick Actions still
+      // completes before runApp so a cold-launch action cannot be lost, while
+      // storage initialization progresses in parallel with that plugin call.
+      // Keep the underlying Keychain operation separate from the bounded
+      // startup wait. `Future.timeout` does not cancel its source; awaiting
+      // only the wrapper would let auth bootstrap start a second Keychain
+      // read while the first one was still executing on iOS.
+      final keychainWarmupRead = secureStorage
+          .read(key: '_warmup')
+          .catchError((Object _) => null);
+      final keychainWarmupBarrier = keychainWarmupRead.then<void>((_) {});
+      final keychainWarmupDeadline = waitForSecureStorageStartupDeadline(
+        keychainWarmupBarrier,
+      );
+      unawaited(
+        keychainWarmupRead.then<void>((_) {
+          _startupTimeline?.instant('secure_storage_ready');
+        }),
+      );
+      final hiveBoxesFuture = HiveBootstrap.instance.ensureInitialized();
+      final preferencesFuture = PreferencesStore.ensureInitialized();
+
       try {
-        await secureStorage
-            .read(key: '_warmup')
-            .timeout(const Duration(milliseconds: 500), onTimeout: () => null);
-      } catch (_) {
-        // Ignore warmup errors - this is best-effort
+        await QuickActionsBootstrap.initialize();
+      } catch (error, stackTrace) {
+        DebugLogger.error(
+          'quick-actions-bootstrap',
+          scope: 'app/platform',
+          error: error,
+          stackTrace: stackTrace,
+        );
       }
-      _startupTimeline?.instant('secure_storage_ready');
 
-      // Initialize Hive (now optimized with migration state caching)
-      final hiveBoxes = await HiveBootstrap.instance.ensureInitialized();
+      // Initialize Hive and preferences concurrently. Preferences must still be
+      // ready before ProviderContainer construction because theme/locale reads
+      // are synchronous.
+      final hiveBoxes = await hiveBoxesFuture;
       _startupTimeline?.instant('hive_ready');
-
-      // Preload shared_preferences so synchronous preference reads (theme,
-      // locale, settings, drawer/sidebar state) are available before the first
-      // build. MUST complete before the ProviderContainer is created.
-      await PreferencesStore.ensureInitialized();
+      await preferencesFuture;
       _startupTimeline?.instant('prefs_ready');
 
       // Run migration checks (fast-pathed after first run).
@@ -182,6 +209,11 @@ void main() {
       await HivePrefsMigrator(hiveBoxes: hiveBoxes).migrateIfNeeded();
       _startupTimeline?.instant('migration_complete');
 
+      // Bound time-to-first-paint even if the platform call stalls. Provider
+      // reads use the original in-flight operation as their barrier below, so
+      // timing out here never starts a concurrent second Keychain access.
+      await keychainWarmupDeadline;
+
       // Finish timeline after first frame paints
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _startupTimeline?.instant('first_frame_rendered');
@@ -191,7 +223,12 @@ void main() {
 
       final providerContainer = ProviderContainer(
         overrides: [
-          secureStorageProvider.overrideWithValue(secureStorage),
+          secureStorageProvider.overrideWithValue(
+            ReadinessGatedSecureStorage(
+              delegate: secureStorage,
+              readiness: keychainWarmupBarrier,
+            ),
+          ),
           hiveBoxesProvider.overrideWithValue(hiveBoxes),
           // Inversion seam (E3): the core/sync drainer reads the no-op
           // RequestCompletionRunner stub; bind it to the chat implementation so
@@ -236,6 +273,7 @@ class _ConduitAppState extends ConsumerState<ConduitApp> {
   Brightness? _lastAppliedOverlayBrightness;
   StreamSubscription<NativeSheetEvent>? _nativeSheetSubscription;
   final Map<String, String> _nativeSheetDraftValues = {};
+  Future<void> _nativeSheetControlQueue = Future<void>.value();
 
   @override
   void initState() {
@@ -254,18 +292,57 @@ class _ConduitAppState extends ConsumerState<ConduitApp> {
   void _handleNativeSheetEvent(NativeSheetEvent event) {
     switch (event) {
       case NativeSheetLogoutRequested():
-        unawaited(ref.read(authActionsProvider).logout());
+        unawaited(_handleNativeSheetLogoutRequested());
       case NativeSheetDismissed():
         _nativeSheetDraftValues.clear();
         break;
+      case NativeSheetControlChanged(
+        id: 'sign-out',
+        value: final bool keepServerDetails,
+      ):
+        unawaited(
+          _handleNativeSheetLogoutRequested(
+            keepServerDetails: keepServerDetails,
+          ),
+        );
       case NativeSheetControlChanged():
-        unawaited(_handleNativeSheetControlChanged(event));
+        _nativeSheetControlQueue = _nativeSheetControlQueue.then(
+          (_) => _handleNativeSheetControlChanged(event),
+        );
       case NativeSheetDetailAppeared(:final detailId):
         unawaited(
           ref.read(nativeSheetHydrationServiceProvider).hydrateDetail(detailId),
         );
       case NativeEditProfileCommitted():
         unawaited(_handleNativeEditProfileCommitted(event));
+    }
+  }
+
+  Future<void> _handleNativeSheetLogoutRequested({
+    bool? keepServerDetails,
+  }) async {
+    try {
+      var resolvedKeepServerDetails = keepServerDetails;
+      if (resolvedKeepServerDetails == null) {
+        final navigatorContext = NavigationService.context;
+        if (navigatorContext == null) {
+          throw StateError('Native sign-out navigator is unavailable.');
+        }
+        resolvedKeepServerDetails = await showSignOutOptionsDialog(
+          navigatorContext,
+        );
+      }
+      if (!mounted || resolvedKeepServerDetails == null) return;
+      await ref
+          .read(signOutCoordinatorProvider)
+          .signOut(keepServerDetails: resolvedKeepServerDetails);
+    } catch (error, stackTrace) {
+      DebugLogger.error(
+        'native-sign-out-failed',
+        scope: 'native/sheet',
+        error: error,
+        stackTrace: stackTrace,
+      );
     }
   }
 
@@ -334,6 +411,30 @@ class _ConduitAppState extends ConsumerState<ConduitApp> {
   ) async {
     final value = event.value;
     try {
+      // Hermes-only: "Connect to Open WebUI" row. Dismiss the native
+      // sheet and route into the OWUI connect flow (the router allows the
+      // serverConnection route for Hermes-only users).
+      if (event.id == 'add-owui-server') {
+        unawaited(
+          NavigationService.router.pushNamed<void>(
+            RouteNames.serverConnection,
+            extra: const NativeSheetNavigationOrigin(),
+          ),
+        );
+        return;
+      }
+
+      if (event.id == NativeSheetRoutes.directConnections) {
+        final request = directConnectionsNativeSheetNavigationRequest;
+        unawaited(
+          NavigationService.router.pushNamed<void>(
+            request.routeName,
+            extra: request.extra,
+          ),
+        );
+        return;
+      }
+
       if (event.id.startsWith('tts-voice-pick:')) {
         await _handleNativeTtsVoicePick(event);
         return;
@@ -403,6 +504,20 @@ class _ConduitAppState extends ConsumerState<ConduitApp> {
       }
 
       switch (event.id) {
+        case NativeSheetRoutes.hermes:
+          unawaited(
+            NavigationService.router.pushNamed<void>(
+              RouteNames.hermesSettings,
+              extra: const NativeSheetNavigationOrigin(),
+            ),
+          );
+        case NativeSheetRoutes.workspace:
+          unawaited(
+            NavigationService.router.pushNamed<void>(
+              RouteNames.workspace,
+              extra: const NativeSheetNavigationOrigin(),
+            ),
+          );
         case 'default-model':
           if (value is String) {
             final modelId = value == 'auto-select' ? null : value;

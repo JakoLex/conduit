@@ -119,33 +119,51 @@ class PlatformBackgroundTaskExtendedEvent {
 }
 
 class PlatformAppIntentImagePayload {
-  PlatformAppIntentImagePayload({required this.filename, required this.bytes});
+  PlatformAppIntentImagePayload({
+    required this.filename,
+    required this.filePath,
+  });
 
   String filename;
-  Uint8List bytes;
+  String filePath;
 }
 
 class PlatformAppIntentResponse {
-  PlatformAppIntentResponse({required this.success, this.value, this.error});
+  PlatformAppIntentResponse({
+    required this.success,
+    this.value,
+    this.error,
+    this.ownedFilePath,
+  });
 
   bool success;
   String? value;
   String? error;
+  String? ownedFilePath;
 }
 
 class PlatformNativePasteImageItem {
-  PlatformNativePasteImageItem({required this.mimeType, required this.data});
+  PlatformNativePasteImageItem({
+    required this.mimeType,
+    required this.filePath,
+  });
 
   String mimeType;
-  Uint8List data;
+  String filePath;
 }
 
 class PlatformNativePastePayload {
-  PlatformNativePastePayload({required this.kind, this.text, this.items});
+  PlatformNativePastePayload({
+    required this.kind,
+    this.text,
+    this.items,
+    this.deliveryId,
+  });
 
   PlatformNativePasteKind kind;
   String? text;
   List<PlatformNativePasteImageItem>? items;
+  String? deliveryId;
 }
 
 class PlatformKeyboardAttachmentActionConfig {
@@ -266,7 +284,11 @@ class PlatformNativeSheetItem {
     required this.title,
     this.subtitle,
     required this.sfSymbol,
+    this.iconAsset,
     required this.destructive,
+    required this.dismissOnSelect,
+    this.actionId,
+    this.actionValue,
     this.url,
     required this.kind,
     this.value,
@@ -289,7 +311,11 @@ class PlatformNativeSheetItem {
   String title;
   String? subtitle;
   String sfSymbol;
+  String? iconAsset;
   bool destructive;
+  bool dismissOnSelect;
+  String? actionId;
+  Object? actionValue;
   String? url;
   PlatformNativeSheetItemKind kind;
   Object? value;
@@ -385,6 +411,7 @@ class PlatformNativeProfileSheetUser {
     required this.initials,
     this.avatarUrl,
     this.avatarBytes,
+    required this.avatarIsTemplate,
     required this.avatarHeaders,
     this.bio,
     this.gender,
@@ -397,6 +424,7 @@ class PlatformNativeProfileSheetUser {
   String initials;
   String? avatarUrl;
   Uint8List? avatarBytes;
+  bool avatarIsTemplate;
   Map<String, String> avatarHeaders;
   String? bio;
   String? gender;
@@ -476,22 +504,44 @@ class PlatformNativeSheetModelOption {
 
 class PlatformNativeSheetModelSelectorRequest {
   PlatformNativeSheetModelSelectorRequest({
+    required this.presentationId,
     required this.title,
     this.selectedModelId,
     required this.models,
     required this.pinnedModelIds,
+    required this.featuredModelIds,
     required this.allowsPinning,
     this.pinTitle,
     this.unpinTitle,
+    required this.moreModelsTitle,
+    required this.searchModelsTitle,
+    required this.reasoningEffortTitle,
+    required this.reasoningEffortValue,
+    required this.reasoningEffortOptions,
+    required this.reasoningEffortLabels,
+    required this.allowsCustomReasoningEffort,
+    required this.customReasoningEffortTitle,
+    required this.customReasoningEffortHint,
   });
 
+  String presentationId;
   String title;
   String? selectedModelId;
   List<PlatformNativeSheetModelOption> models;
   List<String> pinnedModelIds;
+  List<String> featuredModelIds;
   bool allowsPinning;
   String? pinTitle;
   String? unpinTitle;
+  String moreModelsTitle;
+  String searchModelsTitle;
+  String reasoningEffortTitle;
+  String reasoningEffortValue;
+  List<String> reasoningEffortOptions;
+  Map<String, String> reasoningEffortLabels;
+  bool allowsCustomReasoningEffort;
+  String customReasoningEffortTitle;
+  String customReasoningEffortHint;
 }
 
 class PlatformNativeSheetOptionsSelectorRequest {
@@ -593,6 +643,12 @@ class PlatformNativeSheetModelPinToggledEvent {
   String modelId;
 }
 
+class PlatformNativeSheetReasoningEffortChangedEvent {
+  PlatformNativeSheetReasoningEffortChangedEvent({required this.value});
+
+  String value;
+}
+
 class PlatformNativeEditProfileCommittedEvent {
   PlatformNativeEditProfileCommittedEvent({
     required this.name,
@@ -649,29 +705,39 @@ abstract class BackgroundStreamingFlutterApi {
 @FlutterApi()
 abstract class AppIntentFlutterApi {
   @async
-  PlatformAppIntentResponse askChat(String? prompt);
+  PlatformAppIntentResponse askChat(String invocationId, String? prompt);
 
   @async
-  PlatformAppIntentResponse startVoiceCall();
+  PlatformAppIntentResponse startVoiceCall(String invocationId);
 
   @async
-  PlatformAppIntentResponse sendText(String text);
+  PlatformAppIntentResponse sendText(String invocationId, String text);
 
   @async
-  PlatformAppIntentResponse sendUrl(String url);
+  PlatformAppIntentResponse sendUrl(String invocationId, String url);
 
   @async
-  PlatformAppIntentResponse sendImage(PlatformAppIntentImagePayload payload);
+  PlatformAppIntentResponse sendImage(
+    String invocationId,
+    PlatformAppIntentImagePayload payload,
+  );
+}
+
+@HostApi()
+abstract class AppIntentHostApi {
+  void setReady(bool ready);
 }
 
 @HostApi()
 abstract class NativePasteHostApi {
+  @async
   bool requestPaste();
 }
 
 @FlutterApi()
 abstract class NativePasteFlutterApi {
-  void onPaste(PlatformNativePastePayload payload);
+  @async
+  bool onPaste(PlatformNativePastePayload payload);
 }
 
 @HostApi()
@@ -703,6 +769,11 @@ abstract class NativeSheetHostApi {
   @async
   String? presentModelSelector(PlatformNativeSheetModelSelectorRequest request);
 
+  void updateModelSelectorModels(
+    String presentationId,
+    List<PlatformNativeSheetModelOption> models,
+  );
+
   @async
   String? presentOptionsSelector(
     PlatformNativeSheetOptionsSelectorRequest request,
@@ -731,5 +802,8 @@ abstract class NativeSheetFlutterApi {
   void onControlChanged(PlatformNativeSheetControlChangedEvent event);
   void onDetailAppeared(PlatformNativeSheetDetailAppearedEvent event);
   void onModelPinToggled(PlatformNativeSheetModelPinToggledEvent event);
+  void onReasoningEffortChanged(
+    PlatformNativeSheetReasoningEffortChangedEvent event,
+  );
   void commitEditProfile(PlatformNativeEditProfileCommittedEvent event);
 }

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../utils/debug_logger.dart';
 
@@ -21,6 +22,14 @@ class SecureCredentialStorage {
   static const String _credentialsKey = 'user_credentials_v2';
   static const String _serverConfigsKey = 'server_configs_v2';
   static const String _authTokenKey = 'auth_token_v2';
+  static const String _hermesApiKeyKey = 'hermes_api_key_v1';
+  static const String _hermesSessionKeyKey = 'hermes_session_key_v1';
+  static const String _directConnectionProfilesKey =
+      'direct_connection_profiles_v1';
+  static const String _openWebUiDirectIdentityKey =
+      'openwebui_direct_identity_key_v1';
+  static Future<void> _openWebUiDirectIdentityKeyQueue = Future<void>.value();
+  static bool _openWebUiDirectIdentityWritesBlocked = false;
 
   /// Get Android-specific secure storage options
   AndroidOptions _getAndroidOptions() {
@@ -57,12 +66,6 @@ class SecureCredentialStorage {
     String authType = 'credentials',
   }) async {
     try {
-      // First check if secure storage is available
-      final isAvailable = await isSecureStorageAvailable();
-      if (!isAvailable) {
-        throw Exception('Secure storage is not available on this device');
-      }
-
       final credentials = {
         'serverId': serverId,
         'username': username,
@@ -85,87 +88,145 @@ class SecureCredentialStorage {
 
       DebugLogger.storage(
         'save-ok',
-        scope: 'credentials',
+        scope: 'credentials/storage',
         data: {'version': '2.1'},
       );
     } catch (e) {
-      DebugLogger.error('save-failed', scope: 'credentials', error: e);
+      DebugLogger.error('save-failed', scope: 'credentials/storage', error: e);
       rethrow;
     }
   }
 
   /// Retrieve saved credentials
   Future<Map<String, String>?> getSavedCredentials() async {
+    final String? storedData;
     try {
-      final storedData = await _secureStorage.read(key: _credentialsKey);
-      if (storedData == null || storedData.isEmpty) {
-        return null;
-      }
+      storedData = await _secureStorage.read(key: _credentialsKey);
+    } catch (error, stackTrace) {
+      // A Keychain/keystore read failure is not proof that credentials are
+      // absent. Propagate it so the optimized storage layer can retry without
+      // negative-caching a transient platform failure.
+      DebugLogger.error(
+        'read-failed',
+        scope: 'credentials/storage',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      Error.throwWithStackTrace(error, stackTrace);
+    }
 
-      final jsonString = storedData;
-      final decoded = jsonDecode(jsonString);
-
-      if (decoded is! Map<String, dynamic>) {
-        DebugLogger.warning('invalid-format', scope: 'credentials');
-        await deleteSavedCredentials();
-        return null;
-      }
-
-      // Validate required fields
-      if (!decoded.containsKey('serverId') ||
-          !decoded.containsKey('username') ||
-          !decoded.containsKey('password')) {
-        DebugLogger.warning('missing-fields', scope: 'credentials');
-        await deleteSavedCredentials();
-        return null;
-      }
-
-      // Check if credentials are too old (optional expiration)
-      final savedAt = decoded['savedAt']?.toString();
-      if (savedAt != null) {
-        try {
-          final savedTime = DateTime.parse(savedAt);
-          final now = DateTime.now();
-          final daysSinceCreated = now.difference(savedTime).inDays;
-
-          // Warn if credentials are very old (but don't delete them)
-          if (daysSinceCreated > 90) {
-            DebugLogger.info(
-              'credentials-old',
-              scope: 'credentials',
-              data: {'ageDays': daysSinceCreated},
-            );
-          }
-        } catch (e) {
-          DebugLogger.warning(
-            'savedat-parse-failed',
-            scope: 'credentials',
-            data: {'raw': savedAt, 'error': e.toString()},
-          );
-        }
-      }
-
-      return {
-        'serverId': decoded['serverId']?.toString() ?? '',
-        'username': decoded['username']?.toString() ?? '',
-        'password': decoded['password']?.toString() ?? '',
-        'savedAt': decoded['savedAt']?.toString() ?? '',
-        'authType': decoded['authType']?.toString() ?? 'credentials',
-      };
-    } catch (e) {
-      DebugLogger.error('read-failed', scope: 'credentials', error: e);
-      // Don't delete credentials on retrieval errors - they might be recoverable
+    if (storedData == null || storedData.isEmpty) {
       return null;
     }
+
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(storedData);
+    } catch (error) {
+      // Parsing failures are distinct from platform read failures. Preserve the
+      // payload here: a future app version may still be able to recover it.
+      // FormatException messages may quote the malformed JSON, including
+      // credential values, so only record its non-sensitive runtime type.
+      DebugLogger.error(
+        'decode-failed',
+        scope: 'credentials/storage',
+        data: {'errorType': error.runtimeType.toString()},
+      );
+      return null;
+    }
+
+    if (decoded is! Map<String, dynamic>) {
+      DebugLogger.warning('invalid-format', scope: 'credentials/storage');
+      await deleteSavedCredentials();
+      return null;
+    }
+
+    // Do not coerce malformed JSON values into apparently usable credentials.
+    // Password content is intentionally not trimmed: spaces and control
+    // characters can be legitimate password bytes, but the value must exist.
+    final serverId = decoded['serverId'];
+    final username = decoded['username'];
+    final password = decoded['password'];
+    if (serverId is! String ||
+        serverId.trim().isEmpty ||
+        username is! String ||
+        username.trim().isEmpty ||
+        password is! String ||
+        password.isEmpty) {
+      DebugLogger.warning(
+        'invalid-required-fields',
+        scope: 'credentials/storage',
+      );
+      await deleteSavedCredentials();
+      return null;
+    }
+
+    // Check if credentials are too old (optional expiration)
+    final savedAt = decoded['savedAt']?.toString();
+    if (savedAt != null) {
+      try {
+        final savedTime = DateTime.parse(savedAt);
+        final now = DateTime.now();
+        final daysSinceCreated = now.difference(savedTime).inDays;
+
+        // Warn if credentials are very old (but don't delete them)
+        if (daysSinceCreated > 90) {
+          DebugLogger.info(
+            'credentials-old',
+            scope: 'credentials/storage',
+            data: {'ageDays': daysSinceCreated},
+          );
+        }
+      } catch (error) {
+        DebugLogger.warning(
+          'savedat-parse-failed',
+          scope: 'credentials/storage',
+          data: {
+            'errorType': error.runtimeType.toString(),
+            'valueLength': savedAt.length,
+          },
+        );
+      }
+    }
+
+    return {
+      'serverId': serverId,
+      'username': username,
+      'password': password,
+      'savedAt': decoded['savedAt']?.toString() ?? '',
+      'authType': decoded['authType']?.toString() ?? 'credentials',
+    };
+  }
+
+  /// Returns the exact versioned credential payload without converting a
+  /// Keychain/keystore read failure into an absent value.
+  ///
+  /// Auth-session transactions use this to restore the prior credential bytes
+  /// if a later ownership/token write fails. The public parsed read remains
+  /// intentionally forgiving for normal bootstrap behavior.
+  Future<String?> getSavedCredentialsPayloadStrict() =>
+      _secureStorage.read(key: _credentialsKey);
+
+  /// Restores an exact payload captured by
+  /// [getSavedCredentialsPayloadStrict], or removes it when none existed.
+  Future<void> restoreSavedCredentialsPayload(String? payload) {
+    if (payload == null) {
+      return _secureStorage.delete(key: _credentialsKey);
+    }
+    return _secureStorage.write(key: _credentialsKey, value: payload);
   }
 
   /// Delete saved credentials
   Future<void> deleteSavedCredentials() async {
     try {
       await _secureStorage.delete(key: _credentialsKey);
-      DebugLogger.storage('delete-ok', scope: 'credentials');
+      DebugLogger.storage('delete-ok', scope: 'credentials/storage');
     } catch (e) {
-      DebugLogger.error('delete-failed', scope: 'credentials', error: e);
+      DebugLogger.error(
+        'delete-failed',
+        scope: 'credentials/storage',
+        error: e,
+      );
       rethrow;
     }
   }
@@ -201,6 +262,15 @@ class SecureCredentialStorage {
     }
   }
 
+  /// Read the auth token without converting a Keychain/keystore failure into
+  /// an absent token.
+  ///
+  /// Transactional callers use this before changing any durable auth state so
+  /// a transient platform read failure cannot be mistaken for a legitimate
+  /// null snapshot and erase an existing session during rollback.
+  Future<String?> getAuthTokenStrict() =>
+      _secureStorage.read(key: _authTokenKey);
+
   /// Delete auth token
   Future<void> deleteAuthToken() async {
     try {
@@ -213,6 +283,208 @@ class SecureCredentialStorage {
       );
       rethrow;
     }
+  }
+
+  /// Save the Hermes Agent API key (bearer token for the direct Hermes backend).
+  Future<void> saveHermesApiKey(String apiKey) async {
+    try {
+      await _secureStorage.write(key: _hermesApiKeyKey, value: apiKey);
+    } catch (e) {
+      DebugLogger.error('save-failed', scope: 'hermes/api-key', error: e);
+      rethrow;
+    }
+  }
+
+  /// Get the Hermes Agent API key, or null when none is stored.
+  Future<String?> getHermesApiKey() =>
+      _readHermesSecret(_hermesApiKeyKey, scope: 'hermes/api-key');
+
+  Future<String?> _readHermesSecret(String key, {required String scope}) async {
+    try {
+      return await _secureStorage.read(key: key);
+    } catch (error) {
+      // Keychain/keystore access can fail transiently while the platform is
+      // unlocking. Retry once rather than treating a configured backend as if
+      // its secret were absent for the remainder of this app session.
+      DebugLogger.warning(
+        'read-retrying',
+        scope: scope,
+        data: {'error': error.toString()},
+      );
+    }
+
+    try {
+      return await _secureStorage.read(key: key);
+    } catch (error, stackTrace) {
+      DebugLogger.error(
+        'read-failed',
+        scope: scope,
+        error: error,
+        stackTrace: stackTrace,
+      );
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+  }
+
+  /// Delete the Hermes Agent API key.
+  Future<void> deleteHermesApiKey() async {
+    try {
+      await _secureStorage.delete(key: _hermesApiKeyKey);
+    } catch (e) {
+      DebugLogger.error('delete-failed', scope: 'hermes/api-key', error: e);
+      rethrow;
+    }
+  }
+
+  /// Save the Hermes long-term memory session key (`X-Hermes-Session-Key`).
+  Future<void> saveHermesSessionKey(String sessionKey) async {
+    try {
+      await _secureStorage.write(key: _hermesSessionKeyKey, value: sessionKey);
+    } catch (e) {
+      DebugLogger.error('save-failed', scope: 'hermes/session-key', error: e);
+      rethrow;
+    }
+  }
+
+  /// Get the Hermes long-term memory session key, or null when none is stored.
+  Future<String?> getHermesSessionKey() =>
+      _readHermesSecret(_hermesSessionKeyKey, scope: 'hermes/session-key');
+
+  /// Delete the Hermes long-term memory session key.
+  Future<void> deleteHermesSessionKey() async {
+    try {
+      await _secureStorage.delete(key: _hermesSessionKeyKey);
+    } catch (e) {
+      DebugLogger.error('delete-failed', scope: 'hermes/session-key', error: e);
+      rethrow;
+    }
+  }
+
+  /// Persists the complete versioned direct-connection document securely.
+  ///
+  /// Profiles include API keys, custom headers, and optional mTLS material, so
+  /// their serialized representation must never be placed in preferences.
+  Future<void> saveDirectConnectionProfiles(String profilesJson) async {
+    try {
+      await _secureStorage.write(
+        key: _directConnectionProfilesKey,
+        value: profilesJson,
+      );
+    } catch (error, stackTrace) {
+      DebugLogger.error(
+        'save-failed',
+        scope: 'direct-connections/profiles',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+  }
+
+  /// Reads the versioned direct-connection document from secure storage.
+  /// Storage failures are surfaced rather than being confused with no config.
+  Future<String?> getDirectConnectionProfiles() async {
+    try {
+      return await _secureStorage.read(key: _directConnectionProfilesKey);
+    } catch (error, stackTrace) {
+      DebugLogger.error(
+        'read-failed',
+        scope: 'direct-connections/profiles',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+  }
+
+  Future<void> deleteDirectConnectionProfiles() async {
+    try {
+      await _secureStorage.delete(key: _directConnectionProfilesKey);
+    } catch (error, stackTrace) {
+      DebugLogger.error(
+        'delete-failed',
+        scope: 'direct-connections/profiles',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+  }
+
+  /// Returns the durable device secret used for domain-separated Direct
+  /// identity authentication, creating it when needed.
+  Future<List<int>> getOrCreateOpenWebUiDirectIdentityKey() {
+    if (_openWebUiDirectIdentityWritesBlocked) {
+      return Future<List<int>>.error(
+        StateError('Direct identity changes are unavailable while signing out.'),
+      );
+    }
+    final result = _openWebUiDirectIdentityKeyQueue.then<List<int>>(
+      (_) => _loadOrCreateOpenWebUiDirectIdentityKeyIfAllowed(),
+      onError: (Object _, StackTrace _) =>
+          _loadOrCreateOpenWebUiDirectIdentityKeyIfAllowed(),
+    );
+    _openWebUiDirectIdentityKeyQueue = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return result;
+  }
+
+  Future<List<int>> _loadOrCreateOpenWebUiDirectIdentityKeyIfAllowed() {
+    if (_openWebUiDirectIdentityWritesBlocked) {
+      return Future<List<int>>.error(
+        StateError('Direct identity changes are unavailable while signing out.'),
+      );
+    }
+    return _loadOrCreateOpenWebUiDirectIdentityKey();
+  }
+
+  static Future<void> blockDirectIdentityWritesForAppDataClear() async {
+    _openWebUiDirectIdentityWritesBlocked = true;
+    await _openWebUiDirectIdentityKeyQueue;
+  }
+
+  static void resumeDirectIdentityWritesAfterAppDataClear() {
+    _openWebUiDirectIdentityWritesBlocked = false;
+  }
+
+  Future<List<int>> _loadOrCreateOpenWebUiDirectIdentityKey() async {
+    List<int>? decodeKey(String? raw) {
+      if (raw == null || raw.isEmpty) return null;
+      try {
+        final decoded = base64Url.decode(raw);
+        return decoded.length >= 32 ? decoded : null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    final existing = decodeKey(
+      await _secureStorage.read(key: _openWebUiDirectIdentityKey),
+    );
+    if (existing != null) return List<int>.unmodifiable(existing);
+
+    final random = Random.secure();
+    final generated = List<int>.generate(
+      32,
+      (_) => random.nextInt(256),
+      growable: false,
+    );
+    await _secureStorage.write(
+      key: _openWebUiDirectIdentityKey,
+      value: base64UrlEncode(generated),
+    );
+    // Read back to verify that secure persistence accepted the generated key.
+    final persisted = decodeKey(
+      await _secureStorage.read(key: _openWebUiDirectIdentityKey),
+    );
+    if (persisted == null) {
+      throw StateError(
+        'Open WebUI direct identity key could not be persisted.',
+      );
+    }
+    return List<int>.unmodifiable(persisted);
   }
 
   /// Save server configurations securely
@@ -279,6 +551,7 @@ class SecureCredentialStorage {
       );
     } catch (e) {
       DebugLogger.error('clear-failed', scope: 'credentials', error: e);
+      rethrow;
     }
   }
 

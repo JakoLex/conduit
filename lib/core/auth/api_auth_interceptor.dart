@@ -1,13 +1,38 @@
 import 'dart:async';
 
 import 'package:dio/dio.dart';
+import '../network/conduit_user_agent.dart';
 import '../utils/debug_logger.dart';
+
+/// Immutable authorization value captured for work that must remain bound to
+/// the account session that created it, even if the shared [ApiService]
+/// interceptor is updated before the queued request reaches [onRequest].
+final class ApiAuthSnapshot {
+  const ApiAuthSnapshot._(this._token, this._revision);
+
+  final String? _token;
+  final int _revision;
+}
 
 /// Consistent authentication interceptor for all API requests
 /// Implements security requirements from OpenAPI specification
 class ApiAuthInterceptor extends Interceptor {
+  static const String authSnapshotExtraKey = 'conduit.api.auth_snapshot';
+  static const String candidateAuthTokenExtraKey =
+      'conduit.api.candidate_auth_token';
+  static const String _requestAuthRevisionExtraKey =
+      'conduit.api.request_auth_revision';
+  static const String _requestAuthTokenExtraKey =
+      'conduit.api.request_auth_token';
+  static const String _requestCookieSuppressedExtraKey =
+      'conduit.api.request_cookie_suppressed';
+
   String? _authToken;
+  int _authRevision = 0;
+  final Uri _serverUri;
   final Map<String, String> customHeaders;
+  bool _suppressCookieCustomHeader;
+  final bool Function()? _shouldSuppressCookieCustomHeader;
 
   // Callbacks for auth events
   void Function()? onAuthTokenInvalid;
@@ -15,7 +40,6 @@ class ApiAuthInterceptor extends Interceptor {
 
   // Public endpoints that don't require authentication
   static const Set<String> _publicEndpoints = {
-    '/health',
     '/api/v1/auths/signin',
     '/api/v1/auths/signup',
     '/api/v1/auths/ldap',
@@ -23,6 +47,7 @@ class ApiAuthInterceptor extends Interceptor {
 
   // Endpoints that have optional authentication (work without but better with)
   static const Set<String> _optionalAuthEndpoints = {
+    '/health',
     '/api/config',
     '/api/models',
   };
@@ -36,17 +61,63 @@ class ApiAuthInterceptor extends Interceptor {
   };
 
   ApiAuthInterceptor({
+    required String serverUrl,
     String? authToken,
     this.onAuthTokenInvalid,
     this.onTokenInvalidated,
     this.customHeaders = const {},
-  }) : _authToken = authToken;
+    bool suppressCookieCustomHeader = false,
+    bool Function()? shouldSuppressCookieCustomHeader,
+  }) : _serverUri = Uri.parse(serverUrl),
+       _authToken = authToken,
+       _suppressCookieCustomHeader = suppressCookieCustomHeader,
+       _shouldSuppressCookieCustomHeader = shouldSuppressCookieCustomHeader;
 
   void updateAuthToken(String? token) {
+    if (token == _authToken) return;
     _authToken = token;
+    _authRevision++;
   }
 
   String? get authToken => _authToken;
+
+  /// Monotonic identity for account-scoped caches owned by this interceptor.
+  int get authenticationEpoch => _authRevision;
+
+  void setCookieCustomHeaderSuppressed(bool suppressed) {
+    if (_suppressCookieCustomHeader == suppressed) return;
+    _suppressCookieCustomHeader = suppressed;
+    // Cookie credentials are part of the authenticated transport identity.
+    // Rotating their availability invalidates callbacks from dispatched work
+    // just like rotating the bearer token does.
+    _authRevision++;
+  }
+
+  /// Whether a configured reverse-proxy Cookie must be omitted right now.
+  ///
+  /// The optional resolver lets short-lived clients observe a logout fence
+  /// that can change after construction. Resolver failures are fail-closed so
+  /// provider teardown can never reattach a persisted proxy session.
+  bool get cookieCustomHeaderSuppressed {
+    if (_suppressCookieCustomHeader) return true;
+    final resolver = _shouldSuppressCookieCustomHeader;
+    if (resolver == null) return false;
+    try {
+      return resolver();
+    } catch (_) {
+      return true;
+    }
+  }
+
+  ApiAuthSnapshot captureSnapshot() =>
+      ApiAuthSnapshot._(_authToken, _authRevision);
+
+  String _endpointPath(String rawPath) {
+    final parsed = Uri.tryParse(rawPath);
+    final path = parsed?.path ?? rawPath.split(RegExp(r'[?#]')).first;
+    if (path.isEmpty) return '/';
+    return path.startsWith('/') ? path : '/$path';
+  }
 
   _EndpointAuthMode _authModeFor(String path) {
     if (_publicEndpoints.contains(path)) {
@@ -62,11 +133,93 @@ class ApiAuthInterceptor extends Interceptor {
     return _authFailureEndpoints.contains(path);
   }
 
+  bool _targetsServerOrigin(RequestOptions options) {
+    final Uri requestUri;
+    try {
+      requestUri = options.uri;
+    } on FormatException {
+      return false;
+    }
+    if (!requestUri.hasScheme && !requestUri.hasAuthority) return true;
+
+    final requestScheme = requestUri.scheme.toLowerCase();
+    final serverScheme = _serverUri.scheme.toLowerCase();
+    return requestScheme == serverScheme &&
+        requestUri.host.toLowerCase() == _serverUri.host.toLowerCase() &&
+        _effectivePort(requestUri, requestScheme) ==
+            _effectivePort(_serverUri, serverScheme);
+  }
+
+  int? _effectivePort(Uri uri, String scheme) {
+    if (uri.hasPort) return uri.port;
+    return switch (scheme) {
+      'http' => 80,
+      'https' => 443,
+      _ => null,
+    };
+  }
+
+  void _removeServerCredentials(RequestOptions options) {
+    final serverCredentialHeaders = <String>{
+      'authorization',
+      ...customHeaders.keys.map((header) => header.toLowerCase()),
+    };
+    options.headers.removeWhere(
+      (header, _) => serverCredentialHeaders.contains(header.toLowerCase()),
+    );
+  }
+
   @override
   void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
-    final path = options.path;
+    if (!_targetsServerOrigin(options)) {
+      // The shared Dio instance is also used for externally hosted images.
+      // Never forward credentials belonging to the selected Open WebUI server
+      // to an absolute URL on another origin.
+      _removeServerCredentials(options);
+      if (!options.headers.keys.any(ConduitUserAgent.isHeaderName)) {
+        final runtimeDefault = ConduitUserAgent.runtimeDefaultValue;
+        if (runtimeDefault != null) {
+          options.headers[ConduitUserAgent.headerName] = runtimeDefault;
+        }
+      }
+      options.headers['Content-Type'] ??= 'application/json';
+      options.headers['Accept'] ??= 'application/json';
+      handler.next(options);
+      return;
+    }
+
+    final path = _endpointPath(options.path);
     final authMode = _authModeFor(path);
-    final token = _authToken;
+    final snapshot = options.extra[authSnapshotExtraKey];
+    if (snapshot is ApiAuthSnapshot &&
+        (snapshot._revision != _authRevision ||
+            snapshot._token != _authToken)) {
+      handler.reject(
+        DioException(
+          requestOptions: options,
+          type: DioExceptionType.cancel,
+          error: 'Authorization session changed before request dispatch.',
+        ),
+      );
+      return;
+    }
+    final candidateToken = options.extra[candidateAuthTokenExtraKey];
+    final token = candidateToken is String
+        ? candidateToken
+        : snapshot is ApiAuthSnapshot
+        ? snapshot._token
+        : _authToken;
+    final requestCookieSuppressed = cookieCustomHeaderSuppressed;
+    // Bind any eventual 401/403 callback to the session that dispatched this
+    // request. A response from account A must not flip account B to an error
+    // after the shared interceptor has rotated tokens.
+    // Callers commonly pass const Options.extra maps. Dio exposes the same map
+    // on RequestOptions, so take a mutable request-local copy before stamping
+    // response ownership metadata.
+    options.extra = Map<String, dynamic>.of(options.extra);
+    options.extra[_requestAuthRevisionExtraKey] = _authRevision;
+    options.extra[_requestAuthTokenExtraKey] = token;
+    options.extra[_requestCookieSuppressedExtraKey] = requestCookieSuppressed;
 
     if (authMode == _EndpointAuthMode.required) {
       if (token == null || token.isEmpty) {
@@ -94,12 +247,14 @@ class ApiAuthInterceptor extends Interceptor {
     if (customHeaders.isNotEmpty) {
       customHeaders.forEach((key, value) {
         final lowerKey = key.toLowerCase();
-        if (lowerKey == 'authorization') {
+        if (lowerKey == 'authorization' ||
+            ConduitUserAgent.isHeaderName(lowerKey)) {
           DebugLogger.warning(
             'Skipping reserved header override attempt: $key',
           );
           return;
         }
+        if (requestCookieSuppressed && lowerKey == 'cookie') return;
         options.headers[key] = value;
       });
     }
@@ -107,19 +262,40 @@ class ApiAuthInterceptor extends Interceptor {
     // Add other common headers for API consistency
     options.headers['Content-Type'] ??= 'application/json';
     options.headers['Accept'] ??= 'application/json';
+    ConduitUserAgent.applyTo(options.headers);
 
     handler.next(options);
   }
 
   @override
   void onError(DioException err, ErrorInterceptorHandler handler) {
+    if (!_targetsServerOrigin(err.requestOptions)) {
+      handler.next(err);
+      return;
+    }
+
     final statusCode = err.response?.statusCode;
-    final path = err.requestOptions.path;
+    // Classify the endpoint-relative path rather than the fully resolved URI.
+    // The latter includes a configured Open WebUI base-path prefix and would
+    // otherwise hide auth failures for subpath-hosted installations.
+    final path = _endpointPath(err.requestOptions.path);
 
     final suppressAuthFailureNotification =
         err.requestOptions.extra['suppressAuthFailureNotification'] == true;
+    final requestRevision =
+        err.requestOptions.extra[_requestAuthRevisionExtraKey];
+    final requestToken = err.requestOptions.extra[_requestAuthTokenExtraKey];
+    final requestCookieSuppressed =
+        err.requestOptions.extra[_requestCookieSuppressedExtraKey];
+    final responseOwnsCurrentSession =
+        requestRevision == _authRevision &&
+        requestToken == _authToken &&
+        requestCookieSuppressed is bool &&
+        requestCookieSuppressed == cookieCustomHeaderSuppressed;
     if (statusCode case final code?
-        when !suppressAuthFailureNotification && (code == 401 || code == 403)) {
+        when !suppressAuthFailureNotification &&
+            responseOwnsCurrentSession &&
+            (code == 401 || code == 403)) {
       _handleAuthorizationError(path: path, statusCode: code);
     }
 
@@ -136,21 +312,21 @@ class ApiAuthInterceptor extends Interceptor {
     if (authMode == _EndpointAuthMode.required &&
         _shouldNotifyAuthFailure(path)) {
       _notifyAuthFailure(
-        '$statusCode $statusLabel on $path - '
+        '$statusCode $statusLabel on required endpoint - '
         'notifying app without clearing token',
       );
       return;
     }
 
     DebugLogger.auth(
-      '$statusCode on non-essential endpoint $path - keeping auth token',
+      '$statusCode on non-essential endpoint - keeping auth token',
     );
   }
 
   /// Clear auth token and notify callbacks
   /// Note: This should only be called for explicit logout, not for connection errors
   void _clearAuthToken() {
-    _authToken = null;
+    updateAuthToken(null);
     final future = onTokenInvalidated?.call();
     if (future != null) {
       unawaited(future);

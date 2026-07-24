@@ -7,6 +7,7 @@ import '../models/conversation.dart';
 import '../utils/embed_utils.dart';
 import '../utils/message_tree_utils.dart' as message_tree;
 import '../utils/openwebui_source_parser.dart';
+import 'direct_replay_output.dart';
 import 'semantic_message_builder.dart';
 import 'structured_output.dart';
 import 'structured_output_renderer.dart';
@@ -246,6 +247,60 @@ void _addVersionsFromSiblings(
   }
 }
 
+({List<String>? attachmentIds, List<Map<String, dynamic>>? files})
+_parseOpenWebUiFiles(Object? raw) {
+  if (raw is! List) {
+    return (attachmentIds: null, files: null);
+  }
+
+  final attachmentIds = <String>[];
+  final files = <Map<String, dynamic>>[];
+  for (final entry in raw) {
+    if (entry is! Map) continue;
+
+    // Open WebUI file/context entries are protocol descriptors, not a fixed
+    // display-only shape. Retrieval can depend on an id, context mode, or
+    // nested file data, so retain the complete JSON-compatible descriptor.
+    final descriptor = _coerceJsonMap(entry);
+    // Transport headers in a persisted conversation are remote input. Image
+    // renderers derive authentication from the configured server instead;
+    // retaining payload-supplied headers here could forward credentials to an
+    // arbitrary descriptor URL when a conversation or sibling is opened.
+    descriptor.remove('headers');
+    if (descriptor['type'] != null) {
+      files.add(descriptor);
+    }
+
+    // attachmentIds is Conduit's legacy uploaded-file projection. Derive it
+    // independently so that its requirements never decide whether a complete
+    // Open WebUI descriptor survives the conversation round-trip.
+    if (descriptor['file_id'] != null) {
+      attachmentIds.add(descriptor['file_id'].toString());
+    } else if (descriptor['type'] != null && descriptor['url'] != null) {
+      final url = descriptor['url'].toString();
+      // Handle all URL formats:
+      // 1. /api/v1/files/{id} and /api/v1/files/{id}/content (old format)
+      // 2. Just a file ID like "abc-123-def" (new OpenWebUI format)
+      final match = RegExp(
+        r'/api/v1/files/([^/]+)(?:/content)?$',
+      ).firstMatch(url);
+      if (match != null) {
+        attachmentIds.add(match.group(1)!);
+      } else if (!url.startsWith('data:') &&
+          !url.startsWith('http') &&
+          !url.startsWith('/') &&
+          url.isNotEmpty) {
+        attachmentIds.add(url);
+      }
+    }
+  }
+
+  return (
+    attachmentIds: attachmentIds.isEmpty ? null : attachmentIds,
+    files: files.isEmpty ? null : files,
+  );
+}
+
 /// Parse a sibling message as a ChatMessageVersion JSON map.
 Map<String, dynamic>? _parseSiblingAsVersion(
   Map<String, dynamic> msgData, {
@@ -283,7 +338,24 @@ Map<String, dynamic>? _parseSiblingAsVersion(
   }
 
   final outputItems = _effectiveOutputItems(msgData, historyMsg);
-  if (outputItems.isNotEmpty) {
+  final role = _resolveRole(msgData);
+  final metadata = _extractOpenWebUiMessageMetadata(
+    msgData,
+    historyMsg: historyMsg,
+    role: role,
+  );
+  final directReplayResolution = _resolveDirectReplayForMessage(
+    msgData,
+    historyMsg: historyMsg,
+    outputItems: outputItems,
+    role: role,
+    metadata: metadata,
+    content: contentString,
+  );
+  final directReplay = directReplayResolution.replay;
+  if (directReplay != null) {
+    contentString = directReplayResolution.content;
+  } else if (outputItems.isNotEmpty) {
     final outputBlocks = parseOpenWebUIStructuredOutput(outputItems);
     final outputContent = _mergeContentWithStructuredOutput(
       contentString,
@@ -296,26 +368,7 @@ Map<String, dynamic>? _parseSiblingAsVersion(
 
   // Extract files
   final effectiveFiles = msgData['files'] ?? historyMsg?['files'];
-  List<Map<String, dynamic>>? files;
-  if (effectiveFiles is List) {
-    final allFiles = <Map<String, dynamic>>[];
-    for (final entry in effectiveFiles) {
-      if (entry is! Map) continue;
-      if (entry['type'] != null && entry['url'] != null) {
-        final fileMap = <String, dynamic>{
-          'type': entry['type'],
-          'url': entry['url'],
-        };
-        if (entry['name'] != null) fileMap['name'] = entry['name'];
-        if (entry['size'] != null) fileMap['size'] = entry['size'];
-        if (entry['content_type'] != null) {
-          fileMap['content_type'] = entry['content_type'];
-        }
-        allFiles.add(fileMap);
-      }
-    }
-    files = allFiles.isNotEmpty ? allFiles : null;
-  }
+  final files = _parseOpenWebUiFiles(effectiveFiles).files;
 
   final embeds = normalizeEmbedList(msgData['embeds'] ?? historyMsg?['embeds']);
 
@@ -411,6 +464,15 @@ Map<String, dynamic>? _extractOpenWebUiMessageMetadata(
     ..._coerceJsonMap(msgData['metadata']),
     ..._coerceJsonMap(historyMsg?['metadata']),
   };
+
+  // Hermes transport/approval metadata is app-owned runtime provenance. Never
+  // let an OpenWebUI payload manufacture authenticated Hermes actions.
+  metadata.removeWhere(
+    (key, _) => key.toString().toLowerCase().startsWith('hermes'),
+  );
+  if (metadata['transport'] == 'hermesRun') {
+    metadata.remove('transport');
+  }
 
   final rawParentId = historyMsg?['parentId'] ?? msgData['parentId'];
   if (rawParentId != null) {
@@ -529,8 +591,42 @@ Map<String, dynamic> _parseOpenWebUIMessageToJson(
     }
   }
 
+  final role = _resolveRole(msgData);
+  final extractedMetadata = _extractOpenWebUiMessageMetadata(
+    msgData,
+    historyMsg: historyMsg,
+    role: role,
+  );
+  var metadata = <String, dynamic>{...?extractedMetadata};
   final outputItems = _effectiveOutputItems(msgData, historyMsg);
-  if (outputItems.isNotEmpty) {
+  final directReplayResolution = _resolveDirectReplayForMessage(
+    msgData,
+    historyMsg: historyMsg,
+    outputItems: outputItems,
+    role: role,
+    metadata: metadata,
+    content: contentString,
+  );
+  metadata = directReplayResolution.metadata!;
+  final directReplay = directReplayResolution.replay;
+  if (directReplay != null) {
+    contentString = directReplayResolution.content;
+    if (!directReplayResolution.preserveIncompletePresentation) {
+      metadata[kConduitDirectRawAssistantContentMetadataKey] =
+          directReplay.text;
+    }
+  } else if (outputItems.isNotEmpty) {
+    if (_hasTerminalDirectReplayProvenance(
+      msgData,
+      historyMsg: historyMsg,
+      role: role,
+      metadata: metadata,
+    )) {
+      // Open WebUI's Continue Response flow replaces this assistant's output
+      // in place. Once a non-empty output is no longer our exact mirror, its
+      // old raw replay cache must not survive the replacement.
+      metadata.remove(kConduitDirectRawAssistantContentMetadataKey);
+    }
     final outputBlocks = parseOpenWebUIStructuredOutput(outputItems);
     final outputContent = _mergeContentWithStructuredOutput(
       contentString,
@@ -544,62 +640,10 @@ Map<String, dynamic> _parseOpenWebUIMessageToJson(
   // Extract error field from OpenWebUI - preserve it separately for round-trip
   final errorData = _extractErrorData(msgData, historyMsg);
 
-  final role = _resolveRole(msgData);
-  final metadata = _extractOpenWebUiMessageMetadata(
-    msgData,
-    historyMsg: historyMsg,
-    role: role,
-  );
-
   final effectiveFiles = msgData['files'] ?? historyMsg?['files'];
-  List<String>? attachmentIds;
-  List<Map<String, dynamic>>? files;
-  if (effectiveFiles is List) {
-    final attachments = <String>[];
-    final allFiles = <Map<String, dynamic>>[];
-    for (final entry in effectiveFiles) {
-      if (entry is! Map) continue;
-      if (entry['file_id'] != null) {
-        attachments.add(entry['file_id'].toString());
-      } else if (entry['type'] != null && entry['url'] != null) {
-        final fileMap = <String, dynamic>{
-          'type': entry['type'],
-          'url': entry['url'],
-        };
-        if (entry['name'] != null) fileMap['name'] = entry['name'];
-        if (entry['size'] != null) fileMap['size'] = entry['size'];
-        if (entry['content_type'] != null) {
-          fileMap['content_type'] = entry['content_type'];
-        }
-        final headers = _coerceStringMap(entry['headers']);
-        if (headers != null && headers.isNotEmpty) {
-          fileMap['headers'] = headers;
-        }
-        allFiles.add(fileMap);
-
-        final url = entry['url'].toString();
-        // Handle all URL formats:
-        // 1. /api/v1/files/{id} and /api/v1/files/{id}/content (old format)
-        // 2. Just a file ID like "abc-123-def" (new OpenWebUI format)
-        final match = RegExp(
-          r'/api/v1/files/([^/]+)(?:/content)?$',
-        ).firstMatch(url);
-        if (match != null) {
-          attachments.add(match.group(1)!);
-        } else if (!url.startsWith('data:') &&
-            !url.startsWith('http') &&
-            !url.startsWith('/')) {
-          // New format: URL is just a bare file ID (UUID-like)
-          // Validate it looks like a reasonable ID (not an empty string)
-          if (url.isNotEmpty) {
-            attachments.add(url);
-          }
-        }
-      }
-    }
-    attachmentIds = attachments.isNotEmpty ? attachments : null;
-    files = allFiles.isNotEmpty ? allFiles : null;
-  }
+  final parsedFiles = _parseOpenWebUiFiles(effectiveFiles);
+  final attachmentIds = parsedFiles.attachmentIds;
+  final files = parsedFiles.files;
   final embeds = normalizeEmbedList(msgData['embeds'] ?? historyMsg?['embeds']);
 
   final statusHistoryRaw = historyMsg != null
@@ -629,7 +673,7 @@ Map<String, dynamic> _parseOpenWebUIMessageToJson(
     'attachmentIds': ?attachmentIds,
     'files': ?files,
     if (embeds.isNotEmpty) 'embeds': embeds,
-    'metadata': metadata ?? const <String, dynamic>{},
+    'metadata': metadata,
     'statusHistory': _parseStatusHistoryField(statusHistoryRaw),
     'followUps': _coerceStringList(followUpsRaw),
     'codeExecutions': _parseCodeExecutionsField(codeExecRaw),
@@ -744,24 +788,6 @@ List<Map<String, dynamic>> _parseStatusHistoryField(dynamic raw) {
   return const <Map<String, dynamic>>[];
 }
 
-Map<String, String>? _coerceStringMap(dynamic raw) {
-  if (raw is Map) {
-    final result = <String, String>{};
-    raw.forEach((key, value) {
-      final keyString = key?.toString();
-      final valueString = value?.toString();
-      if (keyString != null &&
-          keyString.isNotEmpty &&
-          valueString != null &&
-          valueString.isNotEmpty) {
-        result[keyString] = valueString;
-      }
-    });
-    return result.isEmpty ? null : result;
-  }
-  return null;
-}
-
 List<String> _coerceStringList(dynamic raw) {
   if (raw is List) {
     return raw
@@ -873,6 +899,119 @@ List<Map<String, dynamic>> _effectiveOutputItems(
     return directItems;
   }
   return _normalizeOutputItems(historyMsg['output']);
+}
+
+ConduitDirectReplayOutputMirror? _trustedDirectReplayOutput(
+  Map<String, dynamic> msgData, {
+  required Map<String, dynamic>? historyMsg,
+  required List<Map<String, dynamic>> outputItems,
+  required String role,
+  required Map<String, dynamic>? metadata,
+}) {
+  if (!_hasTerminalDirectReplayProvenance(
+    msgData,
+    historyMsg: historyMsg,
+    role: role,
+    metadata: metadata,
+  )) {
+    return null;
+  }
+  return parseConduitDirectReplayOutput(outputItems);
+}
+
+({
+  String content,
+  Map<String, dynamic>? metadata,
+  ConduitDirectReplayOutputMirror? replay,
+  bool preserveIncompletePresentation,
+})
+_resolveDirectReplayForMessage(
+  Map<String, dynamic> msgData, {
+  required Map<String, dynamic>? historyMsg,
+  required List<Map<String, dynamic>> outputItems,
+  required String role,
+  required Map<String, dynamic>? metadata,
+  required String content,
+}) {
+  final replay = _trustedDirectReplayOutput(
+    msgData,
+    historyMsg: historyMsg,
+    outputItems: outputItems,
+    role: role,
+    metadata: metadata,
+  );
+  if (replay == null) {
+    return (
+      content: content,
+      metadata: metadata,
+      replay: null,
+      preserveIncompletePresentation: false,
+    );
+  }
+
+  final preserveIncompletePresentation =
+      replay.isIncompleteAnswerSentinel &&
+      metadata?[kConduitDirectRawAssistantContentMetadataKey] is String &&
+      (metadata?[kConduitDirectRawAssistantContentMetadataKey] as String)
+          .trim()
+          .isEmpty;
+  return (
+    content: _reconcileDirectReplayContent(
+      content,
+      metadata: metadata,
+      replayText: replay.text,
+      preserveIncompletePresentation: preserveIncompletePresentation,
+    ),
+    metadata: metadata,
+    replay: replay,
+    preserveIncompletePresentation: preserveIncompletePresentation,
+  );
+}
+
+bool _hasTerminalDirectReplayProvenance(
+  Map<String, dynamic> msgData, {
+  required Map<String, dynamic>? historyMsg,
+  required String role,
+  required Map<String, dynamic>? metadata,
+}) =>
+    role.trim().toLowerCase() == 'assistant' &&
+    metadata?['transport'] == kConduitDirectTransport &&
+    _safeBool(msgData['done'] ?? historyMsg?['done']) == true &&
+    _safeBool(msgData['isStreaming'] ?? historyMsg?['isStreaming']) != true;
+
+String _reconcileDirectReplayContent(
+  String content, {
+  required Map<String, dynamic>? metadata,
+  required String replayText,
+  bool preserveIncompletePresentation = false,
+}) {
+  if (preserveIncompletePresentation) return content;
+  final replayPresentation = renderSemanticMessageBlocks(<SemanticMessageBlock>[
+    SemanticTextBlock(replayText),
+  ]);
+  final priorRaw = metadata?[kConduitDirectRawAssistantContentMetadataKey];
+  if (priorRaw == replayText ||
+      content == replayPresentation ||
+      content.endsWith('\n$replayPresentation')) {
+    return content;
+  }
+
+  if (priorRaw is String) {
+    final priorPresentation = renderSemanticMessageBlocks(
+      <SemanticMessageBlock>[SemanticTextBlock(priorRaw)],
+    );
+    if (content == priorPresentation) return replayPresentation;
+    final suffix = '\n$priorPresentation';
+    if (content.endsWith(suffix)) {
+      return '${content.substring(0, content.length - suffix.length)}'
+          '\n$replayPresentation';
+    }
+  }
+
+  // The mirror is the edited provider-facing answer. If the prior display
+  // cannot be separated safely from stale answer text, prefer the edit alone
+  // instead of presenting or replaying two divergent answers.
+  return replayPresentation;
 }
 
 String _mergeContentWithStructuredOutput(

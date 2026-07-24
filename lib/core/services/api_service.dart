@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:dio/dio.dart';
+import 'package:dio/io.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http_parser/http_parser.dart';
 import 'package:uuid/uuid.dart';
@@ -20,6 +22,12 @@ import '../models/server_config.dart';
 import '../models/server_memory.dart';
 import '../models/server_user_settings.dart';
 import '../models/user.dart';
+import '../network/conduit_user_agent.dart';
+import '../../features/workspace/models/workspace_common.dart';
+import '../../features/workspace/models/workspace_knowledge.dart';
+import '../../features/workspace/models/workspace_prompt_command.dart';
+import '../../features/workspace/models/workspace_resources.dart';
+import '../../features/workspace/models/workspace_tool_content.dart';
 import '../auth/api_auth_interceptor.dart';
 import '../error/api_error_interceptor.dart';
 import '../sync/sync_api_client.dart' show SyncTerminalException;
@@ -39,6 +47,563 @@ const int _conversationWorkerByteThreshold = 50 * 1024;
 const int _conversationSummaryWorkerItemThreshold = 24;
 const int _fileUploadTimeoutBytesPerSecondFloor = 128 * 1024;
 const Duration _minimumFileUploadTimeout = Duration(minutes: 5);
+const int _maximumPublicHealthRedirects = 5;
+const Set<int> _publicHealthRedirectStatusCodes = {
+  HttpStatus.movedPermanently,
+  HttpStatus.found,
+  HttpStatus.seeOther,
+  HttpStatus.temporaryRedirect,
+  HttpStatus.permanentRedirect,
+};
+
+const int _maximumSameOriginRedirectHops = 5;
+const String _sameOriginRedirectHopExtraKey = 'conduit.sameOriginRedirectHops';
+
+int _effectiveHttpPort(Uri uri) {
+  if (uri.hasPort) return uri.port;
+  return uri.scheme.toLowerCase() == 'https' ? 443 : 80;
+}
+
+/// Whether a redirect target may keep this client's credentials: the exact
+/// request origin, or its default-port https upgrade. Cross-origin hops,
+/// scheme downgrades, and port remaps must surface to the caller instead.
+@visibleForTesting
+bool isCredentialSafeRedirectTarget(Uri from, Uri to) {
+  final fromScheme = from.scheme.toLowerCase();
+  final toScheme = to.scheme.toLowerCase();
+  if (toScheme != 'http' && toScheme != 'https') return false;
+  if (to.host.isEmpty || to.host.toLowerCase() != from.host.toLowerCase()) {
+    return false;
+  }
+  if (toScheme == fromScheme) {
+    return _effectiveHttpPort(to) == _effectiveHttpPort(from);
+  }
+  return fromScheme == 'http' &&
+      toScheme == 'https' &&
+      _effectiveHttpPort(from) == 80 &&
+      _effectiveHttpPort(to) == 443;
+}
+
+final class _PublicHealthDeadline {
+  _PublicHealthDeadline(this.budget) : _clock = Stopwatch()..start();
+
+  final Duration budget;
+  final Stopwatch _clock;
+
+  Duration remaining({Duration? cappedAt}) {
+    final value = budget - _clock.elapsed;
+    if (value <= Duration.zero) {
+      throw TimeoutException('Public health-check deadline expired');
+    }
+    if (cappedAt != null && value > cappedAt) return cappedAt;
+    return value;
+  }
+}
+
+Future<void> _cancelPublicHealthResponse(Response<dynamic>? response) async {
+  final body = response?.data;
+  if (body is! ResponseBody) return;
+  try {
+    final subscription = body.stream.listen(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    await subscription.cancel();
+  } catch (_) {
+    // The request client may already have closed the native response stream.
+  }
+}
+
+CancelToken _linkedPublicHealthCancelToken(CancelToken parent) {
+  final child = CancelToken();
+  if (parent.isCancelled) {
+    child.cancel(parent.cancelError);
+    return child;
+  }
+  unawaited(
+    parent.whenCancel.then<void>((_) {
+      if (!child.isCancelled) child.cancel(parent.cancelError);
+    }),
+  );
+  return child;
+}
+
+typedef PublicHealthAddressResolver =
+    Future<List<InternetAddress>> Function(String host);
+typedef PublicHealthSocketConnector =
+    Future<ConnectionTask<Socket>> Function(InternetAddress address, int port);
+typedef PublicHealthSocketUpgrader =
+    Future<Socket> Function(Socket socket, String host);
+
+final class _PublicHealthNat64Prefix {
+  const _PublicHealthNat64Prefix(this.bytes, this.length);
+
+  final List<int> bytes;
+  final int length;
+
+  bool matches(List<int> address) {
+    final prefixBytes = length ~/ 8;
+    if (address.length != 16 || bytes.length != prefixBytes) return false;
+    for (var index = 0; index < prefixBytes; index++) {
+      if (address[index] != bytes[index]) return false;
+    }
+    return true;
+  }
+}
+
+final class _PinnedPublicHealthSocketAttempt {
+  bool acceptsResult = true;
+  ConnectionTask<Socket>? connectionTask;
+  Socket? rawSocket;
+  Socket? upgradedSocket;
+
+  void cancel() {
+    acceptsResult = false;
+    try {
+      connectionTask?.cancel();
+    } catch (_) {}
+    try {
+      rawSocket?.destroy();
+    } catch (_) {}
+    try {
+      upgradedSocket?.destroy();
+    } catch (_) {}
+  }
+
+  void transferSocketOwnership() {
+    acceptsResult = false;
+    connectionTask = null;
+    rawSocket = null;
+    upgradedSocket = null;
+  }
+}
+
+/// Owns every socket produced while trying a prevalidated DNS result.
+///
+/// `SecureSocket.secure` detaches the raw [Socket] before its future completes.
+/// Keeping an acceptance flag around the upgrade future is therefore essential:
+/// a timeout can no longer close the detached wrapper, but it can still destroy
+/// the upgraded socket as soon as that future completes.
+final class _PinnedPublicHealthConnection {
+  _PinnedPublicHealthConnection({
+    required this.target,
+    required this.addresses,
+    required this.connectTimeout,
+    required this.connector,
+    required this.upgrader,
+  });
+
+  final Uri target;
+  final List<InternetAddress> addresses;
+  final Duration connectTimeout;
+  final PublicHealthSocketConnector connector;
+  final PublicHealthSocketUpgrader upgrader;
+  final Completer<Socket> _result = Completer<Socket>();
+
+  _PinnedPublicHealthSocketAttempt? _activeAttempt;
+  bool _cancelled = false;
+
+  ConnectionTask<Socket> start() {
+    unawaited(_run());
+    return ConnectionTask.fromSocket<Socket>(_result.future, cancel);
+  }
+
+  void cancel() {
+    if (_cancelled) return;
+    _cancelled = true;
+    _activeAttempt?.cancel();
+    if (!_result.isCompleted) {
+      _result.completeError(
+        const SocketException('Pinned health connection was cancelled'),
+        StackTrace.current,
+      );
+    }
+  }
+
+  Future<void> _run() async {
+    final deadline = DateTime.now().add(connectTimeout);
+    Object? lastError;
+    StackTrace? lastStackTrace;
+
+    for (var index = 0; index < addresses.length; index++) {
+      if (_cancelled || _result.isCompleted) return;
+      final remaining = deadline.difference(DateTime.now());
+      if (remaining <= Duration.zero) break;
+
+      // Reserve a fair share of the one connection deadline for every
+      // prevalidated address. This retains IPv6/IPv4 fallback without allowing
+      // each failed address to restart the full timeout.
+      final addressesLeft = addresses.length - index;
+      final sliceMicros =
+          (remaining.inMicroseconds + addressesLeft - 1) ~/ addressesLeft;
+      final attemptDeadline = DateTime.now().add(
+        Duration(microseconds: sliceMicros),
+      );
+      final attempt = _PinnedPublicHealthSocketAttempt();
+      _activeAttempt = attempt;
+
+      try {
+        final connectionTask = await connector(addresses[index], target.port)
+            .then((task) {
+              if (!attempt.acceptsResult || _cancelled) {
+                task.cancel();
+                throw const SocketException(
+                  'Pinned health connection was cancelled',
+                );
+              }
+              attempt.connectionTask = task;
+              return task;
+            })
+            .timeout(_remainingUntil(attemptDeadline));
+
+        final rawSocket = await connectionTask.socket
+            .then((socket) {
+              if (!attempt.acceptsResult || _cancelled) {
+                socket.destroy();
+                throw const SocketException(
+                  'Pinned health connection was cancelled',
+                );
+              }
+              attempt.rawSocket = socket;
+              return socket;
+            })
+            .timeout(_remainingUntil(attemptDeadline));
+        attempt.connectionTask = null;
+
+        if (target.scheme.toLowerCase() == 'http') {
+          attempt.transferSocketOwnership();
+          _activeAttempt = null;
+          _result.complete(rawSocket);
+          return;
+        }
+
+        final upgradedSocket = await upgrader(rawSocket, target.host)
+            .then((socket) {
+              if (!attempt.acceptsResult || _cancelled) {
+                socket.destroy();
+                throw const SocketException(
+                  'Pinned health connection was cancelled',
+                );
+              }
+              attempt.upgradedSocket = socket;
+              return socket;
+            })
+            .timeout(_remainingUntil(attemptDeadline));
+
+        attempt.transferSocketOwnership();
+        _activeAttempt = null;
+        _result.complete(upgradedSocket);
+        return;
+      } catch (error, stackTrace) {
+        lastError = error;
+        lastStackTrace = stackTrace;
+        attempt.cancel();
+        if (identical(_activeAttempt, attempt)) _activeAttempt = null;
+      }
+    }
+
+    if (_cancelled || _result.isCompleted) return;
+    _result.completeError(
+      lastError ??
+          const SocketException('No validated health address was reachable'),
+      lastStackTrace ?? StackTrace.current,
+    );
+  }
+
+  Duration _remainingUntil(DateTime deadline) {
+    final remaining = deadline.difference(DateTime.now());
+    return remaining > Duration.zero
+        ? remaining
+        : const Duration(microseconds: 1);
+  }
+}
+
+@visibleForTesting
+bool requestUsesServerConnectivityOrigin(Uri request, Uri? server) {
+  if (server == null ||
+      !request.hasScheme ||
+      !server.hasScheme ||
+      request.host.isEmpty ||
+      server.host.isEmpty) {
+    return false;
+  }
+  return request.scheme.toLowerCase() == server.scheme.toLowerCase() &&
+      request.host.toLowerCase() == server.host.toLowerCase() &&
+      request.port == server.port;
+}
+
+/// Whether an address is safe for a public, off-origin health redirect.
+///
+/// Same-origin health redirects deliberately bypass this classification so a
+/// self-hosted Open WebUI instance can keep using loopback, LAN, VPN, or ULA
+/// addressing. Off-origin redirects must be globally routable to avoid
+/// turning the public `/health` probe into an internal-network request.
+@visibleForTesting
+bool isPublicHealthRedirectAddress(InternetAddress address) {
+  final bytes = address.rawAddress;
+  if (address.type == InternetAddressType.IPv4) {
+    return _isPublicIpv4(bytes);
+  }
+  if (address.type != InternetAddressType.IPv6 || bytes.length != 16) {
+    return false;
+  }
+
+  // IPv4-mapped IPv6 addresses retain the IPv4 address's classification.
+  if (bytes.take(10).every((byte) => byte == 0) &&
+      bytes[10] == 0xff &&
+      bytes[11] == 0xff) {
+    return _isPublicIpv4(bytes.sublist(12));
+  }
+
+  // The well-known NAT64 prefix embeds an IPv4 destination in the final four
+  // bytes. Do not allow it to disguise a private or otherwise reserved target.
+  const nat64Prefix = <int>[0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0];
+  if (_startsWithBytes(bytes, nat64Prefix)) {
+    return _isPublicIpv4(bytes.sublist(12));
+  }
+
+  // Network-specific RFC 6052 Pref64 values cannot be inferred from an IPv6
+  // address alone. In particular, treating every global /96 address as a
+  // synthesized IPv4 destination would reject ordinary hosts such as
+  // 2606:4700:4700::1. Only the standardized well-known prefix above is
+  // unambiguous without a platform Pref64-discovery API; every other address
+  // continues through native IPv6 classification.
+
+  // Globally routable unicast currently lives in 2000::/3. This rejects
+  // unspecified, loopback, ULA, link/site-local, multicast, and other
+  // reserved address classes in one fail-closed boundary.
+  if ((bytes[0] & 0xe0) != 0x20) return false;
+
+  // Reject special-purpose ranges nested inside global-unicast space.
+  if (bytes[0] == 0x20 && bytes[1] == 0x01) {
+    // 2001:0000::/23 (IETF protocol assignments, not ordinary public hosts).
+    if (bytes[2] <= 0x01) return false;
+    // 2001:db8::/32 documentation.
+    if (bytes[2] == 0x0d && bytes[3] == 0xb8) return false;
+  }
+  // 2002::/16 (deprecated 6to4 transition space).
+  if (bytes[0] == 0x20 && bytes[1] == 0x02) return false;
+  // 3fff::/20 documentation.
+  if (bytes[0] == 0x3f && bytes[1] == 0xff && (bytes[2] & 0xf0) == 0) {
+    return false;
+  }
+  return true;
+}
+
+bool _requiresNat64PrefixDiscovery(InternetAddress address) {
+  if (address.type != InternetAddressType.IPv6 ||
+      address.rawAddress.length != 16) {
+    return false;
+  }
+  final bytes = address.rawAddress;
+  final isMapped =
+      bytes.take(10).every((byte) => byte == 0) &&
+      bytes[10] == 0xff &&
+      bytes[11] == 0xff;
+  if (isMapped) return false;
+  const wellKnownPrefix = <int>[0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0];
+  return !_startsWithBytes(bytes, wellKnownPrefix);
+}
+
+bool _isPublicHealthRedirectAddressWithNat64Prefixes(
+  InternetAddress address,
+  List<_PublicHealthNat64Prefix> prefixes,
+) {
+  if (!isPublicHealthRedirectAddress(address)) return false;
+  if (address.type != InternetAddressType.IPv6) return true;
+
+  final bytes = address.rawAddress;
+  for (final prefix in prefixes) {
+    if (!prefix.matches(bytes)) continue;
+    final embedded = _rfc6052EmbeddedIpv4(bytes, prefix.length);
+    // An address inside a discovered translation prefix must use the RFC 6052
+    // layout. Invalid reserved/u bits fail closed instead of being treated as
+    // an unrelated native IPv6 host.
+    if (embedded == null || !_isPublicIpv4(embedded)) return false;
+  }
+  return true;
+}
+
+List<_PublicHealthNat64Prefix>? _nat64PrefixesFromIpv4OnlyArpa(
+  List<InternetAddress> addresses,
+) {
+  if (addresses.isEmpty) return null;
+  const discoveryTargets = <List<int>>[
+    <int>[192, 0, 0, 170],
+    <int>[192, 0, 0, 171],
+  ];
+  final prefixes = <String, _PublicHealthNat64Prefix>{};
+
+  for (final address in addresses) {
+    final bytes = address.rawAddress;
+    if (address.type == InternetAddressType.IPv4) {
+      if (!discoveryTargets.any((target) => listEquals(target, bytes))) {
+        return null;
+      }
+      continue;
+    }
+    if (address.type != InternetAddressType.IPv6 || bytes.length != 16) {
+      return null;
+    }
+
+    var discovered = false;
+    for (final prefixLength in const <int>[32, 40, 48, 56, 64, 96]) {
+      final embedded = _rfc6052EmbeddedIpv4(bytes, prefixLength);
+      if (embedded == null ||
+          !discoveryTargets.any((target) => listEquals(target, embedded))) {
+        continue;
+      }
+      final prefixBytes = List<int>.unmodifiable(
+        bytes.sublist(0, prefixLength ~/ 8),
+      );
+      final key = '$prefixLength:${prefixBytes.join(',')}';
+      prefixes[key] = _PublicHealthNat64Prefix(prefixBytes, prefixLength);
+      discovered = true;
+    }
+    // ipv4only.arpa has no native AAAA records. An IPv6 answer that does not
+    // encode either standardized marker means discovery was tampered with or
+    // is unsupported, so generic IPv6 targets cannot be classified safely.
+    if (!discovered) return null;
+  }
+
+  return List<_PublicHealthNat64Prefix>.unmodifiable(prefixes.values);
+}
+
+@visibleForTesting
+bool isPublicHealthRedirectAddressWithNat64DiscoveryForTest(
+  InternetAddress address,
+  List<InternetAddress> ipv4OnlyArpaAnswers,
+) {
+  final prefixes = _nat64PrefixesFromIpv4OnlyArpa(ipv4OnlyArpaAnswers);
+  return prefixes != null &&
+      _isPublicHealthRedirectAddressWithNat64Prefixes(address, prefixes);
+}
+
+List<int>? _rfc6052EmbeddedIpv4(List<int> bytes, int prefixLength) {
+  if (bytes.length != 16) return null;
+  if (prefixLength == 96) return bytes.sublist(12, 16);
+
+  // RFC 6052's u octet separates an embedding that crosses bit 64. The
+  // remaining suffix bits are reserved and zero in synthesized addresses.
+  if (bytes[8] != 0) return null;
+  final (candidate, suffixStart) = switch (prefixLength) {
+    32 => (<int>[...bytes.sublist(4, 8)], 9),
+    40 => (<int>[...bytes.sublist(5, 8), bytes[9]], 10),
+    48 => (<int>[...bytes.sublist(6, 8), ...bytes.sublist(9, 11)], 11),
+    56 => (<int>[bytes[7], ...bytes.sublist(9, 12)], 12),
+    64 => (<int>[...bytes.sublist(9, 13)], 13),
+    _ => (<int>[], 16),
+  };
+  if (candidate.length != 4 ||
+      !bytes.sublist(suffixStart).every((byte) => byte == 0)) {
+    return null;
+  }
+  return candidate;
+}
+
+bool _startsWithBytes(List<int> value, List<int> prefix) {
+  if (value.length < prefix.length) return false;
+  for (var index = 0; index < prefix.length; index++) {
+    if (value[index] != prefix[index]) return false;
+  }
+  return true;
+}
+
+bool _isPublicIpv4(List<int> bytes) {
+  if (bytes.length != 4) return false;
+  final first = bytes[0];
+  final second = bytes[1];
+
+  if (first == 0 || first == 10 || first == 127 || first >= 224) return false;
+  if (first == 100 && second >= 64 && second <= 127) return false; // CGNAT
+  if (first == 169 && second == 254) return false; // link-local
+  if (first == 172 && second >= 16 && second <= 31) return false;
+  if (first == 192) {
+    if (second == 0 && bytes[2] == 0) return false; // protocol assignments
+    if (second == 0 && bytes[2] == 2) return false; // documentation
+    if (second == 88 && bytes[2] == 99) return false; // deprecated relay
+    if (second == 168) return false;
+  }
+  if (first == 198) {
+    if (second == 18 || second == 19) return false; // benchmarking
+    if (second == 51 && bytes[2] == 100) return false; // documentation
+  }
+  if (first == 203 && second == 0 && bytes[2] == 113) return false;
+  return true;
+}
+
+final class FileContentTooLargeException implements Exception {
+  const FileContentTooLargeException();
+
+  @override
+  String toString() => 'File content exceeds the configured byte limit.';
+}
+
+/// Forwards caller cancellation without giving request-local guards ownership
+/// of a token that may be shared with other file lookups.
+final class _FileContentCancellationLink {
+  _FileContentCancellationLink(CancelToken? caller) {
+    if (caller == null) return;
+    final cancellation = caller.cancelError;
+    if (cancellation != null) {
+      requestToken.cancel(cancellation.error);
+      return;
+    }
+
+    // CancelToken exposes a Future rather than a removable listener. Keep only
+    // a weak link in that future so a completed request and its transport are
+    // collectible even when a long-lived shared caller token is never cancelled.
+    final weakLink = WeakReference<_FileContentCancellationLink>(this);
+    unawaited(
+      caller.whenCancel.then<void>(
+        (error) => weakLink.target?._forward(error),
+        onError: (Object _, StackTrace _) {},
+      ),
+    );
+  }
+
+  final CancelToken requestToken = CancelToken();
+  bool _attached = true;
+
+  void _forward(DioException error) {
+    if (_attached && !requestToken.isCancelled) {
+      requestToken.cancel(error.error);
+    }
+  }
+
+  void detach() => _attached = false;
+}
+
+Future<bool> _moveFileContentStreamOrCancel(
+  StreamIterator<List<int>> iterator,
+  CancelToken? cancelToken,
+) {
+  final cancellation = cancelToken?.cancelError;
+  if (cancellation != null) return Future<bool>.error(cancellation);
+  final move = iterator.moveNext();
+  if (cancelToken == null) return move;
+  // Future.any observes the losing stream move as well as the cancellation
+  // branch, so a source that reports a late error after cancellation cannot
+  // escape through the zone.
+  return Future.any<bool>(<Future<bool>>[
+    move,
+    cancelToken.whenCancel.then<bool>((error) => throw error),
+  ]);
+}
+
+void _cancelFileContentStreamIterator(StreamIterator<List<int>> iterator) {
+  try {
+    unawaited(
+      iterator.cancel().then<void>(
+        (_) {},
+        onError: (Object _, StackTrace _) {},
+      ),
+    );
+  } catch (_) {
+    // The request token already revoked transport ownership. Source teardown
+    // is best effort and must not delay Stop or replace the primary error.
+  }
+}
 
 void _traceApi(String message) {
   if (!_traceApiLogs) {
@@ -250,7 +815,14 @@ class ApiService {
   final ServerConfig serverConfig;
   final WorkerManager _workerManager;
   final DateTime Function() _now;
+  final PublicHealthAddressResolver _publicHealthAddressResolver;
+  final PublicHealthSocketConnector _publicHealthSocketConnector;
+  final PublicHealthSocketUpgrader _publicHealthSocketUpgrader;
+  final Duration _publicHealthPinnedConnectTimeout;
+  final Duration _publicHealthRequestTimeout;
   late final ApiAuthInterceptor _authInterceptor;
+  Future<void> _userSettingsMutationQueue = Future<void>.value();
+  bool _disposed = false;
   _ChatRequestMetadataFormat? _chatRequestMetadataFormat;
   // Public getter for dio instance
   Dio get dio => _dio;
@@ -268,41 +840,138 @@ class ApiService {
     required this.serverConfig,
     required WorkerManager workerManager,
     String? authToken,
+    bool suppressCookieCustomHeader = false,
+    bool Function()? shouldSuppressCookieCustomHeader,
     DateTime Function()? now,
+    PublicHealthAddressResolver? publicHealthAddressResolver,
+    PublicHealthSocketConnector? publicHealthSocketConnector,
+    PublicHealthSocketUpgrader? publicHealthSocketUpgrader,
+    Duration publicHealthPinnedConnectTimeout = const Duration(seconds: 30),
+    Duration publicHealthRequestTimeout = const Duration(seconds: 30),
   }) : _dio = Dio(
          BaseOptions(
            baseUrl: serverConfig.url,
            connectTimeout: const Duration(seconds: 30),
            receiveTimeout: const Duration(seconds: 30),
-           followRedirects: true,
-           maxRedirects: 5,
-           validateStatus: (status) => status != null && status < 400,
-           // Add custom headers from server config
-           headers: serverConfig.customHeaders.isNotEmpty
-               ? Map<String, String>.from(serverConfig.customHeaders)
-               : null,
+           // Requests on this client can carry a bearer token plus
+           // installation-specific reverse-proxy headers. Dart's redirect
+           // handling cannot guarantee that arbitrary custom credentials are
+           // stripped when Location crosses origins, so credentialed API
+           // redirects must be surfaced to the caller instead of followed.
+           followRedirects: false,
+           maxRedirects: 0,
+           validateStatus: (status) => status != null && status < 300,
          ),
        ),
        _workerManager = workerManager,
-       _now = now ?? DateTime.now {
-    ServerTlsHttpClientFactory.configureDio(_dio, serverConfig);
-
-    // Use API key from server config if provided and no explicit auth token
-    final effectiveAuthToken = authToken ?? serverConfig.apiKey;
+       _now = now ?? DateTime.now,
+       _publicHealthAddressResolver =
+           publicHealthAddressResolver ??
+           ((host) => InternetAddress.lookup(host)),
+       _publicHealthSocketConnector =
+           publicHealthSocketConnector ??
+           ((address, port) => Socket.startConnect(address, port)),
+       _publicHealthSocketUpgrader =
+           publicHealthSocketUpgrader ??
+           ((socket, host) => SecureSocket.secure(socket, host: host)),
+       _publicHealthPinnedConnectTimeout = publicHealthPinnedConnectTimeout,
+       _publicHealthRequestTimeout = publicHealthRequestTimeout {
+    if (publicHealthRequestTimeout <= Duration.zero) {
+      throw ArgumentError.value(
+        publicHealthRequestTimeout,
+        'publicHealthRequestTimeout',
+        'must be greater than zero',
+      );
+    }
+    ServerTlsHttpClientFactory.configureDio(
+      _dio,
+      serverConfig,
+      userAgent: ConduitUserAgent.value,
+    );
 
     // Initialize the consistent auth interceptor
     _authInterceptor = ApiAuthInterceptor(
-      authToken: effectiveAuthToken,
+      serverUrl: serverConfig.url,
+      // OpenWebUI bearer ownership comes only from AuthStateManager (or an
+      // explicit operation-scoped discovery token). Legacy ServerConfig.apiKey
+      // values must never silently survive logout or a server switch.
+      authToken: authToken,
       onAuthTokenInvalid: onAuthTokenInvalid,
       onTokenInvalidated: onTokenInvalidated,
       customHeaders: serverConfig.customHeaders,
+      suppressCookieCustomHeader: suppressCookieCustomHeader,
+      shouldSuppressCookieCustomHeader: shouldSuppressCookieCustomHeader,
     );
 
     // Add interceptors in order of priority:
     // 1. Auth interceptor (must be first to add auth headers)
     _dio.interceptors.add(_authInterceptor);
 
-    // 2. Validation interceptor removed (no schema loading/logging)
+    // 2. Same-origin redirect recovery. Base options disable redirect
+    // following because Dart's client cannot guarantee credential stripping on
+    // cross-origin Location hops. Reverse proxies still commonly redirect API
+    // paths within the SAME origin (trailing slashes, canonical rewrites, and
+    // default-port http→https upgrades), and those worked before redirect
+    // following was disabled, so safe idempotent hops are replayed here with
+    // the target restricted by [isCredentialSafeRedirectTarget].
+    _dio.interceptors.add(
+      InterceptorsWrapper(
+        onError: (error, handler) async {
+          final response = error.response;
+          final status = response?.statusCode;
+          if (error.type != DioExceptionType.badResponse ||
+              response == null ||
+              status == null ||
+              !_publicHealthRedirectStatusCodes.contains(status)) {
+            return handler.next(error);
+          }
+          final options = error.requestOptions;
+          final method = options.method.toUpperCase();
+          final convertsToGet =
+              status == HttpStatus.seeOther && method != 'HEAD';
+          if (method != 'GET' && method != 'HEAD' && !convertsToGet) {
+            return handler.next(error);
+          }
+          final locationValue = response.headers.value(
+            HttpHeaders.locationHeader,
+          );
+          final location = locationValue == null
+              ? null
+              : Uri.tryParse(locationValue);
+          if (location == null) return handler.next(error);
+          final target = options.uri.resolveUri(location);
+          final hops =
+              (options.extra[_sameOriginRedirectHopExtraKey] as int?) ?? 0;
+          if (hops >= _maximumSameOriginRedirectHops ||
+              !isCredentialSafeRedirectTarget(options.uri, target)) {
+            return handler.next(error);
+          }
+          options.extra = Map<String, dynamic>.of(options.extra)
+            ..[_sameOriginRedirectHopExtraKey] = hops + 1;
+          // Location carries the complete target including its query; the
+          // original queryParameters must not be re-merged on top of it.
+          options.path = target.toString();
+          options.queryParameters = <String, dynamic>{};
+          if (convertsToGet) {
+            options.method = 'GET';
+            options.data = null;
+            // Stale body headers would make the bodyless GET claim content it
+            // never sends, which the server-side parser rejects.
+            options.headers.removeWhere((name, _) {
+              final normalized = name.toLowerCase();
+              return normalized == Headers.contentLengthHeader ||
+                  normalized == Headers.contentTypeHeader;
+            });
+          }
+          try {
+            final redirected = await _dio.fetch<dynamic>(options);
+            return handler.resolve(redirected);
+          } on DioException catch (redirectError) {
+            return handler.next(redirectError);
+          }
+        },
+      ),
+    );
 
     // 3. Error handling interceptor (transforms errors to standardized format)
     _dio.interceptors.add(
@@ -312,39 +981,90 @@ class ApiService {
       ),
     );
 
-    // 4. Success pings to relax offline detection.
-    // Any successful API response indicates recent connectivity; suppress
-    // offline transitions briefly to avoid UI flicker.
+    // 4. Success pings to relax offline detection. ApiService also supports
+    // absolute image/CDN URLs, so only the configured server origin is allowed
+    // to influence that server's health state.
+    final connectivityOrigin = Uri.tryParse(serverConfig.url);
     _dio.interceptors.add(
       InterceptorsWrapper(
         onResponse: (response, handler) {
           try {
             if ((response.statusCode ?? 0) >= 200 &&
-                (response.statusCode ?? 0) < 400) {
+                (response.statusCode ?? 0) < 400 &&
+                requestUsesServerConnectivityOrigin(
+                  response.requestOptions.uri,
+                  connectivityOrigin,
+                )) {
               ConnectivityService.suppressOfflineGlobally(
                 const Duration(seconds: 4),
               );
+              ConnectivityService.noteSuccessfulTraffic(connectivityOrigin);
             }
           } catch (_) {}
           handler.next(response);
+        },
+        onError: (error, handler) {
+          if (error.response == null &&
+              requestUsesServerConnectivityOrigin(
+                error.requestOptions.uri,
+                connectivityOrigin,
+              ) &&
+              (error.type == DioExceptionType.connectionTimeout ||
+                  error.type == DioExceptionType.sendTimeout ||
+                  error.type == DioExceptionType.receiveTimeout ||
+                  error.type == DioExceptionType.connectionError ||
+                  error.type == DioExceptionType.unknown)) {
+            ConnectivityService.reportTransportFailure(connectivityOrigin);
+          }
+          handler.next(error);
         },
       ),
     );
   }
 
-  Future<Uint8List> fetchImageBytes(String imageUrl) async {
+  Future<Uint8List> fetchImageBytes(
+    String imageUrl, {
+    int maxBytes = 2 * 1024 * 1024,
+  }) async {
     final uri = Uri.parse(imageUrl);
+    final cancelToken = CancelToken();
     final options = Options(
       responseType: ResponseType.bytes,
       receiveTimeout: const Duration(seconds: 10),
       sendTimeout: const Duration(seconds: 10),
     );
     final Response<List<int>> response = uri.hasScheme
-        ? await _dio.getUri<List<int>>(uri, options: options)
-        : await _dio.get<List<int>>(imageUrl, options: options);
+        ? await _dio.getUri<List<int>>(
+            uri,
+            options: options,
+            cancelToken: cancelToken,
+            onReceiveProgress: (received, total) {
+              if (received > maxBytes || total > maxBytes) {
+                cancelToken.cancel('Image response exceeded $maxBytes bytes');
+              }
+            },
+          )
+        : await _dio.get<List<int>>(
+            imageUrl,
+            options: options,
+            cancelToken: cancelToken,
+            onReceiveProgress: (received, total) {
+              if (received > maxBytes || total > maxBytes) {
+                cancelToken.cancel('Image response exceeded $maxBytes bytes');
+              }
+            },
+          );
+    final contentType = response.headers.value(Headers.contentTypeHeader);
+    if (contentType != null &&
+        !contentType.toLowerCase().startsWith('image/')) {
+      throw const FormatException('Image response has a non-image MIME type.');
+    }
     final data = response.data;
     if (data == null || data.isEmpty) {
       return Uint8List(0);
+    }
+    if (data.length > maxBytes) {
+      throw StateError('Image response exceeded $maxBytes bytes.');
     }
     if (data is Uint8List) {
       return data;
@@ -356,7 +1076,54 @@ class ApiService {
     _authInterceptor.updateAuthToken(token);
   }
 
+  /// Prevents a persisted reverse-proxy cookie from being attached to future
+  /// requests. Used as a process-local logout fail-safe when durable config
+  /// scrubbing cannot be confirmed.
+  void setCookieCustomHeaderSuppressed(bool suppressed) {
+    _authInterceptor.setCookieCustomHeaderSuppressed(suppressed);
+  }
+
+  /// Live logout-fence state used by request paths that build headers outside
+  /// Dio (for example authenticated image widgets).
+  bool get cookieCustomHeaderSuppressed =>
+      _authInterceptor.cookieCustomHeaderSuppressed;
+
   String? get authToken => _authInterceptor.authToken;
+
+  /// Changes whenever the bearer/cookie transport identity changes.
+  int get authenticationEpoch => _authInterceptor.authenticationEpoch;
+
+  /// Freezes the current bearer token for an already-authorized unit of work.
+  /// Passing this snapshot to supported request methods prevents a queued
+  /// request from silently adopting a later account's token on the same
+  /// [ApiService] instance.
+  ApiAuthSnapshot captureAuthSnapshot() => _authInterceptor.captureSnapshot();
+
+  Options _withAuthSnapshot(Options options, ApiAuthSnapshot? authSnapshot) {
+    if (authSnapshot == null) return options;
+    options.extra = <String, dynamic>{
+      ...?options.extra,
+      ApiAuthInterceptor.authSnapshotExtraKey: authSnapshot,
+      'suppressAuthFailureNotification': true,
+    };
+    return options;
+  }
+
+  /// Runs a user-settings mutation after every mutation already submitted to
+  /// this API service.
+  ///
+  /// Open WebUI replaces the complete settings document on update, so every
+  /// read-modify-write sequence must share this boundary to avoid committing
+  /// an older snapshot over another feature's change. A failed operation is
+  /// still removed from the tail so it cannot poison later mutations.
+  Future<T> serializeUserSettingsMutation<T>(Future<T> Function() operation) {
+    final result = _userSettingsMutationQueue.then<T>((_) => operation());
+    _userSettingsMutationQueue = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return result;
+  }
 
   /// Ensure interceptor callbacks stay in sync if they are set after construction
   void setAuthCallbacks({
@@ -373,21 +1140,325 @@ class ApiService {
     }
   }
 
+  /// Warms the service-wide Dio pool so the first real request (often a chat
+  /// completion) does not pay DNS/TCP/TLS handshake latency. [checkHealth]
+  /// deliberately uses a request-scoped client it can force-close, so it no
+  /// longer touches the pool the completion path uses; this probe does.
+  Future<void> warmConnectionPool() async {
+    try {
+      await _dio.get<dynamic>(
+        '/health',
+        options: Options(
+          extra: const {'suppressAuthFailureNotification': true},
+        ),
+      );
+    } catch (_) {
+      // Best-effort: warmup failures are routine offline and must stay silent.
+    }
+  }
+
   /// Basic health check - just verifies the server is reachable.
   Future<bool> checkHealth() async {
+    final deadline = _PublicHealthDeadline(_publicHealthRequestTimeout);
+    final cancelToken = CancelToken();
+    final initialRequestCancelToken = _linkedPublicHealthCancelToken(
+      cancelToken,
+    );
+    // The service-wide Dio pool must not retain an unread or endless health
+    // response. A request-scoped client gives this probe force-close ownership
+    // of the upstream socket as soon as status/redirect headers are known.
+    final healthDio = Dio(
+      BaseOptions(
+        baseUrl: serverConfig.url,
+        connectTimeout: deadline.remaining(
+          cappedAt: const Duration(seconds: 30),
+        ),
+        receiveTimeout: deadline.remaining(
+          cappedAt: const Duration(seconds: 30),
+        ),
+        followRedirects: false,
+        maxRedirects: 0,
+        validateStatus: (status) => status != null,
+        headers: _publicHealthHeaders(includeServerHeaders: true),
+      ),
+    );
+    ServerTlsHttpClientFactory.configureDio(
+      healthDio,
+      serverConfig,
+      userAgent: ConduitUserAgent.value,
+    );
+    final deadlineTimer = Timer(_publicHealthRequestTimeout, () {
+      if (!cancelToken.isCancelled) {
+        cancelToken.cancel('Public health-check deadline expired');
+      }
+    });
+    Response<dynamic>? response;
     try {
-      final response = await _dio.get('/health');
-      return response.statusCode == 200;
-    } catch (e) {
+      response = await healthDio
+          .get<dynamic>(
+            '/health',
+            options: Options(
+              followRedirects: false,
+              responseType: ResponseType.stream,
+              validateStatus: (status) => status != null,
+            ),
+            cancelToken: initialRequestCancelToken,
+          )
+          .timeout(deadline.remaining());
+      if (response.statusCode == HttpStatus.ok) return true;
+      if (!_publicHealthRedirectStatusCodes.contains(response.statusCode)) {
+        return false;
+      }
+      final location = response.headers.value(HttpHeaders.locationHeader);
+      if (location == null || location.isEmpty) return false;
+      final from = response.requestOptions.uri;
+      if (!initialRequestCancelToken.isCancelled) {
+        initialRequestCancelToken.cancel('Initial health response complete');
+      }
+      await _cancelPublicHealthResponse(response);
+      response = null;
+      healthDio.close(force: true);
+      return await _followPublicHealthRedirect(
+        from: from,
+        location: location,
+        deadline: deadline,
+        cancelToken: cancelToken,
+      );
+    } on TimeoutException {
+      if (!cancelToken.isCancelled) {
+        cancelToken.cancel('Public health-check deadline expired');
+      }
+      return false;
+    } on DioException catch (error) {
+      response ??= error.response;
+      return false;
+    } catch (_) {
+      return false;
+    } finally {
+      deadlineTimer.cancel();
+      if (!initialRequestCancelToken.isCancelled) {
+        initialRequestCancelToken.cancel('Initial health response complete');
+      }
+      await _cancelPublicHealthResponse(response);
+      healthDio.close(force: true);
+    }
+  }
+
+  Future<bool> _followPublicHealthRedirect({
+    required Uri from,
+    required String location,
+    required _PublicHealthDeadline deadline,
+    required CancelToken cancelToken,
+  }) async {
+    final serverOrigin = ServerTlsHttpClientFactory.parseBaseUri(
+      serverConfig.url,
+    );
+    final visited = <Uri>{from.replace(fragment: '')};
+    Uri current;
+    try {
+      current = from.resolve(location).replace(fragment: '');
+    } on FormatException {
       return false;
     }
+
+    for (
+      var redirectCount = 0;
+      redirectCount < _maximumPublicHealthRedirects;
+      redirectCount++
+    ) {
+      final scheme = current.scheme.toLowerCase();
+      if ((scheme != 'http' && scheme != 'https') ||
+          current.host.isEmpty ||
+          current.userInfo.isNotEmpty ||
+          !visited.add(current)) {
+        return false;
+      }
+
+      final targetsServer = requestUsesServerConnectivityOrigin(
+        current,
+        serverOrigin,
+      );
+      List<InternetAddress>? pinnedAddresses;
+      if (!targetsServer) {
+        final validatedAddresses = await _resolveSafeOffOriginHealthTarget(
+          current,
+          deadline: deadline,
+        );
+        if (validatedAddresses == null) return false;
+        pinnedAddresses = validatedAddresses;
+      }
+      final hopTimeout = deadline.remaining(
+        cappedAt: targetsServer
+            ? const Duration(seconds: 30)
+            : _publicHealthPinnedConnectTimeout,
+      );
+      final redirectDio = Dio(
+        BaseOptions(
+          connectTimeout: hopTimeout,
+          receiveTimeout: deadline.remaining(
+            cappedAt: const Duration(seconds: 30),
+          ),
+          followRedirects: false,
+          validateStatus: (status) => status != null,
+          headers: _publicHealthHeaders(includeServerHeaders: targetsServer),
+        ),
+      );
+      if (targetsServer) {
+        // Server-specific trust and mTLS material must never be reused for an
+        // off-origin redirect. A fresh client per hop keeps that boundary
+        // explicit and makes connection-pool cleanup deterministic.
+        ServerTlsHttpClientFactory.configureDio(
+          redirectDio,
+          serverConfig,
+          userAgent: ConduitUserAgent.value,
+        );
+      } else {
+        _configurePinnedPublicHealthDio(
+          redirectDio,
+          target: current,
+          addresses: pinnedAddresses!,
+          deadline: deadline,
+        );
+      }
+
+      Response<dynamic>? response;
+      final hopCancelToken = _linkedPublicHealthCancelToken(cancelToken);
+      try {
+        // Health checks only need status and headers. Keep the body as a
+        // stream so an off-origin endpoint cannot force an arbitrarily large
+        // response into memory before the per-hop client is closed.
+        response = await redirectDio
+            .getUri<dynamic>(
+              current,
+              options: Options(responseType: ResponseType.stream),
+              cancelToken: hopCancelToken,
+            )
+            .timeout(deadline.remaining());
+        if (response.statusCode == HttpStatus.ok) return true;
+        if (!_publicHealthRedirectStatusCodes.contains(response.statusCode)) {
+          return false;
+        }
+        final nextLocation = response.headers.value(HttpHeaders.locationHeader);
+        if (nextLocation == null || nextLocation.isEmpty) return false;
+        current = current.resolve(nextLocation).replace(fragment: '');
+      } on DioException catch (error) {
+        response ??= error.response;
+        return false;
+      } on FormatException {
+        return false;
+      } finally {
+        if (!hopCancelToken.isCancelled) {
+          hopCancelToken.cancel('Health redirect response complete');
+        }
+        await _cancelPublicHealthResponse(response);
+        redirectDio.close(force: true);
+      }
+    }
+    return false;
+  }
+
+  Future<List<InternetAddress>?> _resolveSafeOffOriginHealthTarget(
+    Uri target, {
+    required _PublicHealthDeadline deadline,
+  }) async {
+    try {
+      final literal = InternetAddress.tryParse(target.host);
+      final addresses = literal == null
+          ? await _publicHealthAddressResolver(
+              target.host,
+            ).timeout(deadline.remaining(cappedAt: const Duration(seconds: 10)))
+          : <InternetAddress>[literal];
+      if (addresses.isEmpty) return null;
+
+      var nat64Prefixes = const <_PublicHealthNat64Prefix>[];
+      if (addresses.any(_requiresNat64PrefixDiscovery)) {
+        final discoveryAnswers = await _publicHealthAddressResolver(
+          'ipv4only.arpa',
+        ).timeout(deadline.remaining(cappedAt: const Duration(seconds: 10)));
+        final discovered = _nat64PrefixesFromIpv4OnlyArpa(discoveryAnswers);
+        if (discovered == null) return null;
+        nat64Prefixes = discovered;
+      }
+      if (!addresses.every(
+        (address) => _isPublicHealthRedirectAddressWithNat64Prefixes(
+          address,
+          nat64Prefixes,
+        ),
+      )) {
+        return null;
+      }
+      // Return the exact validated objects. The transport below connects to
+      // one of these addresses directly and never resolves [target.host]
+      // again, closing the DNS-rebinding gap between policy and use.
+      return List<InternetAddress>.unmodifiable(addresses);
+    } catch (_) {
+      // DNS failure and malformed/unsupported address families fail closed.
+      return null;
+    }
+  }
+
+  void _configurePinnedPublicHealthDio(
+    Dio dio, {
+    required Uri target,
+    required List<InternetAddress> addresses,
+    required _PublicHealthDeadline deadline,
+  }) {
+    final adapter = dio.httpClientAdapter;
+    if (adapter is! IOHttpClientAdapter) {
+      throw StateError('Pinned health redirects require dart:io transport');
+    }
+    adapter.createHttpClient = () {
+      final client = HttpClient()..userAgent = ConduitUserAgent.value;
+      // A proxy would resolve the hostname outside this validated boundary.
+      client.findProxy = (_) => 'DIRECT';
+      client.connectionFactory = (uri, proxyHost, proxyPort) {
+        if (proxyHost != null ||
+            proxyPort != null ||
+            !requestUsesServerConnectivityOrigin(uri, target)) {
+          return Future<ConnectionTask<Socket>>.error(
+            StateError('Unexpected target for pinned health redirect'),
+          );
+        }
+        return Future<ConnectionTask<Socket>>.value(
+          _PinnedPublicHealthConnection(
+            target: uri,
+            addresses: addresses,
+            connectTimeout: deadline.remaining(
+              cappedAt: _publicHealthPinnedConnectTimeout,
+            ),
+            connector: _publicHealthSocketConnector,
+            upgrader: _publicHealthSocketUpgrader,
+          ).start(),
+        );
+      };
+      return client;
+    };
+  }
+
+  Map<String, String> _publicHealthHeaders({
+    required bool includeServerHeaders,
+  }) {
+    if (!includeServerHeaders) return ConduitUserAgent.mergeHeaders();
+    final headers = Map<String, String>.from(serverConfig.customHeaders)
+      ..removeWhere((name, _) {
+        final normalized = name.toLowerCase();
+        return normalized == HttpHeaders.authorizationHeader ||
+            ConduitUserAgent.isHeaderName(name) ||
+            (cookieCustomHeaderSuppressed &&
+                normalized == HttpHeaders.cookieHeader);
+      });
+    final token = _authInterceptor.authToken;
+    if (token != null && token.isNotEmpty) {
+      headers[HttpHeaders.authorizationHeader] = 'Bearer $token';
+    }
+    return ConduitUserAgent.mergeHeaders(headers);
   }
 
   /// Health check with proxy detection.
   ///
   /// This method detects when the server is behind an authentication proxy
   /// (like oauth2-proxy) by checking for:
-  /// - HTTP redirects (302, 307, 308) to login pages
+  /// - HTTP redirects (301, 302, 303, 307, 308) to login pages
   /// - HTML responses instead of expected JSON/text
   ///
   /// When a proxy is detected, returns [HealthCheckResult.proxyAuthRequired]
@@ -398,25 +1469,27 @@ class ApiService {
   Future<HealthCheckResult> checkHealthWithProxyDetection({
     bool throwOnConnectionError = false,
   }) async {
+    // This transport intentionally differs from the service client because
+    // redirects must remain visible. It is nevertheless request-scoped and
+    // must release its native connection pool on every return path.
+    final tempDio = Dio(
+      BaseOptions(
+        baseUrl: serverConfig.url,
+        connectTimeout: const Duration(seconds: 15),
+        receiveTimeout: const Duration(seconds: 15),
+        followRedirects: false,
+        validateStatus: (status) => true,
+        headers: _publicHealthHeaders(includeServerHeaders: true),
+      ),
+    );
+    Response<dynamic>? response;
     try {
-      // Create a temporary Dio instance that doesn't follow redirects
-      // so we can detect proxy redirects
-      final tempDio = Dio(
-        BaseOptions(
-          baseUrl: serverConfig.url,
-          connectTimeout: const Duration(seconds: 15),
-          receiveTimeout: const Duration(seconds: 15),
-          followRedirects: false,
-          validateStatus: (status) => true, // Accept all status codes
-          headers: serverConfig.customHeaders.isNotEmpty
-              ? Map<String, String>.from(serverConfig.customHeaders)
-              : null,
-        ),
-      );
-
       ServerTlsHttpClientFactory.configureDio(tempDio, serverConfig);
 
-      final response = await tempDio.get('/health');
+      response = await tempDio.get<dynamic>(
+        '/health',
+        options: Options(responseType: ResponseType.stream),
+      );
       final statusCode = response.statusCode ?? 0;
 
       DebugLogger.log(
@@ -425,11 +1498,11 @@ class ApiService {
       );
 
       // Check for redirects (proxy authentication pages)
-      if (statusCode == 302 || statusCode == 307 || statusCode == 308) {
-        final location = response.headers.value('location');
+      if (_publicHealthRedirectStatusCodes.contains(statusCode)) {
         DebugLogger.log(
-          'Detected redirect to: $location - likely proxy auth required',
+          'proxy-auth-redirect-detected',
           scope: 'api/proxy-detect',
+          data: {'statusCode': statusCode},
         );
         return HealthCheckResult.proxyAuthRequired;
       }
@@ -437,7 +1510,8 @@ class ApiService {
       // Check for 401/403 which may indicate proxy auth
       if (statusCode == 401 || statusCode == 403) {
         // Check if the response is HTML (proxy login page)
-        final contentType = response.headers.value('content-type') ?? '';
+        final contentType =
+            response.headers.value('content-type')?.toLowerCase() ?? '';
         if (contentType.contains('text/html')) {
           DebugLogger.log(
             'Detected HTML response on 401/403 - likely proxy auth required',
@@ -450,24 +1524,14 @@ class ApiService {
       // Check for successful response
       if (statusCode == 200) {
         // Verify it's not an HTML login page masquerading as 200
-        final contentType = response.headers.value('content-type') ?? '';
-        final data = response.data;
+        final contentType =
+            response.headers.value('content-type')?.toLowerCase() ?? '';
 
         // OpenWebUI's /health returns {"status": true} or plain "true"
         // If we get HTML, it's probably a proxy login page
         if (contentType.contains('text/html')) {
-          // OpenWebUI's /health returns JSON, not HTML.
-          // Any HTML response indicates a proxy page or misconfiguration.
-          final htmlContent = data?.toString().toLowerCase() ?? '';
-          final hasLoginKeywords =
-              htmlContent.contains('login') ||
-              htmlContent.contains('sign in') ||
-              htmlContent.contains('authenticate') ||
-              htmlContent.contains('oauth');
-
           DebugLogger.log(
-            'Detected HTML response on /health - '
-            '${hasLoginKeywords ? 'login page detected' : 'unexpected HTML'}',
+            'Detected HTML response on /health',
             scope: 'api/proxy-detect',
           );
 
@@ -481,6 +1545,7 @@ class ApiService {
 
       return HealthCheckResult.unhealthy;
     } on DioException catch (e) {
+      response ??= e.response;
       DebugLogger.log(
         'Proxy detection failed with DioException: ${e.type}',
         scope: 'api/proxy-detect',
@@ -501,14 +1566,15 @@ class ApiService {
       }
 
       // Check if response indicates proxy
-      final response = e.response;
-      if (response != null) {
-        final statusCode = response.statusCode ?? 0;
-        if (statusCode == 302 || statusCode == 307 || statusCode == 308) {
+      final errorResponse = e.response;
+      if (errorResponse != null) {
+        final statusCode = errorResponse.statusCode ?? 0;
+        if (_publicHealthRedirectStatusCodes.contains(statusCode)) {
           return HealthCheckResult.proxyAuthRequired;
         }
 
-        final contentType = response.headers.value('content-type') ?? '';
+        final contentType =
+            errorResponse.headers.value('content-type')?.toLowerCase() ?? '';
         if (contentType.contains('text/html') &&
             (statusCode == 401 || statusCode == 403 || statusCode == 200)) {
           return HealthCheckResult.proxyAuthRequired;
@@ -528,13 +1594,33 @@ class ApiService {
       DebugLogger.error(
         'proxy-detection-failed',
         scope: 'api/proxy-detect',
-        error: e,
+        data: {
+          'errorType': e.runtimeType.toString(),
+          if (e is DioException) 'statusCode': e.response?.statusCode,
+        },
       );
       if (throwOnConnectionError) {
         rethrow;
       }
       return HealthCheckResult.unreachable;
+    } finally {
+      await _cancelPublicHealthResponse(response);
+      tempDio.close(force: true);
     }
+  }
+
+  /// Releases the native HTTP client's connection pool. Every [ApiService]
+  /// owns its Dio instance; providers and request-scoped auth probes call this
+  /// when their server/session ownership ends.
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    // Graceful close: new work is rejected but in-flight requests run to
+    // completion. Provider rebuilds can retire a service for the same server
+    // mid-generation (config writes, fence flips); force-closing there would
+    // abort an active SSE chat stream that survived such rebuilds before this
+    // client owned its pool.
+    _dio.close();
   }
 
   /// Verifies this is actually an OpenWebUI server by checking the /api/config
@@ -683,7 +1769,7 @@ class ApiService {
           final location = e.response?.headers.value('location');
           if (location != null) {
             throw Exception(
-              'Server redirect detected. Please check your server URL configuration. Redirect to: $location',
+              'Server redirect detected. Please check your server URL configuration.',
             );
           }
         }
@@ -692,8 +1778,11 @@ class ApiService {
     }
   }
 
-  Future<void> logout() async {
-    await _dio.get('/api/v1/auths/signout');
+  Future<void> logout({ApiAuthSnapshot? authSnapshot}) async {
+    await _dio.post(
+      '/api/v1/auths/signout',
+      options: _withAuthSnapshot(Options(), authSnapshot),
+    );
   }
 
   /// LDAP authentication - uses username instead of email.
@@ -718,16 +1807,18 @@ class ApiService {
         // Handle LDAP not enabled
         if (e.response?.statusCode == 400) {
           final data = e.response?.data;
-          if (data is Map && data['detail'] != null) {
-            throw Exception(data['detail']);
+          if (data is Map &&
+              data['detail'] == 'LDAP authentication is not enabled') {
+            throw Exception('LDAP authentication is not enabled');
           }
+          throw Exception('LDAP authentication failed');
         }
         // Handle specific redirect cases
         if (e.response?.statusCode == 307 || e.response?.statusCode == 308) {
           final location = e.response?.headers.value('location');
           if (location != null) {
             throw Exception(
-              'Server redirect detected. Please check your server URL configuration. Redirect to: $location',
+              'Server redirect detected. Please check your server URL configuration.',
             );
           }
         }
@@ -739,12 +1830,18 @@ class ApiService {
   // User info
   Future<User> getCurrentUser({
     bool suppressAuthFailureNotification = false,
+    String? candidateAuthToken,
+    ApiAuthSnapshot? authSnapshot,
   }) async {
+    final extra = <String, dynamic>{
+      if (suppressAuthFailureNotification)
+        'suppressAuthFailureNotification': true,
+      ApiAuthInterceptor.candidateAuthTokenExtraKey: ?candidateAuthToken,
+      ApiAuthInterceptor.authSnapshotExtraKey: ?authSnapshot,
+    };
     final response = await _dio.get(
       '/api/v1/auths/',
-      options: suppressAuthFailureNotification
-          ? Options(extra: const {'suppressAuthFailureNotification': true})
-          : null,
+      options: extra.isEmpty ? null : Options(extra: extra),
     );
     DebugLogger.log('user-info', scope: 'api/user');
     return User.fromJson(response.data);
@@ -2417,9 +3514,14 @@ class ApiService {
   }
 
   // User Settings
-  Future<Map<String, dynamic>> getUserSettings() async {
+  Future<Map<String, dynamic>> getUserSettings({
+    ApiAuthSnapshot? authSnapshot,
+  }) async {
     _traceApi('Fetching user settings');
-    final response = await _dio.get('/api/v1/users/user/settings');
+    final response = await _dio.get(
+      '/api/v1/users/user/settings',
+      options: _withAuthSnapshot(Options(), authSnapshot),
+    );
     final data = response.data;
     // Handle null response from server (happens for new users with no settings)
     if (data is Map<String, dynamic>) {
@@ -2428,72 +3530,129 @@ class ApiService {
     return <String, dynamic>{};
   }
 
-  Future<void> updateUserSettings(Map<String, dynamic> settings) async {
+  Future<void> updateUserSettings(
+    Map<String, dynamic> settings, {
+    ApiAuthSnapshot? authSnapshot,
+  }) async {
     _traceApi('Updating user settings');
     // Align with web client update route
-    await _dio.post('/api/v1/users/user/settings/update', data: settings);
+    await _postUserSettings(settings, authSnapshot: authSnapshot);
+  }
+
+  Future<Response<dynamic>> _postUserSettings(
+    Map<String, dynamic> settings, {
+    ApiAuthSnapshot? authSnapshot,
+  }) {
+    return _dio.post(
+      '/api/v1/users/user/settings/update',
+      data: settings,
+      options: _withAuthSnapshot(Options(), authSnapshot),
+    );
   }
 
   Future<ServerUserSettings> getServerUserSettingsModel() async {
     return ServerUserSettings.fromJson(await getUserSettings());
   }
 
-  Future<ServerUserSettings> updateUserSystemPrompt(
-    String? systemPrompt,
-  ) async {
-    final settings = _deepCloneJsonMap(await getUserSettings());
-    final ui = _coerceJsonMap(settings['ui']) ?? <String, dynamic>{};
-    final trimmed = _normalizeNullableString(systemPrompt);
+  Future<ServerUserSettings> updateUserSystemPrompt(String? systemPrompt) {
+    final authSnapshot = captureAuthSnapshot();
+    return serializeUserSettingsMutation(() async {
+      final settings = _deepCloneJsonMap(
+        await getUserSettings(authSnapshot: authSnapshot),
+      );
+      final ui = _coerceJsonMap(settings['ui']) ?? <String, dynamic>{};
+      final trimmed = _normalizeNullableString(systemPrompt);
 
-    if (trimmed == null || trimmed.isEmpty) {
-      ui.remove('system');
-    } else {
-      ui['system'] = trimmed;
-    }
+      if (trimmed == null || trimmed.isEmpty) {
+        ui.remove('system');
+      } else {
+        ui['system'] = trimmed;
+      }
 
-    settings.remove('system');
-    settings['ui'] = ui;
-    _traceApi('Updating user system prompt');
-    final response = await _dio.post(
-      '/api/v1/users/user/settings/update',
-      data: settings,
-    );
-    final data = _coerceResponseMap(response.data) ?? settings;
-    return ServerUserSettings.fromJson(data);
+      settings.remove('system');
+      settings['ui'] = ui;
+      _traceApi('Updating user system prompt');
+      final response = await _postUserSettings(
+        settings,
+        authSnapshot: authSnapshot,
+      );
+      final data = _coerceResponseMap(response.data) ?? settings;
+      return ServerUserSettings.fromJson(data);
+    });
   }
 
-  Future<ServerUserSettings> updateUserDefaultModel(String? modelId) async {
-    final settings = _deepCloneJsonMap(await getUserSettings());
-    final ui = _coerceJsonMap(settings['ui']) ?? <String, dynamic>{};
-    final trimmed = _normalizeNullableString(modelId);
+  Future<ServerUserSettings> updateUserDefaultModel(String? modelId) {
+    final authSnapshot = captureAuthSnapshot();
+    return serializeUserSettingsMutation(() async {
+      final settings = _deepCloneJsonMap(
+        await getUserSettings(authSnapshot: authSnapshot),
+      );
+      final ui = _coerceJsonMap(settings['ui']) ?? <String, dynamic>{};
+      final trimmed = _normalizeNullableString(modelId);
 
-    if (trimmed == null) {
-      ui.remove('models');
-    } else {
-      ui['models'] = <String>[trimmed];
-    }
+      if (trimmed == null) {
+        ui.remove('models');
+      } else {
+        ui['models'] = <String>[trimmed];
+      }
 
-    settings['ui'] = ui;
-    final response = await _dio.post(
-      '/api/v1/users/user/settings/update',
-      data: settings,
-    );
-    final data = _coerceResponseMap(response.data) ?? settings;
-    return ServerUserSettings.fromJson(data);
+      settings['ui'] = ui;
+      final response = await _postUserSettings(
+        settings,
+        authSnapshot: authSnapshot,
+      );
+      final data = _coerceResponseMap(response.data) ?? settings;
+      return ServerUserSettings.fromJson(data);
+    });
   }
 
-  Future<ServerUserSettings> updateUserMemoryEnabled(bool enabled) async {
-    final settings = _deepCloneJsonMap(await getUserSettings());
-    final ui = _coerceJsonMap(settings['ui']) ?? <String, dynamic>{};
-    ui['memory'] = enabled;
-    settings['ui'] = ui;
+  Future<ServerUserSettings> updateUserReasoningEffort(String? effort) {
+    final authSnapshot = captureAuthSnapshot();
+    return serializeUserSettingsMutation(() async {
+      final settings = _deepCloneJsonMap(
+        await getUserSettings(authSnapshot: authSnapshot),
+      );
+      final params = _coerceJsonMap(settings['params']) ?? <String, dynamic>{};
+      final trimmed = _normalizeNullableString(effort);
 
-    final response = await _dio.post(
-      '/api/v1/users/user/settings/update',
-      data: settings,
-    );
-    final data = _coerceResponseMap(response.data) ?? settings;
-    return ServerUserSettings.fromJson(data);
+      if (trimmed == null) {
+        params.remove('reasoning_effort');
+      } else {
+        params['reasoning_effort'] = trimmed;
+      }
+
+      if (params.isEmpty) {
+        settings.remove('params');
+      } else {
+        settings['params'] = params;
+      }
+      _traceApi('Updating user reasoning effort');
+      final response = await _postUserSettings(
+        settings,
+        authSnapshot: authSnapshot,
+      );
+      final data = _coerceResponseMap(response.data) ?? settings;
+      return ServerUserSettings.fromJson(data);
+    });
+  }
+
+  Future<ServerUserSettings> updateUserMemoryEnabled(bool enabled) {
+    final authSnapshot = captureAuthSnapshot();
+    return serializeUserSettingsMutation(() async {
+      final settings = _deepCloneJsonMap(
+        await getUserSettings(authSnapshot: authSnapshot),
+      );
+      final ui = _coerceJsonMap(settings['ui']) ?? <String, dynamic>{};
+      ui['memory'] = enabled;
+      settings['ui'] = ui;
+
+      final response = await _postUserSettings(
+        settings,
+        authSnapshot: authSnapshot,
+      );
+      final data = _coerceResponseMap(response.data) ?? settings;
+      return ServerUserSettings.fromJson(data);
+    });
   }
 
   /// Persists the notification preferences that Open WebUI stores server-side.
@@ -2503,41 +3662,49 @@ class ApiService {
     bool? notificationEnabled,
     bool? notificationSound,
     bool? notificationSoundAlways,
-  }) async {
-    final settings = _deepCloneJsonMap(await getUserSettings());
-    if (notificationEnabled != null) {
-      settings['notificationEnabled'] = notificationEnabled;
-    }
-    if (notificationSound != null) {
-      settings['notificationSound'] = notificationSound;
-    }
-    if (notificationSoundAlways != null) {
-      settings['notificationSoundAlways'] = notificationSoundAlways;
-    }
+  }) {
+    final authSnapshot = captureAuthSnapshot();
+    return serializeUserSettingsMutation(() async {
+      final settings = _deepCloneJsonMap(
+        await getUserSettings(authSnapshot: authSnapshot),
+      );
+      if (notificationEnabled != null) {
+        settings['notificationEnabled'] = notificationEnabled;
+      }
+      if (notificationSound != null) {
+        settings['notificationSound'] = notificationSound;
+      }
+      if (notificationSoundAlways != null) {
+        settings['notificationSoundAlways'] = notificationSoundAlways;
+      }
 
-    _traceApi('Updating user notification settings');
-    final response = await _dio.post(
-      '/api/v1/users/user/settings/update',
-      data: settings,
-    );
-    final data = _coerceResponseMap(response.data) ?? settings;
-    return ServerUserSettings.fromJson(data);
+      _traceApi('Updating user notification settings');
+      final response = await _postUserSettings(
+        settings,
+        authSnapshot: authSnapshot,
+      );
+      final data = _coerceResponseMap(response.data) ?? settings;
+      return ServerUserSettings.fromJson(data);
+    });
   }
 
-  Future<ServerUserSettings> updateUserPinnedModels(
-    List<String> modelIds,
-  ) async {
-    final settings = _deepCloneJsonMap(await getUserSettings());
-    final ui = _coerceJsonMap(settings['ui']) ?? <String, dynamic>{};
-    ui['pinnedModels'] = SettingsService.sanitizePinnedModels(modelIds);
-    settings['ui'] = ui;
+  Future<ServerUserSettings> updateUserPinnedModels(List<String> modelIds) {
+    final authSnapshot = captureAuthSnapshot();
+    return serializeUserSettingsMutation(() async {
+      final settings = _deepCloneJsonMap(
+        await getUserSettings(authSnapshot: authSnapshot),
+      );
+      final ui = _coerceJsonMap(settings['ui']) ?? <String, dynamic>{};
+      ui['pinnedModels'] = SettingsService.sanitizePinnedModels(modelIds);
+      settings['ui'] = ui;
 
-    final response = await _dio.post(
-      '/api/v1/users/user/settings/update',
-      data: settings,
-    );
-    final data = _coerceResponseMap(response.data) ?? settings;
-    return ServerUserSettings.fromJson(data);
+      final response = await _postUserSettings(
+        settings,
+        authSnapshot: authSnapshot,
+      );
+      final data = _coerceResponseMap(response.data) ?? settings;
+      return ServerUserSettings.fromJson(data);
+    });
   }
 
   // Suggestions
@@ -3033,53 +4200,138 @@ class ApiService {
   }
 
   // Files
-  Future<String> getFileContent(String fileId) async {
+  Future<String> getFileContent(
+    String fileId, {
+    int? maxBytes,
+    ApiAuthSnapshot? authSnapshot,
+    CancelToken? cancelToken,
+  }) async {
     _traceApi('Fetching file content: $fileId');
+    if (maxBytes != null && maxBytes <= 0) {
+      throw ArgumentError.value(maxBytes, 'maxBytes');
+    }
     // The Open-WebUI endpoint returns the raw file bytes with appropriate
     // Content-Type headers, not JSON. We must read bytes and base64-encode
     // them for consistent handling across platforms/widgets.
-    final response = await _dio.get(
-      '/api/v1/files/$fileId/content',
-      options: Options(responseType: ResponseType.bytes),
-    );
+    // Dio wraps streamed response bodies. A request-local token is therefore
+    // required to tear down the adapter's upstream subscription on a size
+    // rejection; cancelling only the exposed body stream is insufficient. A
+    // caller token may be shared, so it can cancel this token but never vice
+    // versa.
+    final cancellationLink = _FileContentCancellationLink(cancelToken);
+    final requestCancelToken = cancellationLink.requestToken;
+    try {
+      final response = await _dio.get<ResponseBody>(
+        '/api/v1/files/$fileId/content',
+        options: _withAuthSnapshot(
+          Options(responseType: ResponseType.stream),
+          authSnapshot,
+        ),
+        cancelToken: requestCancelToken,
+      );
 
-    // Try to determine the mime type from response headers; fallback to text/plain
-    final contentType =
-        response.headers.value(HttpHeaders.contentTypeHeader) ?? '';
-    String mimeType = 'text/plain';
-    if (contentType.isNotEmpty) {
-      // Strip charset if present
-      mimeType = contentType.split(';').first.trim();
+      // Try to determine the mime type from response headers; fallback to text/plain
+      final contentType =
+          response.headers.value(HttpHeaders.contentTypeHeader) ?? '';
+      String mimeType = 'text/plain';
+      if (contentType.isNotEmpty) {
+        // Strip charset if present
+        mimeType = contentType.split(';').first.trim();
+      }
+
+      final advertisedLength = int.tryParse(
+        response.headers.value(HttpHeaders.contentLengthHeader) ?? '',
+      );
+      final body = response.data;
+      if (body == null) {
+        throw const FormatException('File content response is empty.');
+      }
+      if (maxBytes != null &&
+          advertisedLength != null &&
+          advertisedLength > maxBytes) {
+        requestCancelToken.cancel('File content exceeded the byte limit.');
+        throw const FileContentTooLargeException();
+      }
+      final bytes = BytesBuilder(copy: false);
+      var receivedBytes = 0;
+      final iterator = StreamIterator<List<int>>(body.stream);
+      try {
+        // Per-chunk races must stay on the request-local token. Racing the
+        // shared caller token here would attach one non-removable listener per
+        // chunk instead of the single weak link above.
+        while (await _moveFileContentStreamOrCancel(
+          iterator,
+          requestCancelToken,
+        )) {
+          final chunk = iterator.current;
+          receivedBytes += chunk.length;
+          if (maxBytes != null && receivedBytes > maxBytes) {
+            throw const FileContentTooLargeException();
+          }
+          bytes.add(chunk);
+        }
+      } on FileContentTooLargeException {
+        requestCancelToken.cancel('File content exceeded the byte limit.');
+        rethrow;
+      } finally {
+        _cancelFileContentStreamIterator(iterator);
+      }
+
+      final base64Data = base64Encode(bytes.takeBytes());
+
+      // For images, return a data URL so UI can render directly; otherwise return raw base64
+      if (mimeType.startsWith('image/')) {
+        return 'data:$mimeType;base64,$base64Data';
+      }
+
+      return base64Data;
+    } finally {
+      cancellationLink.detach();
     }
-
-    final bytes = response.data is List<int>
-        ? (response.data as List<int>)
-        : (response.data as Uint8List).toList();
-
-    final base64Data = base64Encode(bytes);
-
-    // For images, return a data URL so UI can render directly; otherwise return raw base64
-    if (mimeType.startsWith('image/')) {
-      return 'data:$mimeType;base64,$base64Data';
-    }
-
-    return base64Data;
   }
 
-  Future<Map<String, dynamic>> getFileInfo(String fileId) async {
+  Future<Map<String, dynamic>> getFileInfo(
+    String fileId, {
+    ApiAuthSnapshot? authSnapshot,
+    CancelToken? cancelToken,
+  }) async {
     _traceApi('Fetching file info: $fileId');
-    final response = await _dio.get('/api/v1/files/$fileId');
+    final response = await _dio.get(
+      '/api/v1/files/$fileId',
+      options: _withAuthSnapshot(Options(), authSnapshot),
+      cancelToken: cancelToken,
+    );
     return response.data as Map<String, dynamic>;
   }
 
-  Future<List<FileInfo>> getUserFiles() async {
+  Future<List<FileInfo>> getUserFiles() =>
+      _getUserFilesWith((page) => getUserFilesPage(page: page));
+
+  Future<List<FileInfo>> getUserFilesForSession({
+    ApiAuthSnapshot? authSnapshot,
+    CancelToken? cancelToken,
+  }) => _getUserFilesWith(
+    (page) => getUserFilesPageForSession(
+      page: page,
+      authSnapshot: authSnapshot,
+      cancelToken: cancelToken,
+    ),
+  );
+
+  Future<List<FileInfo>> _getUserFilesWith(
+    Future<({List<FileInfo> items, int? total, bool isPaginated})> Function(
+      int page,
+    )
+    getPage,
+  ) async {
     _traceApi('Fetching user files');
     final files = <FileInfo>[];
     var page = 1;
     int? total;
+    const maxPages = 200;
 
-    while (true) {
-      final pageResult = await getUserFilesPage(page: page);
+    while (page <= maxPages) {
+      final pageResult = await getPage(page);
 
       files.addAll(pageResult.items);
       total ??= pageResult.total;
@@ -3097,6 +4349,10 @@ class ApiService {
       page += 1;
     }
 
+    if (page > maxPages) {
+      _traceApi('Warning: Hit max user-files page limit ($maxPages)');
+    }
+
     return List<FileInfo>.unmodifiable(files);
   }
 
@@ -3105,10 +4361,19 @@ class ApiService {
   /// Supports both the current paginated OpenWebUI response shape and the
   /// legacy plain-list payload used by older servers.
   Future<({List<FileInfo> items, int? total, bool isPaginated})>
-  getUserFilesPage({int page = 1}) async {
+  getUserFilesPage({int page = 1}) => getUserFilesPageForSession(page: page);
+
+  Future<({List<FileInfo> items, int? total, bool isPaginated})>
+  getUserFilesPageForSession({
+    int page = 1,
+    ApiAuthSnapshot? authSnapshot,
+    CancelToken? cancelToken,
+  }) async {
     final response = await _dio.get(
       '/api/v1/files/',
       queryParameters: {'page': page, 'content': false},
+      options: _withAuthSnapshot(Options(), authSnapshot),
+      cancelToken: cancelToken,
     );
     return _parseFileInfoCollection(
       response.data,
@@ -3122,11 +4387,34 @@ class ApiService {
     String? contentType,
     int? limit,
     int? offset,
+  }) async =>
+      await searchFilesForSession(
+        query: query,
+        contentType: contentType,
+        limit: limit,
+        offset: offset,
+      ) ??
+      const <FileInfo>[];
+
+  /// Searches the current user's files while keeping a long-running operation
+  /// pinned to its originating auth session.
+  ///
+  /// Returns null when the server does not expose the file-search endpoint, so
+  /// callers that require compatibility with older OpenWebUI releases can fall
+  /// back to paginated listing. A supported search with no matches returns an
+  /// empty list.
+  Future<List<FileInfo>?> searchFilesForSession({
+    String? query,
+    String? contentType,
+    int? limit,
+    int? offset,
+    ApiAuthSnapshot? authSnapshot,
+    CancelToken? cancelToken,
   }) async {
     _traceApi('Searching files with query: $query');
     final trimmedQuery = query?.trim();
     if (trimmedQuery == null || trimmedQuery.isEmpty) {
-      return const [];
+      return const <FileInfo>[];
     }
 
     final queryParams = <String, dynamic>{};
@@ -3141,6 +4429,8 @@ class ApiService {
       final response = await _dio.get(
         '/api/v1/files/search',
         queryParameters: queryParams,
+        options: _withAuthSnapshot(Options(), authSnapshot),
+        cancelToken: cancelToken,
       );
       final data = response.data;
       if (data is List) {
@@ -3156,10 +4446,15 @@ class ApiService {
         }
         return results;
       }
-      return const [];
+      return const <FileInfo>[];
     } on DioException catch (error) {
       if (error.response?.statusCode == 404) {
-        return const [];
+        final responseData = error.response?.data;
+        final detail = responseData is Map ? responseData['detail'] : null;
+        if (detail == 'No files found matching the pattern.') {
+          return const <FileInfo>[];
+        }
+        return null;
       }
       rethrow;
     }
@@ -3303,6 +4598,322 @@ class ApiService {
   }
 
   // Knowledge Base
+  Future<WorkspacePagedResponse<WorkspaceKnowledgeSummary>>
+  getWorkspaceKnowledge({
+    String? query,
+    String? viewOption,
+    String? source,
+    int page = 1,
+  }) async {
+    final normalizedQuery = query?.trim() ?? '';
+    final normalizedView = viewOption?.trim() ?? '';
+    final normalizedSource = source?.trim() ?? '';
+    final isFiltered =
+        normalizedQuery.isNotEmpty ||
+        normalizedView.isNotEmpty ||
+        normalizedSource.isNotEmpty;
+    final response = await _dio.get(
+      isFiltered ? '/api/v1/knowledge/search' : '/api/v1/knowledge/',
+      queryParameters: {
+        'page': page,
+        if (normalizedQuery.isNotEmpty) 'query': normalizedQuery,
+        if (normalizedView.isNotEmpty) 'view_option': normalizedView,
+        if (normalizedSource.isNotEmpty) 'source': normalizedSource,
+      },
+    );
+    return WorkspacePagedResponse.fromJson(
+      response.data,
+      WorkspaceKnowledgeSummary.fromJson,
+    );
+  }
+
+  Future<WorkspaceKnowledgeDetail?> getWorkspaceKnowledgeDetail(
+    String id,
+  ) async {
+    final response = await _dio.get('/api/v1/knowledge/$id');
+    return response.data is Map
+        ? WorkspaceKnowledgeDetail.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceKnowledgeDetail?> createWorkspaceKnowledge(
+    WorkspaceKnowledgeForm form,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/knowledge/create',
+      data: form.toJson(),
+    );
+    return response.data is Map
+        ? WorkspaceKnowledgeDetail.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceKnowledgeDetail?> updateWorkspaceKnowledge(
+    String id,
+    WorkspaceKnowledgeForm form,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/knowledge/$id/update',
+      data: form.toJson(),
+    );
+    return response.data is Map
+        ? WorkspaceKnowledgeDetail.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceKnowledgeDetail?> updateWorkspaceKnowledgeAccess(
+    String id,
+    List<WorkspaceAccessGrantInput> grants,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/knowledge/$id/access/update',
+      data: {'access_grants': workspaceGrantInputs(grants)},
+    );
+    return response.data is Map
+        ? WorkspaceKnowledgeDetail.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceKnowledgeFilePage> getWorkspaceKnowledgeFiles(
+    String id, {
+    String? query,
+    String? viewOption,
+    String? orderBy,
+    String? direction,
+    String? directoryId,
+    bool includeContent = false,
+    int page = 1,
+  }) async {
+    final response = await _dio.get(
+      '/api/v1/knowledge/$id/files',
+      queryParameters: <String, dynamic>{
+        'page': page,
+        'include_content': includeContent,
+        if (query != null && query.isNotEmpty) 'query': query,
+        if (viewOption != null && viewOption.isNotEmpty)
+          'view_option': viewOption,
+        if (orderBy != null && orderBy.isNotEmpty) 'order_by': orderBy,
+        if (direction != null && direction.isNotEmpty) 'direction': direction,
+        'directory_id': ?directoryId,
+      },
+    );
+    return WorkspaceKnowledgeFilePage.fromJson(response.data);
+  }
+
+  Future<List<WorkspacePendingFile>> getWorkspaceKnowledgePendingFiles(
+    String id,
+  ) async {
+    final response = await _dio.get(
+      '/api/v1/knowledge/$id/files/pending',
+      queryParameters: const {'stream': false},
+    );
+    return workspaceJsonList(
+      response.data,
+    ).map(WorkspacePendingFile.fromJson).toList(growable: false);
+  }
+
+  Future<WorkspaceKnowledgeDetail?> attachWorkspaceKnowledgeFile(
+    String id,
+    String fileId, {
+    String? directoryId,
+  }) async {
+    final response = await _dio.post(
+      '/api/v1/knowledge/$id/file/add',
+      data: {'file_id': fileId, 'directory_id': directoryId},
+    );
+    return response.data is Map
+        ? WorkspaceKnowledgeDetail.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceKnowledgeDetail?> reindexWorkspaceKnowledgeFile(
+    String id,
+    String fileId,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/knowledge/$id/file/update',
+      data: {'file_id': fileId},
+    );
+    return response.data is Map
+        ? WorkspaceKnowledgeDetail.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceKnowledgeDetail?> removeWorkspaceKnowledgeFile(
+    String id,
+    String fileId, {
+    bool deleteFile = true,
+  }) async {
+    final response = await _dio.post(
+      '/api/v1/knowledge/$id/file/remove',
+      queryParameters: {'delete_file': deleteFile},
+      data: {'file_id': fileId},
+    );
+    return response.data is Map
+        ? WorkspaceKnowledgeDetail.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceKnowledgeDetail?> attachWorkspaceKnowledgeFiles(
+    String id,
+    List<({String fileId, String? directoryId})> files,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/knowledge/$id/files/batch/add',
+      data: files
+          .map(
+            (file) => {
+              'file_id': file.fileId,
+              'directory_id': file.directoryId,
+            },
+          )
+          .toList(growable: false),
+    );
+    return response.data is Map
+        ? WorkspaceKnowledgeDetail.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceKnowledgeDirectory> createWorkspaceKnowledgeDirectory(
+    String id, {
+    required String name,
+    String? parentId,
+  }) async {
+    final response = await _dio.post(
+      '/api/v1/knowledge/$id/dirs/create',
+      data: {'name': name, 'parent_id': parentId},
+    );
+    return WorkspaceKnowledgeDirectory.fromJson(
+      Map<String, dynamic>.from(response.data as Map),
+    );
+  }
+
+  Future<WorkspaceKnowledgeDirectory> updateWorkspaceKnowledgeDirectory(
+    String id,
+    String directoryId, {
+    String? name,
+    String? parentId,
+    bool updateParent = false,
+  }) async {
+    final response = await _dio.post(
+      '/api/v1/knowledge/$id/dirs/$directoryId/update',
+      data: {'name': ?name, if (updateParent) 'parent_id': parentId},
+    );
+    return WorkspaceKnowledgeDirectory.fromJson(
+      Map<String, dynamic>.from(response.data as Map),
+    );
+  }
+
+  Future<bool> deleteWorkspaceKnowledgeDirectory(
+    String id,
+    String directoryId, {
+    bool moveFiles = true,
+  }) async {
+    final response = await _dio.delete(
+      '/api/v1/knowledge/$id/dirs/$directoryId/delete',
+      queryParameters: {'move_files': moveFiles},
+    );
+    return workspaceJsonMap(response.data)['status'] == true;
+  }
+
+  Future<bool> moveWorkspaceKnowledgeFile(
+    String id,
+    String fileId, {
+    String? directoryId,
+  }) async {
+    final response = await _dio.post(
+      '/api/v1/knowledge/$id/file/move',
+      data: {'file_id': fileId, 'directory_id': directoryId},
+    );
+    return workspaceJsonMap(response.data)['status'] == true;
+  }
+
+  Future<WorkspaceSyncDiff> diffWorkspaceKnowledge(
+    String id,
+    List<Map<String, dynamic>> manifest,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/knowledge/$id/sync/diff',
+      data: {'manifest': manifest},
+    );
+    return WorkspaceSyncDiff.fromJson(
+      Map<String, dynamic>.from(response.data as Map),
+    );
+  }
+
+  Future<bool> cleanupWorkspaceKnowledgeSync(
+    String id, {
+    required List<String> fileIds,
+    List<String> directoryIds = const [],
+  }) async {
+    final response = await _dio.post(
+      '/api/v1/knowledge/$id/sync/cleanup',
+      data: {'file_ids': fileIds, 'dir_ids': directoryIds},
+    );
+    return workspaceJsonMap(response.data)['status'] == true;
+  }
+
+  Future<List<int>> exportWorkspaceKnowledge(String id) async {
+    final response = await _dio.get<List<int>>(
+      '/api/v1/knowledge/$id/export',
+      options: Options(responseType: ResponseType.bytes),
+    );
+    return response.data ?? const <int>[];
+  }
+
+  /// Removes every file (and optionally directories) from a knowledge base while
+  /// keeping the base itself. Owner/write-access or admin only, server-enforced.
+  Future<WorkspaceKnowledgeDetail?> resetWorkspaceKnowledge(
+    String id, {
+    bool includeDirectories = true,
+  }) async {
+    final response = await _dio.post(
+      '/api/v1/knowledge/$id/reset',
+      queryParameters: {'include_directories': includeDirectories},
+    );
+    return response.data is Map
+        ? WorkspaceKnowledgeDetail.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  /// Uploads an in-memory file to `/files/` and returns the new file id. Used by
+  /// the workspace knowledge browser for both binary uploads and generated text
+  /// files. Mirrors [uploadFileWithProgress] but takes bytes directly.
+  Future<String> uploadFileBytes(
+    String fileName,
+    List<int> bytes, {
+    void Function(int sent, int total)? onProgress,
+  }) async {
+    _traceApi('Uploading file bytes: $fileName (${bytes.length} bytes)');
+    final formData = FormData.fromMap({
+      'file': MultipartFile.fromBytes(bytes, filename: fileName),
+    });
+    final response = await _dio.post(
+      '/api/v1/files/',
+      data: formData,
+      onSendProgress: onProgress,
+    );
+    return response.data['id'] as String;
+  }
+
   Future<List<KnowledgeBase>> getKnowledgeBases() async {
     _traceApi('Fetching knowledge bases');
     final response = await _dio.get('/api/v1/knowledge/');
@@ -4092,6 +5703,7 @@ class ApiService {
     Map<String, dynamic>? modelItem,
     String? sessionId,
     List<String>? filterIds,
+    ApiAuthSnapshot? authSnapshot,
   }) async {
     // Format messages to match OpenWebUI expected structure exactly
     final formattedMessages = messages.map((msg) {
@@ -4139,9 +5751,12 @@ class ApiService {
       final resp = await _dio.post(
         '/api/chat/completed',
         data: requestData,
-        options: Options(
-          sendTimeout: const Duration(seconds: 10),
-          receiveTimeout: const Duration(seconds: 10),
+        options: _withAuthSnapshot(
+          Options(
+            sendTimeout: const Duration(seconds: 10),
+            receiveTimeout: const Duration(seconds: 10),
+          ),
+          authSnapshot,
         ),
       );
       if (resp.data is Map<String, dynamic>) {
@@ -4511,6 +6126,297 @@ class ApiService {
     }
   }
 
+  Map<String, dynamic> _workspaceListQuery({
+    String? query,
+    String? viewOption,
+    String? tag,
+    String? orderBy,
+    String? direction,
+    int page = 1,
+  }) => <String, dynamic>{
+    'page': page,
+    if (query != null && query.isNotEmpty) 'query': query,
+    if (viewOption != null && viewOption.isNotEmpty) 'view_option': viewOption,
+    if (tag != null && tag.isNotEmpty) 'tag': tag,
+    if (orderBy != null && orderBy.isNotEmpty) 'order_by': orderBy,
+    if (direction != null && direction.isNotEmpty) 'direction': direction,
+  };
+
+  Future<WorkspacePagedResponse<WorkspaceModelSummary>> getWorkspaceModels({
+    String? query,
+    String? viewOption,
+    String? tag,
+    String? orderBy,
+    String? direction,
+    int page = 1,
+  }) async {
+    final response = await _dio.get(
+      '/api/v1/models/list',
+      queryParameters: _workspaceListQuery(
+        query: query,
+        viewOption: viewOption,
+        tag: tag,
+        orderBy: orderBy,
+        direction: direction,
+        page: page,
+      ),
+    );
+    return WorkspacePagedResponse.fromJson(
+      response.data,
+      WorkspaceModelSummary.fromJson,
+    );
+  }
+
+  Future<WorkspaceModelDetail?> getWorkspaceModel(String id) async {
+    final response = await _dio.get(
+      '/api/v1/models/model',
+      queryParameters: {'id': id},
+    );
+    return response.data is Map
+        ? WorkspaceModelSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceModelDetail?> createWorkspaceModel(
+    WorkspaceModelForm form,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/models/create',
+      data: form.toJson(),
+    );
+    return response.data is Map
+        ? WorkspaceModelSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceModelDetail?> updateWorkspaceModel(
+    WorkspaceModelForm form,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/models/model/update',
+      data: form.toJson(),
+    );
+    return response.data is Map
+        ? WorkspaceModelSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceModelDetail?> updateWorkspaceModelAccess(
+    String id,
+    String name,
+    List<WorkspaceAccessGrantInput> grants,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/models/model/access/update',
+      data: {
+        'id': id,
+        'name': name,
+        'access_grants': workspaceGrantInputs(grants),
+      },
+    );
+    return response.data is Map
+        ? WorkspaceModelSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<List<WorkspaceModelDetail>> exportWorkspaceModels() async {
+    final response = await _dio.get('/api/v1/models/export');
+    return workspaceJsonList(
+      response.data,
+    ).map(WorkspaceModelSummary.fromJson).toList(growable: false);
+  }
+
+  Future<bool> importWorkspaceModels(List<Map<String, dynamic>> models) async {
+    final response = await _dio.post(
+      '/api/v1/models/import',
+      data: {'models': models},
+    );
+    return response.data == true;
+  }
+
+  Future<List<WorkspaceModelDetail>> syncWorkspaceModels() async {
+    final response = await _dio.post('/api/v1/models/sync');
+    return workspaceJsonList(
+      response.data,
+    ).map(WorkspaceModelSummary.fromJson).toList(growable: false);
+  }
+
+  Future<List<String>> getWorkspaceModelTags() async {
+    final response = await _dio.get('/api/v1/models/tags');
+    return workspaceStringList(response.data);
+  }
+
+  /// Base models available to compose custom workspace models from. Open WebUI
+  /// serves these at `/api/v1/models/base` (the raw connections/pipelines,
+  /// distinct from the user-facing `/models/list`).
+  Future<List<WorkspaceModelSummary>> getWorkspaceBaseModels() async {
+    final response = await _dio.get('/api/v1/models/base');
+    return workspaceJsonList(
+      response.data,
+    ).map(WorkspaceModelSummary.fromJson).toList(growable: false);
+  }
+
+  /// Fetches a model's profile image bytes from the dedicated
+  /// `/api/v1/models/model/profile/image` endpoint. Returns null when the
+  /// server has no stored image (or serves a redirect to a remote URL).
+  Future<List<int>?> getWorkspaceModelProfileImage(String id) async {
+    try {
+      final response = await _dio.get<List<int>>(
+        '/api/v1/models/model/profile/image',
+        queryParameters: {'id': id},
+        options: Options(
+          responseType: ResponseType.bytes,
+          followRedirects: false,
+          validateStatus: (status) => status != null && status < 400,
+        ),
+      );
+      final data = response.data;
+      return data == null || data.isEmpty ? null : data;
+    } on DioException {
+      return null;
+    }
+  }
+
+  Future<WorkspaceModelDetail?> toggleWorkspaceModel(String id) async {
+    final response = await _dio.post(
+      '/api/v1/models/model/toggle',
+      queryParameters: {'id': id},
+    );
+    return response.data is Map
+        ? WorkspaceModelSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<bool> deleteWorkspaceModel(String id) async {
+    final response = await _dio.post(
+      '/api/v1/models/model/delete',
+      data: {'id': id},
+    );
+    return response.data == true;
+  }
+
+  Future<WorkspacePagedResponse<WorkspaceSkillSummary>> getWorkspaceSkills({
+    String? query,
+    String? viewOption,
+    int page = 1,
+  }) async {
+    final response = await _dio.get(
+      '/api/v1/skills/list',
+      queryParameters: _workspaceListQuery(
+        query: query,
+        viewOption: viewOption,
+        page: page,
+      ),
+    );
+    return WorkspacePagedResponse.fromJson(
+      response.data,
+      WorkspaceSkillSummary.fromJson,
+    );
+  }
+
+  Future<WorkspaceSkillDetail?> getWorkspaceSkill(String id) async {
+    final response = await _dio.get('/api/v1/skills/id/$id');
+    return response.data is Map
+        ? WorkspaceSkillSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceSkillDetail?> createWorkspaceSkill(
+    WorkspaceSkillForm form,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/skills/create',
+      data: form.toJson(),
+    );
+    return response.data is Map
+        ? WorkspaceSkillSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceSkillDetail?> updateWorkspaceSkill(
+    String id,
+    WorkspaceSkillForm form,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/skills/id/$id/update',
+      data: form.toJson(),
+    );
+    return response.data is Map
+        ? WorkspaceSkillSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceSkillDetail?> updateWorkspaceSkillAccess(
+    String id,
+    List<WorkspaceAccessGrantInput> grants,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/skills/id/$id/access/update',
+      data: {'access_grants': workspaceGrantInputs(grants)},
+    );
+    return response.data is Map
+        ? WorkspaceSkillSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<List<WorkspaceSkillDetail>> exportWorkspaceSkills() async {
+    final response = await _dio.get('/api/v1/skills/export');
+    return workspaceJsonList(
+      response.data,
+    ).map(WorkspaceSkillSummary.fromJson).toList(growable: false);
+  }
+
+  Future<WorkspaceSkillDetail?> toggleWorkspaceSkill(String id) async {
+    final response = await _dio.post('/api/v1/skills/id/$id/toggle');
+    return response.data is Map
+        ? WorkspaceSkillSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<bool> deleteWorkspaceSkill(String id) async {
+    final response = await _dio.delete('/api/v1/skills/id/$id/delete');
+    return response.data == true;
+  }
+
+  Future<WorkspacePagedResponse<WorkspacePrincipalPreview>>
+  searchWorkspaceUsers(String query, {int page = 1}) async {
+    final response = await _dio.get(
+      '/api/v1/users/search',
+      queryParameters: {'query': query, 'page': page},
+    );
+    return WorkspacePagedResponse.fromJson(
+      response.data,
+      WorkspacePrincipalPreview.user,
+    );
+  }
+
+  Future<List<WorkspacePrincipalPreview>> getWorkspaceGroups() async {
+    final response = await _dio.get('/api/v1/groups/');
+    return workspaceJsonList(
+      response.data,
+    ).map(WorkspacePrincipalPreview.group).toList(growable: false);
+  }
+
   // Prompts
   Future<List<Prompt>> getPrompts() async {
     _traceApi('Fetching prompts');
@@ -4545,23 +6451,205 @@ class ApiService {
     }
   }
 
+  Future<WorkspacePagedResponse<WorkspacePromptSummary>> getWorkspacePrompts({
+    String? query,
+    String? viewOption,
+    String? tag,
+    String? orderBy,
+    String? direction,
+    int page = 1,
+  }) async {
+    final response = await _dio.get(
+      '/api/v1/prompts/list',
+      queryParameters: _workspaceListQuery(
+        query: query,
+        viewOption: viewOption,
+        tag: tag,
+        orderBy: orderBy,
+        direction: direction,
+        page: page,
+      ),
+    );
+    return WorkspacePagedResponse.fromJson(
+      response.data,
+      WorkspacePromptSummary.fromJson,
+    );
+  }
+
+  Future<WorkspacePromptDetail?> getWorkspacePrompt(String id) async {
+    final response = await _dio.get('/api/v1/prompts/id/$id');
+    return response.data is Map
+        ? WorkspacePromptSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspacePromptDetail?> createWorkspacePrompt(
+    WorkspacePromptForm form,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/prompts/create',
+      data: form.toJson(),
+    );
+    return response.data is Map
+        ? WorkspacePromptSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspacePromptDetail?> updateWorkspacePrompt(
+    String id,
+    WorkspacePromptForm form,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/prompts/id/$id/update',
+      data: form.toJson(),
+    );
+    return response.data is Map
+        ? WorkspacePromptSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspacePromptDetail?> updateWorkspacePromptAccess(
+    String id,
+    List<WorkspaceAccessGrantInput> grants,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/prompts/id/$id/access/update',
+      data: {'access_grants': workspaceGrantInputs(grants)},
+    );
+    return response.data is Map
+        ? WorkspacePromptSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<List<String>> getWorkspacePromptTags() async {
+    final response = await _dio.get('/api/v1/prompts/tags');
+    return workspaceStringList(response.data);
+  }
+
+  Future<WorkspacePromptDetail?> updateWorkspacePromptMetadata(
+    String id, {
+    required String name,
+    required String command,
+    List<String> tags = const [],
+  }) async {
+    final response = await _dio.post(
+      '/api/v1/prompts/id/$id/update/meta',
+      data: {'name': name, 'command': command, 'tags': tags},
+    );
+    return response.data is Map
+        ? WorkspacePromptSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspacePromptDetail?> setWorkspacePromptVersion(
+    String id,
+    String versionId,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/prompts/id/$id/update/version',
+      data: {'version_id': versionId},
+    );
+    return response.data is Map
+        ? WorkspacePromptSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspacePromptDetail?> toggleWorkspacePrompt(String id) async {
+    final response = await _dio.post('/api/v1/prompts/id/$id/toggle');
+    return response.data is Map
+        ? WorkspacePromptSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<List<WorkspacePromptHistoryEntry>> getWorkspacePromptHistory(
+    String id, {
+    int page = 0,
+  }) async {
+    final response = await _dio.get(
+      '/api/v1/prompts/id/$id/history',
+      queryParameters: {'page': page < 0 ? 0 : page},
+    );
+    return workspaceJsonList(
+      response.data,
+    ).map(WorkspacePromptHistoryEntry.fromJson).toList(growable: false);
+  }
+
+  Future<WorkspacePromptHistoryEntry> getWorkspacePromptHistoryEntry(
+    String promptId,
+    String historyId,
+  ) async {
+    final response = await _dio.get(
+      '/api/v1/prompts/id/$promptId/history/$historyId',
+    );
+    return WorkspacePromptHistoryEntry.fromJson(
+      Map<String, dynamic>.from(response.data as Map),
+    );
+  }
+
+  Future<bool> deleteWorkspacePromptHistoryEntry(
+    String promptId,
+    String historyId,
+  ) async {
+    final response = await _dio.delete(
+      '/api/v1/prompts/id/$promptId/history/$historyId',
+    );
+    return response.data == true;
+  }
+
+  Future<Map<String, dynamic>> getWorkspacePromptHistoryDiff(
+    String promptId, {
+    required String fromId,
+    required String toId,
+  }) async {
+    final response = await _dio.get(
+      '/api/v1/prompts/id/$promptId/history/diff',
+      queryParameters: {'from_id': fromId, 'to_id': toId},
+    );
+    return Map<String, dynamic>.from(response.data as Map);
+  }
+
   Future<Map<String, dynamic>> createPrompt({
     required String title,
     required String content,
+    String? command,
     String? description,
     List<String>? tags,
   }) async {
-    _traceApi('Creating prompt: $title');
-    final response = await _dio.post(
-      '/api/v1/prompts/',
-      data: {
-        'title': title,
-        'content': content,
-        'description': ?description,
-        'tags': ?tags,
-      },
+    // The workspace prompt API expects a bare command token (no leading slash).
+    // Strip any caller-supplied slash and slugify the title for the fallback.
+    final normalizedCommand = command?.trim().isNotEmpty == true
+        ? WorkspacePromptCommand.strip(command!)
+        : WorkspacePromptCommand.slugify(title);
+    final created = await createWorkspacePrompt(
+      WorkspacePromptForm(
+        command: normalizedCommand,
+        name: title,
+        content: content,
+        meta: description == null ? null : {'description': description},
+        tags: tags ?? const [],
+      ),
     );
-    return response.data as Map<String, dynamic>;
+    if (created == null) throw StateError('Prompt create returned no record.');
+    return <String, dynamic>{
+      'id': created.id,
+      'command': created.command,
+      'name': created.name,
+      'content': created.content,
+    };
   }
 
   Future<void> updatePrompt(
@@ -4571,32 +6659,46 @@ class ApiService {
     String? description,
     List<String>? tags,
   }) async {
-    _traceApi('Updating prompt: $id');
-    await _dio.put(
-      '/api/v1/prompts/$id',
-      data: {
-        'title': ?title,
-        'content': ?content,
-        'description': ?description,
-        'tags': ?tags,
-      },
+    final current = await getWorkspacePrompt(id);
+    if (current == null) throw StateError('Prompt "$id" was not found.');
+    await updateWorkspacePrompt(
+      id,
+      WorkspacePromptForm(
+        command: current.command,
+        name: title ?? current.name,
+        content: content ?? current.content,
+        data: current.data,
+        meta: description == null
+            ? current.meta
+            : {...?current.meta, 'description': description},
+        tags: tags ?? current.tags,
+        accessGrants: current.accessGrants
+            .map(WorkspaceAccessGrantInput.fromGrant)
+            .toList(growable: false),
+        versionId: current.versionId,
+      ),
     );
   }
 
   Future<void> deletePrompt(String id) async {
-    _traceApi('Deleting prompt: $id');
-    await _dio.delete('/api/v1/prompts/$id');
+    final response = await _dio.delete('/api/v1/prompts/id/$id/delete');
+    if (response.data == false) {
+      throw StateError('Failed to delete prompt: $id');
+    }
   }
 
   // Tools & Functions
   Future<List<Map<String, dynamic>>> getTools() async {
     _traceApi('Fetching tools');
     final response = await _dio.get('/api/v1/tools/');
-    final data = response.data;
-    if (data is List) {
-      return data.cast<Map<String, dynamic>>();
-    }
-    return [];
+    return workspaceJsonList(response.data);
+  }
+
+  Future<List<WorkspaceToolSummary>> getWorkspaceTools() async {
+    final response = await _dio.get('/api/v1/tools/list');
+    return workspaceJsonList(
+      response.data,
+    ).map(WorkspaceToolSummary.fromJson).toList(growable: false);
   }
 
   Future<List<Map<String, dynamic>>> getFunctions() async {
@@ -4609,16 +6711,48 @@ class ApiService {
     return [];
   }
 
+  Future<WorkspaceToolDetail?> createWorkspaceTool(
+    WorkspaceToolForm form,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/tools/create',
+      data: form.toJson(),
+    );
+    return response.data is Map
+        ? WorkspaceToolSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
   Future<Map<String, dynamic>> createTool({
     required String name,
     required Map<String, dynamic> spec,
+    String? id,
+    String? content,
+    String? description,
   }) async {
-    _traceApi('Creating tool: $name');
-    final response = await _dio.post(
-      '/api/v1/tools/',
-      data: {'name': name, 'spec': spec},
+    // Tool ids must be Python identifiers (letters/digits/underscore, no leading
+    // digit); derive the fallback via nameToId rather than a hyphenated slug.
+    final toolId = id ?? WorkspaceToolContent.nameToId(name);
+    final source = content ?? spec['content']?.toString() ?? '';
+    final created = await createWorkspaceTool(
+      WorkspaceToolForm(
+        id: toolId,
+        name: name,
+        content: source,
+        meta: {
+          'description': ?description,
+          if (spec.isNotEmpty) 'manifest': spec,
+        },
+      ),
     );
-    return response.data as Map<String, dynamic>;
+    if (created == null) throw StateError('Tool create returned no record.');
+    return <String, dynamic>{
+      'id': created.id,
+      'name': created.name,
+      'meta': created.meta,
+    };
   }
 
   Future<Map<String, dynamic>> createFunction({
@@ -4641,18 +6775,64 @@ class ApiService {
     return response.data as Map<String, dynamic>;
   }
 
+  Future<WorkspaceToolDetail?> updateWorkspaceTool(
+    String toolId,
+    WorkspaceToolForm form,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/tools/id/$toolId/update',
+      data: form.toJson(),
+    );
+    return response.data is Map
+        ? WorkspaceToolSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
+  Future<WorkspaceToolDetail?> updateWorkspaceToolAccess(
+    String toolId,
+    List<WorkspaceAccessGrantInput> grants,
+  ) async {
+    final response = await _dio.post(
+      '/api/v1/tools/id/$toolId/access/update',
+      data: {'access_grants': workspaceGrantInputs(grants)},
+    );
+    return response.data is Map
+        ? WorkspaceToolSummary.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
+  }
+
   Future<Map<String, dynamic>> updateTool(
     String toolId, {
     String? name,
     Map<String, dynamic>? spec,
+    String? content,
     String? description,
   }) async {
-    _traceApi('Updating tool: $toolId');
-    final response = await _dio.post(
-      '/api/v1/tools/id/$toolId/update',
-      data: {'name': ?name, 'spec': ?spec, 'description': ?description},
+    final current = WorkspaceToolSummary.fromJson(await getTool(toolId));
+    final updated = await updateWorkspaceTool(
+      toolId,
+      WorkspaceToolForm(
+        id: toolId,
+        name: name ?? current.name,
+        content:
+            content ?? spec?['content']?.toString() ?? current.content ?? '',
+        meta: {...current.meta, 'description': ?description, 'manifest': ?spec},
+        accessGrants: current.accessGrants
+            .map(WorkspaceAccessGrantInput.fromGrant)
+            .toList(growable: false),
+      ),
     );
-    return response.data as Map<String, dynamic>;
+    if (updated == null) throw StateError('Tool update returned no record.');
+    return <String, dynamic>{
+      'id': updated.id,
+      'name': updated.name,
+      'content': updated.content,
+      'meta': updated.meta,
+    };
   }
 
   Future<void> deleteTool(String toolId) async {
@@ -4664,6 +6844,15 @@ class ApiService {
     _traceApi('Fetching tool valves: $toolId');
     final response = await _dio.get('/api/v1/tools/id/$toolId/valves');
     return response.data as Map<String, dynamic>;
+  }
+
+  Future<WorkspaceValveSpec?> getToolValvesSpec(String toolId) async {
+    final response = await _dio.get('/api/v1/tools/id/$toolId/valves/spec');
+    return response.data is Map
+        ? WorkspaceValveSpec.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
   }
 
   Future<Map<String, dynamic>> updateToolValves(
@@ -4682,6 +6871,17 @@ class ApiService {
     _traceApi('Fetching user tool valves: $toolId');
     final response = await _dio.get('/api/v1/tools/id/$toolId/valves/user');
     return response.data as Map<String, dynamic>;
+  }
+
+  Future<WorkspaceValveSpec?> getUserToolValvesSpec(String toolId) async {
+    final response = await _dio.get(
+      '/api/v1/tools/id/$toolId/valves/user/spec',
+    );
+    return response.data is Map
+        ? WorkspaceValveSpec.fromJson(
+            Map<String, dynamic>.from(response.data as Map),
+          )
+        : null;
   }
 
   Future<Map<String, dynamic>> updateUserToolValves(
@@ -6278,6 +8478,7 @@ class ApiService {
     String? contentType,
     Map<String, dynamic>? metadata,
     CancelToken? cancelToken,
+    ApiAuthSnapshot? authSnapshot,
   }) async {
     _traceApi('Starting file upload: $fileName from $filePath');
 
@@ -6308,9 +8509,9 @@ class ApiService {
         '/api/v1/files/',
         data: formData,
         cancelToken: cancelToken,
-        options: Options(
-          sendTimeout: uploadTimeout,
-          receiveTimeout: uploadTimeout,
+        options: _withAuthSnapshot(
+          Options(sendTimeout: uploadTimeout, receiveTimeout: uploadTimeout),
+          authSnapshot,
         ),
       );
 
@@ -6740,6 +8941,22 @@ class ApiService {
     Map<String, dynamic>? data,
     Map<String, dynamic>? meta,
     Map<String, dynamic>? accessControl,
+  }) => updateNoteForSession(
+    id,
+    title: title,
+    data: data,
+    meta: meta,
+    accessControl: accessControl,
+  );
+
+  Future<Map<String, dynamic>> updateNoteForSession(
+    String id, {
+    String? title,
+    Map<String, dynamic>? data,
+    Map<String, dynamic>? meta,
+    Map<String, dynamic>? accessControl,
+    ApiAuthSnapshot? authSnapshot,
+    CancelToken? cancelToken,
   }) async {
     _traceApi('Updating note: $id');
     final response = await _dio.post(
@@ -6750,6 +8967,8 @@ class ApiService {
         'meta': ?meta,
         'access_control': ?accessControl,
       },
+      options: _withAuthSnapshot(Options(), authSnapshot),
+      cancelToken: cancelToken,
     );
     return response.data as Map<String, dynamic>;
   }

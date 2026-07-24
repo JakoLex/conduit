@@ -1,10 +1,10 @@
 name: conduit
 description: Open-source mobile client for Open-WebUI
-version: 3.4.1+133
+version: 3.4.3+136
 publish_to: 'none'
 
 environment:
-  sdk: ">=3.8.0 <4.0.0"
+  sdk: ">=3.9.2 <4.0.0"
 
 dependencies:
   flutter:
@@ -22,6 +22,8 @@ dependencies:
   
   # Network & API
   dio: ^5.9.0
+  ollama_dart: ^2.4.0
+  openai_dart: ^7.0.1
   http_parser: ^4.0.2
   
   
@@ -34,8 +36,17 @@ dependencies:
   
   # UI Components - Markdown Rendering
   markdown: ^7.3.0
-  pdfrx: ^2.4.3
+  pdfrx: ^2.4.7
+  archive: ^4.0.9
+  xml: ^7.0.1
   flutter_inappwebview: ^6.1.5
+  flutter_svg: ^2.3.0
+  # Native Mermaid renderer. These unpublished workspace packages are pinned
+  # as submodules under third_party/.
+  mermaid_core:
+    path: third_party/mermaid/packages/mermaid_core
+  mermaid_flutter:
+    path: third_party/mermaid/packages/mermaid_flutter
   socket_io_client: ^3.1.2
   yaml: ^3.1.2
   
@@ -49,18 +60,18 @@ dependencies:
   record: ^6.2.0
   audio_session: ^0.2.2
   permission_handler: ^12.0.1
-  image_picker: ^1.2.0
+  image_picker: ^1.2.3
   # Retained on beta: latest stable 11.0.2 conflicts with share_plus via win32 as of 2026-06-10.
   file_picker: ^12.0.0-beta.5
   flutter_sharing_intent: ^2.0.4
-  flutter_image_compress: ^2.1.0
+  flutter_image_compress: ^2.5.0
   path_provider: ^2.1.4
   
   # Utilities
   path: ^1.9.0
-  uuid: ^4.5.0
+  uuid: ^4.6.0
   crypto: ^3.0.3
-  package_info_plus: ^10.1.0
+  package_info_plus: ^10.2.1
   url_launcher: ^6.3.0
   intl: ^0.20.2
 
@@ -69,10 +80,10 @@ dependencies:
   json_annotation: ^4.12.0
   freezed_annotation: ^3.0.0
   wakelock_plus: ^1.4.0
-  share_plus: ^13.1.0
+  share_plus: ^13.2.1
   riverpod_annotation: ^4.0.0
-  flutter_local_notifications: ^22.0.0
-  connectivity_plus: ^7.0.0
+  flutter_local_notifications: ^22.1.0
+  connectivity_plus: ^7.3.0
   flutter_cache_manager: ^3.4.1
   http: ^1.5.0
   flutter_callkit_incoming: ^3.1.1
@@ -81,7 +92,7 @@ dependencies:
   home_widget: ^0.9.2
   flutter_highlight: ^0.7.0
   just_audio: ^0.10.5
-  adaptive_platform_ui: ^0.1.103
+  adaptive_platform_ui: ^0.1.110
   flutter_tex: ^5.2.6
   gaimon: ^1.4.2
   xterm: ^4.0.0
@@ -91,22 +102,31 @@ dependencies:
   jovial_svg: ^1.1.29
   highlight: ^0.7.0
   geolocator: ^14.0.2
-  # Pinned to a fork commit; reason undocumented - verify before changing.
+  # Fork provides zero-lag StickTarget.bottom anchoring used by chat timelines.
+  # The fork publishes no tags, so pin its latest verified commit exactly.
   super_sliver_list:
     git:
       url: https://github.com/Telosnex/super_sliver_list.git
-      ref: 7a897c8ef022966758ac1f7a8d96c0a14b260c9c
-  drift: ^2.34.0
-  drift_flutter: ^0.3.0
+      ref: fe038453b41305baf032b29bbdf3aa64f62b2c09
+  drift: ^2.34.2
+  drift_flutter: ^0.3.1
   fleather: ^1.27.0
   # Document model + markdown/HTML codecs backing the Fleather note editor.
   parchment: ^1.27.0
+
+# Required while mermaid_flutter declares mermaid_core from the hosted source:
+# Pub cannot combine that source with Conduit's unpublished path package, even
+# though both versions are 0.1.0. Remove once the upstream dependency is hosted
+# or points to the adjacent workspace package.
+dependency_overrides:
+  mermaid_core:
+    path: third_party/mermaid/packages/mermaid_core
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0
-  build_runner: ^2.7.1
+  build_runner: ^2.15.1
   freezed: ^3.2.0
   json_serializable: ^6.11.1
   flutter_native_splash: ^2.4.6
@@ -115,9 +135,12 @@ dev_dependencies:
   mocktail: ^1.0.4
   checks: ^0.3.1
   collection: ^1.19.1
-  pigeon: ^27.1.0
+  pigeon: ^27.2.0
   drift_dev: ^2.34.0
   fake_async: ^1.3.3
+  # Used only in tests to mock the microphone permission platform channel.
+  permission_handler_platform_interface: ^4.3.0
+  plugin_platform_interface: ^2.1.8
 
 flutter:
   config:
@@ -128,8 +151,8 @@ flutter:
   # ARB files live in lib/l10n (configured via l10n.yaml)
   
   assets:
+    - THIRD_PARTY_NOTICES.md
     - assets/icons/
-    - assets/mermaid.min.js
     - assets/chartjs.min.js
     - assets/flutter_tex.js
     - assets/flutter_tex.css

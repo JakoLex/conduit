@@ -1,7 +1,5 @@
-import 'dart:io' show Platform;
-
-import 'package:adaptive_platform_ui/adaptive_platform_ui.dart';
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart' show mapEquals, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -9,18 +7,19 @@ import 'package:go_router/go_router.dart';
 import '../../../core/models/backend_config.dart';
 import '../../../core/models/server_config.dart';
 import '../../../core/providers/app_providers.dart';
+import '../../../core/services/api_service.dart';
 import '../../../core/services/input_validation_service.dart';
 import '../../../core/services/navigation_service.dart';
 import '../../../core/widgets/error_boundary.dart';
-import '../../../shared/services/brand_service.dart';
 import '../../../shared/theme/theme_extensions.dart';
-import '../../../shared/widgets/adaptive_route_shell.dart';
 import '../../../shared/widgets/conduit_components.dart';
 import '../../../core/auth/auth_state_manager.dart';
 import '../../../core/utils/debug_logger.dart';
 import 'package:conduit/l10n/app_localizations.dart';
 import '../providers/unified_auth_providers.dart';
 import '../../../core/auth/webview_cookie_helper.dart' show isWebViewSupported;
+import '../../profile/widgets/adaptive_segmented_selector.dart';
+import '../widgets/adaptive_auth_scaffold.dart';
 
 /// Authentication mode options
 enum AuthMode {
@@ -28,6 +27,60 @@ enum AuthMode {
   token, // JWT token
   sso, // OAuth/OIDC via WebView
   ldap, // LDAP username/password
+}
+
+@visibleForTesting
+String normalizeAuthenticationServerUrl(String value) {
+  final trimmed = value.trim();
+  final parsed = Uri.tryParse(trimmed);
+  if (parsed == null || !parsed.hasScheme || parsed.host.isEmpty) {
+    return trimmed;
+  }
+
+  var path = parsed.path;
+  while (path.length > 1 && path.endsWith('/')) {
+    path = path.substring(0, path.length - 1);
+  }
+  if (path == '/') path = '';
+  return parsed
+      .replace(
+        scheme: parsed.scheme.toLowerCase(),
+        host: parsed.host.toLowerCase(),
+        path: path,
+      )
+      .toString();
+}
+
+@visibleForTesting
+bool authenticationServerMatchesSelection(
+  ServerConfig? actual,
+  ServerConfig expected,
+) {
+  return actual != null &&
+      actual.id == expected.id &&
+      actual.apiKey == null &&
+      normalizeAuthenticationServerUrl(actual.url) ==
+          normalizeAuthenticationServerUrl(expected.url) &&
+      mapEquals(actual.customHeaders, expected.customHeaders) &&
+      actual.allowSelfSignedCertificates ==
+          expected.allowSelfSignedCertificates &&
+      actual.mtlsCertificateChainPem == expected.mtlsCertificateChainPem &&
+      actual.mtlsPrivateKeyPem == expected.mtlsPrivateKeyPem &&
+      actual.mtlsPrivateKeyPassword == expected.mtlsPrivateKeyPassword;
+}
+
+/// Whether the selected server's newly-created API client is safe for sign-in.
+///
+/// Selection deliberately strips legacy [ServerConfig.apiKey] values, and the
+/// replacement client must not inherit a bearer from the prior session.
+@visibleForTesting
+bool authenticationApiMatchesSelection(
+  ApiService? actual,
+  ServerConfig expected,
+) {
+  return actual != null &&
+      actual.authToken == null &&
+      authenticationServerMatchesSelection(actual.serverConfig, expected);
 }
 
 class AuthenticationPage extends ConsumerStatefulWidget {
@@ -119,6 +172,15 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
       // Fallback to token if nothing else is enabled
       _authMode = AuthMode.token;
     }
+
+    // Configured OAuth providers are rendered as their own buttons and are
+    // intentionally omitted from the alternate-method selector. When other
+    // methods are available, keep the selected segment and rendered form in
+    // sync instead of passing an out-of-range value to the native control.
+    final selectableModes = _availableAuthModes;
+    if (selectableModes.length > 1 && !selectableModes.contains(_authMode)) {
+      _authMode = selectableModes.first;
+    }
   }
 
   void _checkAuthStateError() {
@@ -137,7 +199,7 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
   Future<void> _loadSavedCredentials() async {
     final storage = ref.read(optimizedStorageServiceProvider);
     final savedCredentials = await storage.getSavedCredentials();
-    if (savedCredentials != null) {
+    if (mounted && savedCredentials != null) {
       setState(() {
         _usernameController.text = savedCredentials['username'] ?? '';
       });
@@ -222,26 +284,38 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
   }
 
   Future<void> _saveServerConfig(ServerConfig config) async {
-    final storage = ref.read(optimizedStorageServiceProvider);
-    await storage.saveServerConfigs([config]);
-    await storage.setActiveServerId(config.id);
-    ref.invalidate(serverConfigsProvider);
-    ref.invalidate(activeServerProvider);
-    ref.invalidate(apiServiceProvider);
+    await ref
+        .read(authStateManagerProvider.notifier)
+        .selectUnauthenticatedServerConfig(config);
 
-    await ref.read(activeServerProvider.future);
-    await _waitForApiService(config.id);
+    final selectedServer = await ref.read(activeServerProvider.future);
+    if (!authenticationServerMatchesSelection(selectedServer, config)) {
+      throw StateError('The selected server changed before sign-in was ready.');
+    }
+    await _waitForApiService(config);
+
+    final backendConfig = widget.backendConfig;
+    if (backendConfig != null) {
+      // The config was already verified for this server before sign-in. Keep it
+      // associated with the newly active server so capability warnings and
+      // transport options do not wait for another fetch after authentication.
+      await ref.read(backendConfigProvider.future);
+      await ref
+          .read(backendConfigProvider.notifier)
+          .cacheForServer(backendConfig, config.id);
+    }
   }
 
-  Future<void> _waitForApiService(String serverId) async {
+  Future<void> _waitForApiService(ServerConfig selectedServer) async {
     final deadline = DateTime.now().add(const Duration(seconds: 2));
     while (DateTime.now().isBefore(deadline)) {
       final api = ref.read(apiServiceProvider);
-      if (api?.serverConfig.id == serverId) {
+      if (authenticationApiMatchesSelection(api, selectedServer)) {
         return;
       }
       await Future<void>.delayed(const Duration(milliseconds: 50));
     }
+    throw StateError('The selected server connection was not ready in time.');
   }
 
   String _formatLoginError(String error) {
@@ -289,99 +363,29 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
       }
     });
 
-    final safePadding = MediaQuery.of(context).padding;
+    final l10n = AppLocalizations.of(context)!;
 
     return ErrorBoundary(
-      child: AdaptiveRouteShell(
-        backgroundColor: context.conduitTheme.surfaceBackground,
-        body: Column(
-          children: [
-            // Main scrollable content
-            Expanded(
-              child: SingleChildScrollView(
-                keyboardDismissBehavior:
-                    ScrollViewKeyboardDismissBehavior.onDrag,
-                child: Center(
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 480),
-                    child: Padding(
-                      padding: EdgeInsets.only(
-                        left: Spacing.pagePadding,
-                        right: Spacing.pagePadding,
-                        top: safePadding.top + Spacing.md,
-                      ),
-                      child: Form(
-                        key: _formKey,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            // Back button row
-                            Align(
-                              alignment: Alignment.centerLeft,
-                              child: _buildBackButton(),
-                            ),
-
-                            const SizedBox(height: Spacing.xl),
-
-                            // Brand icon + title header
-                            _buildHeader(),
-
-                            const SizedBox(height: Spacing.xxl),
-
-                            // Auth mode selector
-                            if (_availableAuthModes.length > 1) ...[
-                              _buildAuthModeSelector(),
-                              const SizedBox(height: Spacing.lg),
-                            ],
-
-                            // Authentication form
-                            _buildAuthForm(),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-
-            // Bottom action button
-            Padding(
-              padding: EdgeInsets.fromLTRB(
-                Spacing.pagePadding,
-                Spacing.md,
-                Spacing.pagePadding,
-                safePadding.bottom + Spacing.md,
-              ),
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 480),
-                child: _buildSignInButton(),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildBackButton() {
-    return GestureDetector(
-      onTap: () => context.go(Routes.serverConnection),
-      child: Container(
-        width: 40,
-        height: 40,
-        decoration: BoxDecoration(
-          color: context.conduitTheme.surfaceContainer,
-          borderRadius: BorderRadius.circular(AppBorderRadius.button),
-          border: Border.all(
-            color: context.conduitTheme.cardBorder,
-            width: BorderWidth.thin,
+      child: AdaptiveAuthScaffold(
+        title: l10n.signIn,
+        backLabel: l10n.backToServerSetup,
+        backButtonKey: const ValueKey<String>('authentication-back-button'),
+        onBack: () => context.go(Routes.serverConnection),
+        bottomAction: _buildSignInButton(),
+        body: Form(
+          key: _formKey,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _buildHeader(),
+              if (_availableAuthModes.length > 1) ...[
+                const SizedBox(height: Spacing.xl),
+                _buildAuthModeSelector(),
+              ],
+              const SizedBox(height: Spacing.lg),
+              _buildAuthForm(),
+            ],
           ),
-        ),
-        child: Icon(
-          Icons.arrow_back,
-          color: context.conduitTheme.textPrimary,
-          size: IconSize.medium,
         ),
       ),
     );
@@ -391,121 +395,61 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
     final theme = context.conduitTheme;
 
     return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // Brand icon with subtle glow
-        Container(
-          width: 72,
-          height: 72,
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [
-                theme.buttonPrimary.withValues(alpha: 0.12),
-                theme.buttonPrimary.withValues(alpha: 0.04),
-              ],
-            ),
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(
-              color: theme.buttonPrimary.withValues(alpha: 0.15),
-              width: BorderWidth.standard,
-            ),
-          ),
-          child: Center(
-            child: BrandService.createBrandIcon(
-              size: 36,
-              useGradient: true,
-              context: context,
-            ),
-          ),
-        ),
-        const SizedBox(height: Spacing.lg),
-
-        // Title
         Text(
-          AppLocalizations.of(context)!.signIn,
-          textAlign: TextAlign.center,
-          style: theme.headingLarge?.copyWith(
-            fontWeight: FontWeight.w700,
-            letterSpacing: AppTypography.letterSpacingTight,
+          AppLocalizations.of(context)!.signInServerDescription,
+          style: theme.bodyMedium?.copyWith(
+            color: theme.textSecondary,
+            height: 1.4,
           ),
         ),
-        const SizedBox(height: Spacing.sm),
-
-        // Server domain subtitle
-        _buildServerDomain(),
+        const SizedBox(height: Spacing.md),
+        ConduitCard(
+          isElevated: false,
+          padding: const EdgeInsets.all(Spacing.md),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                AppLocalizations.of(context)!.openWebUIServer,
+                style: theme.bodySmall?.copyWith(
+                  color: theme.textSecondary,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              const SizedBox(height: Spacing.xxs),
+              _buildServerDomain(),
+            ],
+          ),
+        ),
       ],
     );
   }
 
   Widget _buildAuthModeSelector() {
     final modes = _availableAuthModes;
-    final selectedIndex = modes.indexOf(_authMode);
-    final theme = context.conduitTheme;
-
-    if (!Platform.isAndroid) {
-      return AdaptiveSegmentedControl(
-        labels: modes.map(_authModeLabel).toList(),
-        selectedIndex: selectedIndex >= 0 ? selectedIndex : 0,
-        onValueChanged: (index) {
-          setState(() {
-            _authMode = modes[index];
-            _loginError = null;
-            _obscurePassword = true;
-          });
-        },
-      );
-    }
-
-    // Android: custom segmented control without checkmark
-    return Container(
-      decoration: BoxDecoration(
-        color: theme.surfaceContainer,
-        borderRadius: BorderRadius.circular(AppBorderRadius.button),
-        border: Border.all(color: theme.cardBorder, width: BorderWidth.thin),
-      ),
-      padding: const EdgeInsets.all(3),
-      child: Row(
-        children: [
-          for (int i = 0; i < modes.length; i++)
-            Expanded(
-              child: GestureDetector(
-                onTap: () {
-                  setState(() {
-                    _authMode = modes[i];
-                    _loginError = null;
-                    _obscurePassword = true;
-                  });
-                },
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 200),
-                  curve: Curves.easeInOut,
-                  padding: const EdgeInsets.symmetric(vertical: 10),
-                  decoration: BoxDecoration(
-                    color: i == selectedIndex
-                        ? theme.buttonPrimary
-                        : Colors.transparent,
-                    borderRadius: BorderRadius.circular(
-                      AppBorderRadius.button - 2,
-                    ),
-                  ),
-                  child: Text(
-                    _authModeLabel(modes[i]),
-                    textAlign: TextAlign.center,
-                    style: AppTypography.bodySmallStyle.copyWith(
-                      fontWeight: i == selectedIndex
-                          ? FontWeight.w600
-                          : FontWeight.w500,
-                      color: i == selectedIndex
-                          ? theme.buttonPrimaryText
-                          : theme.textSecondary,
-                    ),
-                  ),
-                ),
-              ),
-            ),
-        ],
-      ),
+    return AdaptiveSegmentedSelector<AuthMode>(
+      key: const ValueKey<String>('authentication-mode-selector'),
+      value: _authMode,
+      showIcons: false,
+      onChanged: (mode) {
+        setState(() {
+          _authMode = mode;
+          _loginError = null;
+          _obscurePassword = true;
+        });
+      },
+      options: [
+        for (final mode in modes)
+          (
+            value: mode,
+            label: _authModeLabel(mode),
+            cupertinoIcon: CupertinoIcons.circle,
+            materialIcon: Icons.circle_outlined,
+            enabled: true,
+          ),
+      ],
     );
   }
 
@@ -514,16 +458,34 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
     final cfg =
         widget.serverConfig ??
         activeServerAsync.maybeWhen(data: (s) => s, orElse: () => null);
-    final displayUrl = cfg?.url ?? 'Server';
+    final displayUrl = _serverAddressForDisplay(cfg?.url);
     return Text(
       displayUrl,
-      textAlign: TextAlign.center,
       overflow: TextOverflow.ellipsis,
       style: context.conduitTheme.bodySmall?.copyWith(
-        color: context.conduitTheme.textSecondary,
+        color: context.conduitTheme.textPrimary,
+        fontWeight: FontWeight.w600,
         fontFamily: AppTypography.monospaceFontFamily,
       ),
     );
+  }
+
+  String _serverAddressForDisplay(String? rawUrl) {
+    if (rawUrl == null || rawUrl.trim().isEmpty) {
+      return AppLocalizations.of(context)!.serverAddressUnavailable;
+    }
+
+    final value = rawUrl.trim();
+    final uri = Uri.tryParse(value);
+    final scheme = uri?.scheme.toLowerCase();
+    if (uri == null ||
+        uri.host.isEmpty ||
+        (scheme != 'http' && scheme != 'https')) {
+      return AppLocalizations.of(context)!.serverAddressUnavailable;
+    }
+
+    final path = uri.path == '/' ? '' : uri.path;
+    return '${uri.origin}$path';
   }
 
   Widget _buildAuthForm() {
@@ -616,7 +578,9 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
       case 'github':
         icon = Icons.code;
       case 'oidc':
-        icon = Platform.isIOS ? CupertinoIcons.lock_shield : Icons.security;
+        icon = context.usesCupertinoChrome
+            ? CupertinoIcons.lock_shield
+            : Icons.security;
       case 'feishu':
         icon = Icons.chat_bubble_outline;
       default:
@@ -659,40 +623,37 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
   }
 
   Widget _buildApiKeyForm() {
+    final l10n = AppLocalizations.of(context)!;
+
     return Column(
       key: const ValueKey('api_key_form'),
       children: [
-        AdaptiveTextFormField(
+        AccessibleFormField(
+          label: l10n.token,
+          hint: 'eyJ...',
           controller: _apiKeyController,
-          placeholder: 'eyJ...',
           validator: (value) =>
               _validateJwtToken(value ?? _apiKeyController.text),
           obscureText: _obscurePassword,
-          prefixIcon: Icon(
-            Platform.isIOS
-                ? CupertinoIcons.lock_shield
-                : Icons.vpn_key_outlined,
-            color: context.conduitTheme.iconSecondary,
-          ),
+          isRequired: true,
+          autocorrect: false,
+          textInputAction: TextInputAction.done,
           suffixIcon: ConduitIconButton(
             icon: _obscurePassword
-                ? (Platform.isIOS
+                ? (context.usesCupertinoChrome
                       ? CupertinoIcons.eye_slash
                       : Icons.visibility_off)
-                : (Platform.isIOS ? CupertinoIcons.eye : Icons.visibility),
+                : (context.usesCupertinoChrome
+                      ? CupertinoIcons.eye
+                      : Icons.visibility),
             iconColor: context.conduitTheme.iconSecondary,
             onPressed: () =>
                 setState(() => _obscurePassword = !_obscurePassword),
-            tooltip: _obscurePassword ? 'Show password' : 'Hide password',
+            tooltip: _obscurePassword ? l10n.showPassword : l10n.hidePassword,
             isCompact: true,
           ),
           onSubmitted: (_) => _signIn(),
           autofillHints: const [AutofillHints.password],
-          cupertinoDecoration: BoxDecoration(
-            color: CupertinoColors.tertiarySystemBackground,
-            border: Border.all(color: context.conduitTheme.inputBorder),
-            borderRadius: BorderRadius.circular(8),
-          ),
         ),
         const SizedBox(height: Spacing.sm),
         Text(
@@ -706,13 +667,16 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
   }
 
   Widget _buildCredentialsForm() {
+    final l10n = AppLocalizations.of(context)!;
+
     return AutofillGroup(
       child: Column(
         key: const ValueKey('credentials_form'),
         children: [
-          AdaptiveTextFormField(
+          AccessibleFormField(
+            label: l10n.usernameOrEmail,
+            hint: l10n.usernameOrEmailHint,
             controller: _usernameController,
-            placeholder: AppLocalizations.of(context)!.usernameOrEmailHint,
             validator: (value) {
               final v = value ?? _usernameController.text;
               return InputValidationService.combine([
@@ -721,21 +685,17 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
               ])(v);
             },
             keyboardType: TextInputType.emailAddress,
-            prefixIcon: Icon(
-              Platform.isIOS ? CupertinoIcons.person : Icons.person_outline,
-              color: context.conduitTheme.iconSecondary,
-            ),
+            textInputAction: TextInputAction.next,
+            autocorrect: false,
+            isRequired: true,
+            onSubmitted: (_) => FocusScope.of(context).nextFocus(),
             autofillHints: const [AutofillHints.username, AutofillHints.email],
-            cupertinoDecoration: BoxDecoration(
-              color: CupertinoColors.tertiarySystemBackground,
-              border: Border.all(color: context.conduitTheme.inputBorder),
-              borderRadius: BorderRadius.circular(8),
-            ),
           ),
           const SizedBox(height: Spacing.lg),
-          AdaptiveTextFormField(
+          AccessibleFormField(
+            label: l10n.password,
+            hint: l10n.passwordHint,
             controller: _passwordController,
-            placeholder: AppLocalizations.of(context)!.passwordHint,
             validator: (value) {
               final v = value ?? _passwordController.text;
               return InputValidationService.combine([
@@ -748,29 +708,25 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
               ])(v);
             },
             obscureText: _obscurePassword,
-            prefixIcon: Icon(
-              Platform.isIOS ? CupertinoIcons.lock : Icons.lock_outline,
-              color: context.conduitTheme.iconSecondary,
-            ),
+            textInputAction: TextInputAction.done,
+            autocorrect: false,
+            isRequired: true,
             suffixIcon: ConduitIconButton(
               icon: _obscurePassword
-                  ? (Platform.isIOS
+                  ? (context.usesCupertinoChrome
                         ? CupertinoIcons.eye_slash
                         : Icons.visibility_off)
-                  : (Platform.isIOS ? CupertinoIcons.eye : Icons.visibility),
+                  : (context.usesCupertinoChrome
+                        ? CupertinoIcons.eye
+                        : Icons.visibility),
               iconColor: context.conduitTheme.iconSecondary,
               onPressed: () =>
                   setState(() => _obscurePassword = !_obscurePassword),
-              tooltip: _obscurePassword ? 'Show password' : 'Hide password',
+              tooltip: _obscurePassword ? l10n.showPassword : l10n.hidePassword,
               isCompact: true,
             ),
             onSubmitted: (_) => _signIn(),
             autofillHints: const [AutofillHints.password],
-            cupertinoDecoration: BoxDecoration(
-              color: CupertinoColors.tertiarySystemBackground,
-              border: Border.all(color: context.conduitTheme.inputBorder),
-              borderRadius: BorderRadius.circular(8),
-            ),
           ),
         ],
       ),
@@ -784,28 +740,25 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
       child: Column(
         key: const ValueKey('ldap_form'),
         children: [
-          AdaptiveTextFormField(
+          AccessibleFormField(
+            label: l10n.ldapUsername,
+            hint: l10n.ldapUsernameHint,
             controller: _ldapUsernameController,
-            placeholder: l10n.ldapUsernameHint,
             validator: (value) => InputValidationService.validateRequired(
               value ?? _ldapUsernameController.text,
             ),
             keyboardType: TextInputType.text,
-            prefixIcon: Icon(
-              Platform.isIOS ? CupertinoIcons.person : Icons.person_outline,
-              color: context.conduitTheme.iconSecondary,
-            ),
+            textInputAction: TextInputAction.next,
+            autocorrect: false,
+            isRequired: true,
+            onSubmitted: (_) => FocusScope.of(context).nextFocus(),
             autofillHints: const [AutofillHints.username],
-            cupertinoDecoration: BoxDecoration(
-              color: CupertinoColors.tertiarySystemBackground,
-              border: Border.all(color: context.conduitTheme.inputBorder),
-              borderRadius: BorderRadius.circular(8),
-            ),
           ),
           const SizedBox(height: Spacing.lg),
-          AdaptiveTextFormField(
+          AccessibleFormField(
+            label: l10n.password,
+            hint: l10n.passwordHint,
             controller: _ldapPasswordController,
-            placeholder: l10n.passwordHint,
             validator: (value) {
               final v = value ?? _ldapPasswordController.text;
               return InputValidationService.combine([
@@ -818,29 +771,25 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
               ])(v);
             },
             obscureText: _obscurePassword,
-            prefixIcon: Icon(
-              Platform.isIOS ? CupertinoIcons.lock : Icons.lock_outline,
-              color: context.conduitTheme.iconSecondary,
-            ),
+            textInputAction: TextInputAction.done,
+            autocorrect: false,
+            isRequired: true,
             suffixIcon: ConduitIconButton(
               icon: _obscurePassword
-                  ? (Platform.isIOS
+                  ? (context.usesCupertinoChrome
                         ? CupertinoIcons.eye_slash
                         : Icons.visibility_off)
-                  : (Platform.isIOS ? CupertinoIcons.eye : Icons.visibility),
+                  : (context.usesCupertinoChrome
+                        ? CupertinoIcons.eye
+                        : Icons.visibility),
               iconColor: context.conduitTheme.iconSecondary,
               onPressed: () =>
                   setState(() => _obscurePassword = !_obscurePassword),
-              tooltip: _obscurePassword ? 'Show password' : 'Hide password',
+              tooltip: _obscurePassword ? l10n.showPassword : l10n.hidePassword,
               isCompact: true,
             ),
             onSubmitted: (_) => _signIn(),
             autofillHints: const [AutofillHints.password],
-            cupertinoDecoration: BoxDecoration(
-              color: CupertinoColors.tertiarySystemBackground,
-              border: Border.all(color: context.conduitTheme.inputBorder),
-              borderRadius: BorderRadius.circular(8),
-            ),
           ),
           const SizedBox(height: Spacing.sm),
           Text(
@@ -873,7 +822,9 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
           child: Column(
             children: [
               Icon(
-                Platform.isIOS ? CupertinoIcons.lock_shield : Icons.security,
+                context.usesCupertinoChrome
+                    ? CupertinoIcons.lock_shield
+                    : Icons.security,
                 size: IconSize.xxl,
                 color: context.conduitTheme.buttonPrimary,
               ),
@@ -890,7 +841,7 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
               const SizedBox(height: Spacing.lg),
               ConduitButton(
                 text: l10n.signInWithSso,
-                icon: Platform.isIOS
+                icon: context.usesCupertinoChrome
                     ? CupertinoIcons.arrow_right
                     : Icons.arrow_forward,
                 onPressed: _navigateToSso,
@@ -906,10 +857,30 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
   Future<void> _navigateToSso() async {
     if (!mounted) return;
 
-    // Save server config first if needed
+    // Save server config first if needed. _saveServerConfig can throw (for
+    // example when the selected server's API client is not ready in time), so
+    // surface that like the credentials path instead of silently doing
+    // nothing; the user can then retry the SSO button.
     if (widget.serverConfig != null && !_serverConfigSaved) {
-      await _saveServerConfig(widget.serverConfig!);
-      _serverConfigSaved = true;
+      try {
+        setState(() {
+          _loginError = null;
+        });
+        await _saveServerConfig(widget.serverConfig!);
+        _serverConfigSaved = true;
+      } catch (e) {
+        DebugLogger.error(
+          'sso-server-config-save-failed',
+          scope: 'auth/page',
+          data: {'errorType': e.runtimeType.toString()},
+        );
+        if (mounted) {
+          setState(() {
+            _loginError = _formatLoginError(e.toString());
+          });
+        }
+        return;
+      }
       if (!mounted) return;
     }
 
@@ -942,12 +913,10 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
 
     return ConduitButton(
       text: buttonText,
-      icon: _isSigningIn
-          ? null
-          : (Platform.isIOS ? CupertinoIcons.arrow_right : Icons.arrow_forward),
       onPressed: _isSigningIn ? null : _signIn,
       isLoading: _isSigningIn,
       isFullWidth: true,
+      useNativeLabel: true,
     );
   }
 
@@ -968,7 +937,7 @@ class _AuthenticationPageState extends ConsumerState<AuthenticationPage> {
         child: Row(
           children: [
             Icon(
-              Platform.isIOS
+              context.usesCupertinoChrome
                   ? CupertinoIcons.exclamationmark_circle
                   : Icons.error_outline,
               color: context.conduitTheme.error,

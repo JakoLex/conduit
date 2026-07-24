@@ -3,8 +3,11 @@ import 'dart:async';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/physics.dart';
+import 'package:flutter/rendering.dart'
+    show RenderBox, RenderEditable, RenderProxyBoxWithHitTestBehavior;
 import 'package:flutter/services.dart';
 
+import '../../core/services/performance_profiler.dart';
 import '../../shared/theme/theme_extensions.dart';
 import 'drawer_slot.dart';
 
@@ -16,6 +19,140 @@ class _HorizontalScrollableHit {
   const _HorizontalScrollableHit({required this.isAtOpenGestureLeadingEdge});
 
   final bool isAtOpenGestureLeadingEdge;
+}
+
+class _DrawerOpenHorizontalDragGestureRecognizer
+    extends HorizontalDragGestureRecognizer {
+  _DrawerOpenHorizontalDragGestureRecognizer({super.debugOwner});
+
+  double minimumLocalX = 0.0;
+  double maximumLocalX = double.infinity;
+  double axisBias = 1.0;
+  bool Function(PointerEvent event)? isPositionAllowed;
+  int? _trackedPointer;
+  Offset? _pointerOrigin;
+  double _verticalDistance = 0.0;
+  bool _directionDisqualified = false;
+
+  @override
+  bool isPointerAllowed(PointerEvent event) {
+    final dx = event.localPosition.dx;
+    if (dx < minimumLocalX ||
+        dx >= maximumLocalX ||
+        (_trackedPointer != null && _trackedPointer != event.pointer) ||
+        isPositionAllowed?.call(event) == false) {
+      return false;
+    }
+    return super.isPointerAllowed(event);
+  }
+
+  @override
+  void addAllowedPointer(PointerDownEvent event) {
+    _trackedPointer = event.pointer;
+    _pointerOrigin = event.position;
+    _verticalDistance = 0.0;
+    _directionDisqualified = false;
+    super.addAllowedPointer(event);
+  }
+
+  @override
+  void handleEvent(PointerEvent event) {
+    if (event.pointer == _trackedPointer && event is PointerMoveEvent) {
+      final delta = event.position - _pointerOrigin!;
+      final dxAbs = delta.dx.abs();
+      _verticalDistance = delta.dy.abs();
+      final touchSlop = computeHitSlop(event.kind, gestureSettings);
+      if ((_verticalDistance > touchSlop && _verticalDistance > dxAbs) ||
+          (delta.dx < -touchSlop && dxAbs > _verticalDistance)) {
+        _directionDisqualified = true;
+      }
+    }
+    super.handleEvent(event);
+  }
+
+  @override
+  void didStopTrackingLastPointer(int pointer) {
+    super.didStopTrackingLastPointer(pointer);
+    _trackedPointer = null;
+    _pointerOrigin = null;
+    _verticalDistance = 0.0;
+    _directionDisqualified = false;
+  }
+
+  @override
+  bool isPointerPanZoomAllowed(PointerPanZoomStartEvent event) => false;
+
+  @override
+  bool hasSufficientGlobalDistanceToAccept(
+    PointerDeviceKind pointerDeviceKind,
+    double? deviceTouchSlop,
+  ) {
+    return !_directionDisqualified &&
+        globalDistanceMoved >
+            computeHitSlop(pointerDeviceKind, gestureSettings) &&
+        globalDistanceMoved > _verticalDistance * axisBias;
+  }
+
+  @override
+  String get debugDescription => 'drawer open horizontal drag';
+}
+
+/// Prevents the full-width drawer-open recognizer from competing with a
+/// descendant that owns non-scroll horizontal gestures, such as rich-text
+/// selection or a document editor.
+class DrawerOpenGestureExclusion extends SingleChildRenderObjectWidget {
+  const DrawerOpenGestureExclusion({super.key, required super.child});
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderDrawerOpenGestureExclusion();
+}
+
+class _RenderDrawerOpenGestureExclusion
+    extends RenderProxyBoxWithHitTestBehavior {
+  _RenderDrawerOpenGestureExclusion()
+    : super(behavior: HitTestBehavior.translucent);
+}
+
+/// Gives a quick rightward drawer drag priority inside an otherwise excluded
+/// gesture owner while still allowing that owner to win gestures such as a
+/// stationary long press.
+///
+/// Place this below the owner's recognizer in the widget tree. For example,
+/// putting it around the child of a [SelectionArea] lets the drawer win an
+/// immediate horizontal drag on every platform, while the selection area's
+/// long-press recognizer still wins before any horizontal movement begins.
+class DrawerOpenGesturePriority extends StatelessWidget {
+  const DrawerOpenGesturePriority({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final layout = ResponsiveDrawerLayout.of(context);
+    return layout?._buildPrioritizedDrawerGestureArena(child) ?? child;
+  }
+}
+
+class DrawerChromeCompositionScope extends InheritedWidget {
+  const DrawerChromeCompositionScope({
+    super.key,
+    required this.composeNativeChrome,
+    required super.child,
+  });
+
+  final bool composeNativeChrome;
+
+  static bool shouldCompose(BuildContext context) {
+    return context
+            .dependOnInheritedWidgetOfExactType<DrawerChromeCompositionScope>()
+            ?.composeNativeChrome ??
+        true;
+  }
+
+  @override
+  bool updateShouldNotify(DrawerChromeCompositionScope oldWidget) =>
+      composeNativeChrome != oldWidget.composeNativeChrome;
 }
 
 bool _usesNativeSidebarChrome(BuildContext context) =>
@@ -40,13 +177,19 @@ double sidebarRefreshIndicatorEdgeOffset(BuildContext context) {
 }
 
 /// Bottom inset so sidebar tab content clears native sidebar chrome.
-double sidebarTabContentBottomPadding(BuildContext context) {
+double sidebarTabContentBottomPadding(
+  BuildContext context, {
+  bool includeNativeBottomBar = true,
+}) {
   if (!_usesNativeSidebarChrome(context)) {
     return Spacing.md;
   }
 
   final bottomPadding = MediaQuery.viewPaddingOf(context).bottom;
-  return bottomPadding + _kSidebarNativeBottomBarContentHeight + Spacing.md;
+  final navigationBarHeight = includeNativeBottomBar
+      ? _kSidebarNativeBottomBarContentHeight
+      : 0.0;
+  return bottomPadding + navigationBarHeight + Spacing.md;
 }
 
 /// Height excluded from drawer drag gestures above the native sidebar tab bar.
@@ -113,17 +256,22 @@ class ResponsiveDrawerLayout extends StatefulWidget {
 
 class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
     with SingleTickerProviderStateMixin {
+  // Matches Flutter's default Material drawer edge width.
+  static const double _kDrawerEdgeDragWidth = 20.0;
   static const double _kEdgeOpenTouchSlop = kTouchSlop;
   static const double _kHorizontalScrollableOpenThreshold = 45.0;
   static const double _kEdgeOpenAxisBias = 1.0;
 
   late final AnimationController _controller;
   late bool _isTabletDocked = widget.tabletInitiallyDocked;
+  late bool _composeTabletDrawerChrome =
+      !widget.tabletDismissible || widget.tabletInitiallyDocked;
 
   /// Cached tablet state to avoid accessing context when unmounted.
   bool _cachedIsTablet = false;
   _DrawerSettleEndpoint? _lastSettledEndpoint;
   _DrawerSettleEndpoint? _pendingSettledEndpoint;
+  bool _composeMobileDrawerChrome = false;
   bool _isDragging = false;
   _DrawerSettleEndpoint? _dragTerminalEndpoint;
   int? _edgePointer;
@@ -148,6 +296,33 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
     return _cachedIsTablet;
   }
 
+  void _setComposeMobileDrawerChrome(bool value) {
+    if (_composeMobileDrawerChrome == value || !mounted) return;
+    setState(() => _composeMobileDrawerChrome = value);
+    _recordChromeComposition(value);
+  }
+
+  void _setComposeTabletDrawerChrome(bool value) {
+    if (_composeTabletDrawerChrome == value || !mounted) return;
+    setState(() => _composeTabletDrawerChrome = value);
+    _recordChromeComposition(value);
+  }
+
+  void _recordChromeComposition(bool value) {
+    PerformanceProfiler.instance.instant(
+      'sidebar_chrome_composition',
+      scope: 'platform_views',
+      data: <String, Object?>{'composeNativeChrome': value},
+    );
+  }
+
+  Widget _scopeDrawer(Widget child, {required bool composeNativeChrome}) {
+    return DrawerChromeCompositionScope(
+      composeNativeChrome: composeNativeChrome,
+      child: child,
+    );
+  }
+
   double get _panelWidth {
     final w = MediaQuery.of(context).size.width;
     final raw = w * widget.maxFraction;
@@ -157,6 +332,41 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
 
   double get _edgeWidth =>
       MediaQuery.of(context).size.width * widget.edgeFraction;
+
+  double get _drawerEdgeDragWidth =>
+      _kDrawerEdgeDragWidth + MediaQuery.paddingOf(context).left;
+
+  double get _rawDrawerEdgeWidth =>
+      _drawerEdgeDragWidth.clamp(0.0, _edgeWidth).toDouble();
+
+  bool _contentDrawerGestureCanStart(PointerEvent event) {
+    if (_controller.value > 0.001) {
+      return false;
+    }
+
+    final result = HitTestResult();
+    WidgetsBinding.instance.hitTestInView(result, event.position, event.viewId);
+    return !result.path.any(
+      (entry) =>
+          entry.target is _RenderDrawerOpenGestureExclusion ||
+          entry.target is RenderEditable,
+    );
+  }
+
+  bool _prioritizedDrawerGestureCanStart(PointerEvent event) {
+    if (_isTablet(context) || _controller.value > 0.001) {
+      return false;
+    }
+
+    final renderObject = context.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) {
+      return false;
+    }
+
+    final localPosition = renderObject.globalToLocal(event.position);
+    return localPosition.dx >= _rawDrawerEdgeWidth &&
+        localPosition.dx < _edgeWidth;
+  }
 
   /// Returns whether the drawer is currently open.
   /// Uses cached tablet state to avoid context access issues when unmounted.
@@ -174,19 +384,42 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    // Update cached tablet state when MediaQuery changes
-    _isTablet(context);
+    final wasTablet = _cachedIsTablet;
+    final isTablet = _isTablet(context);
+    if (wasTablet == isTablet) return;
+
+    final shouldComposeTabletChrome =
+        !widget.tabletDismissible || _isTabletDocked;
+    if (_composeTabletDrawerChrome != shouldComposeTabletChrome) {
+      _composeTabletDrawerChrome = shouldComposeTabletChrome;
+      _recordChromeComposition(shouldComposeTabletChrome);
+    }
   }
 
   @override
   void didUpdateWidget(covariant ResponsiveDrawerLayout oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (!widget.tabletDismissible && !_isTabletDocked) {
-      setState(() => _isTabletDocked = true);
+    if (!widget.tabletDismissible) {
+      final compositionChanged = !_composeTabletDrawerChrome;
+      if (!_isTabletDocked || compositionChanged) {
+        setState(() {
+          _isTabletDocked = true;
+          _composeTabletDrawerChrome = true;
+        });
+        if (compositionChanged) _recordChromeComposition(true);
+      }
     } else if (widget.tabletInitiallyDocked !=
             oldWidget.tabletInitiallyDocked &&
         _isTablet(context)) {
-      setState(() => _isTabletDocked = widget.tabletInitiallyDocked);
+      final compositionChanged =
+          _composeTabletDrawerChrome != widget.tabletInitiallyDocked;
+      setState(() {
+        _isTabletDocked = widget.tabletInitiallyDocked;
+        _composeTabletDrawerChrome = widget.tabletInitiallyDocked;
+      });
+      if (compositionChanged) {
+        _recordChromeComposition(widget.tabletInitiallyDocked);
+      }
     }
   }
 
@@ -244,6 +477,7 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
       _dragTerminalEndpoint = endpoint;
       return;
     }
+    _setComposeMobileDrawerChrome(endpoint != _DrawerSettleEndpoint.closed);
     if (_pendingSettledEndpoint != endpoint) {
       return;
     }
@@ -254,8 +488,13 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
 
   void open({double velocity = 0.0}) {
     if (_isTablet(context)) {
-      if (!_isTabletDocked) {
-        setState(() => _isTabletDocked = true);
+      final compositionChanged = !_composeTabletDrawerChrome;
+      if (!_isTabletDocked || compositionChanged) {
+        setState(() {
+          _isTabletDocked = true;
+          _composeTabletDrawerChrome = true;
+        });
+        if (compositionChanged) _recordChromeComposition(true);
       }
       return;
     }
@@ -263,6 +502,7 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
     _pendingSettledEndpoint = _lastSettledEndpoint == _DrawerSettleEndpoint.open
         ? null
         : _DrawerSettleEndpoint.open;
+    _setComposeMobileDrawerChrome(true);
 
     try {
       widget.onOpenStart?.call();
@@ -279,7 +519,10 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
       }
       return;
     }
-    if (_controller.isDismissed) return;
+    if (_controller.isDismissed) {
+      _setComposeMobileDrawerChrome(false);
+      return;
+    }
     _pendingSettledEndpoint =
         _lastSettledEndpoint == _DrawerSettleEndpoint.closed
         ? null
@@ -291,7 +534,7 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
   void toggle() {
     if (_isTablet(context)) {
       if (!widget.tabletDismissible) return;
-      setState(() => _isTabletDocked = !_isTabletDocked);
+      _isTabletDocked ? close() : open();
       return;
     }
 
@@ -324,6 +567,7 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
   void _beginDrawerDrag() {
     _resetDragState();
     _isDragging = true;
+    _setComposeMobileDrawerChrome(true);
     if (_controller.value <= 0.001) {
       try {
         widget.onOpenStart?.call();
@@ -399,9 +643,27 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
   ) {
     final result = HitTestResult();
     WidgetsBinding.instance.hitTestInView(result, globalPosition, viewId);
+    var foundHorizontalTarget = false;
 
     for (final entry in result.path) {
       final dynamic target = entry.target;
+
+      // Scrollable's opaque gesture handler remains in the hit-test path even
+      // when blank space inside its viewport has no hit-testable descendant.
+      // Its surrounding scroll-semantics render object exposes the position,
+      // which lets us recognize those otherwise invisible scrollable regions.
+      try {
+        final maybePosition = target.position;
+        if (maybePosition is ScrollPosition &&
+            _isHorizontalAxisDirection(maybePosition.axisDirection)) {
+          return _HorizontalScrollableHit(
+            isAtOpenGestureLeadingEdge: _isAtLeadingEdgeForOpenGesture(
+              maybePosition,
+              maybePosition.axisDirection,
+            ),
+          );
+        }
+      } catch (_) {}
 
       AxisDirection? axisDirection;
       try {
@@ -414,6 +676,7 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
       if (axisDirection == null || !_isHorizontalAxisDirection(axisDirection)) {
         continue;
       }
+      foundHorizontalTarget = true;
 
       try {
         final offset = target.offset;
@@ -426,11 +689,11 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
           );
         }
       } catch (_) {}
-
-      return const _HorizontalScrollableHit(isAtOpenGestureLeadingEdge: true);
     }
 
-    return null;
+    return foundHorizontalTarget
+        ? const _HorizontalScrollableHit(isAtOpenGestureLeadingEdge: true)
+        : null;
   }
 
   void _onEdgePointerDown(PointerDownEvent event) {
@@ -450,7 +713,8 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
       return;
     }
 
-    if (horizontalHit.isAtOpenGestureLeadingEdge) {
+    if (horizontalHit.isAtOpenGestureLeadingEdge &&
+        event.localPosition.dx <= _drawerEdgeDragWidth) {
       _edgePointerActivationThreshold = _kHorizontalScrollableOpenThreshold;
     } else {
       _edgePointerSuppressedByHorizontalScrollable = true;
@@ -515,6 +779,9 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
 
     if (_isDragging) {
       _resetDragState();
+      if (_controller.isDismissed) {
+        _setComposeMobileDrawerChrome(false);
+      }
     }
     _resetEdgePointerState();
   }
@@ -539,6 +806,71 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
   void _onDragCancel() {
     if (_isTablet(context)) return;
     _resetDragState();
+    if (_controller.isDismissed) {
+      _setComposeMobileDrawerChrome(false);
+    }
+  }
+
+  Widget _buildMobileContentGestureArena(Widget child) {
+    return RawGestureDetector(
+      behavior: HitTestBehavior.translucent,
+      excludeFromSemantics: true,
+      gestures: <Type, GestureRecognizerFactory>{
+        _DrawerOpenHorizontalDragGestureRecognizer:
+            GestureRecognizerFactoryWithHandlers<
+              _DrawerOpenHorizontalDragGestureRecognizer
+            >(
+              () =>
+                  _DrawerOpenHorizontalDragGestureRecognizer(debugOwner: this),
+              (recognizer) {
+                recognizer
+                  ..minimumLocalX = _rawDrawerEdgeWidth
+                  ..maximumLocalX = _edgeWidth
+                  ..axisBias = _kEdgeOpenAxisBias
+                  ..isPositionAllowed = _contentDrawerGestureCanStart
+                  ..onlyAcceptDragOnThreshold = true
+                  ..dragStartBehavior = DragStartBehavior.down
+                  ..gestureSettings = MediaQuery.maybeGestureSettingsOf(context)
+                  ..onStart = _onDragStart
+                  ..onUpdate = _onDragUpdate
+                  ..onEnd = _onDragEnd
+                  ..onCancel = _onDragCancel;
+              },
+            ),
+      },
+      child: child,
+    );
+  }
+
+  Widget _buildPrioritizedDrawerGestureArena(Widget child) {
+    return RawGestureDetector(
+      behavior: HitTestBehavior.translucent,
+      excludeFromSemantics: true,
+      gestures: <Type, GestureRecognizerFactory>{
+        _DrawerOpenHorizontalDragGestureRecognizer:
+            GestureRecognizerFactoryWithHandlers<
+              _DrawerOpenHorizontalDragGestureRecognizer
+            >(
+              () =>
+                  _DrawerOpenHorizontalDragGestureRecognizer(debugOwner: this),
+              (recognizer) {
+                recognizer
+                  ..minimumLocalX = -double.infinity
+                  ..maximumLocalX = double.infinity
+                  ..axisBias = _kEdgeOpenAxisBias
+                  ..isPositionAllowed = _prioritizedDrawerGestureCanStart
+                  ..onlyAcceptDragOnThreshold = true
+                  ..dragStartBehavior = DragStartBehavior.down
+                  ..gestureSettings = MediaQuery.maybeGestureSettingsOf(context)
+                  ..onStart = _onDragStart
+                  ..onUpdate = _onDragUpdate
+                  ..onEnd = _onDragEnd
+                  ..onCancel = _onDragCancel;
+              },
+            ),
+      },
+      child: child,
+    );
   }
 
   Widget _buildTabletDrawerSlot(ConduitThemeExtension theme, DrawerSlot slot) {
@@ -634,6 +966,10 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
     }
   }
 
+  void _handleTabletDrawerAnimationEnd() {
+    _setComposeTabletDrawerChrome(!widget.tabletDismissible || _isTabletDocked);
+  }
+
   Widget _buildTabletLayout(ConduitThemeExtension theme) {
     final targetWidth = widget.tabletDismissible && !_isTabletDocked
         ? 0.0
@@ -644,17 +980,21 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
         AnimatedContainer(
           duration: _tabletDuration,
           curve: Curves.easeOutCubic,
+          onEnd: _handleTabletDrawerAnimationEnd,
           width: targetWidth,
           decoration: BoxDecoration(color: theme.surfaceBackground),
           child: ClipRect(
             child: IgnorePointer(
               ignoring: widget.tabletDismissible && !_isTabletDocked,
-              child: widget.drawer is DrawerSlot
-                  ? _buildTabletDrawerSlot(theme, widget.drawer as DrawerSlot)
-                  : ColoredBox(
-                      color: theme.surfaceBackground,
-                      child: widget.drawer,
-                    ),
+              child: _scopeDrawer(
+                widget.drawer is DrawerSlot
+                    ? _buildTabletDrawerSlot(theme, widget.drawer as DrawerSlot)
+                    : ColoredBox(
+                        color: theme.surfaceBackground,
+                        child: widget.drawer,
+                      ),
+                composeNativeChrome: _composeTabletDrawerChrome,
+              ),
             ),
           ),
         ),
@@ -692,17 +1032,20 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
                   child: child,
                 );
               },
-              child: widget.child,
+              child: _buildMobileContentGestureArena(widget.child),
             ),
           ),
         ),
 
-        // Edge gesture region to open
+        // The true screen edge intentionally overrides a horizontal scroller
+        // only at its opening edge. Everywhere else, the ancestor recognizer
+        // above participates in the gesture arena so descendant interactions
+        // such as selection, editing, and platform views retain ownership.
         Positioned(
           left: 0,
           top: 0,
           bottom: 0,
-          width: _edgeWidth,
+          width: _rawDrawerEdgeWidth,
           child: Listener(
             behavior: HitTestBehavior.translucent,
             onPointerDown: _onEdgePointerDown,
@@ -742,14 +1085,17 @@ class ResponsiveDrawerLayoutState extends State<ResponsiveDrawerLayout>
                     top: 0,
                     bottom: 0,
                     width: _panelWidth,
-                    child: widget.drawer is DrawerSlot
-                        ? RepaintBoundary(
-                            child: _buildMobileDrawerSlotPanel(
-                              theme,
-                              widget.drawer as DrawerSlot,
-                            ),
-                          )
-                        : _buildMobileDrawerPanel(theme),
+                    child: _scopeDrawer(
+                      widget.drawer is DrawerSlot
+                          ? RepaintBoundary(
+                              child: _buildMobileDrawerSlotPanel(
+                                theme,
+                                widget.drawer as DrawerSlot,
+                              ),
+                            )
+                          : _buildMobileDrawerPanel(theme),
+                      composeNativeChrome: _composeMobileDrawerChrome,
+                    ),
                   ),
                 ],
               ),

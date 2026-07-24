@@ -394,6 +394,7 @@ class _TerminalTabState extends ConsumerState<TerminalTab>
       }
       final channel = ref.read(terminalChannelConnectorProvider)(
         service.buildWebSocketUri(server, session.sessionId),
+        kind: server.kind,
       );
       await channel.ready;
 
@@ -1663,6 +1664,7 @@ class _TerminalTabState extends ConsumerState<TerminalTab>
       AdaptivePopupMenuItem<String>(
         value: 'delete',
         label: l10n.delete,
+        isDestructive: true,
         icon: conduitAdaptivePopupMenuIcon(
           iosSymbol: 'trash',
           materialIcon: Icons.delete_outline,

@@ -1,7 +1,9 @@
 import 'package:conduit/core/services/worker_manager.dart';
 import 'package:conduit/shared/widgets/markdown/compiled_markdown_document.dart';
 import 'package:conduit/shared/widgets/markdown/markdown_compile_service.dart';
+import 'package:conduit/shared/widgets/markdown/markdown_display_part.dart';
 import 'package:conduit/shared/widgets/markdown/markdown_document_controller.dart';
+import 'package:conduit/shared/widgets/markdown/streaming_markdown_preparation.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 class _RecordingIncrementalMarkdownCompileService
@@ -71,6 +73,20 @@ void main() {
   });
 
   test(
+    'raw HTML inside fenced code does not disable incremental splitting',
+    () {
+      const content = '```html\n<div>preview</div>\n```\n\nTail';
+
+      final split = debugSplitStreamingPreparedContentForTesting(content);
+
+      expect(split['frozenPrefix'], '```html\n<div>preview</div>\n```\n\n');
+      expect(split['mutableTail'], 'Tail');
+      expect(split['canIncrementallyCompile'], isTrue);
+      expect(split['fallbackReason'], isNull);
+    },
+  );
+
+  test(
     'splitter falls back to the full document when reference definitions are present',
     () {
       const content = 'See [docs][d].\n\n[d]: https://example.com';
@@ -83,6 +99,17 @@ void main() {
       expect(split['fallbackReason'], 'referenceDefinitions');
     },
   );
+
+  test('splitter keeps CommonMark raw HTML blocks fully mutable', () {
+    const content = '<pre>\nraw line\n\n**not markdown**\n</pre>\n\nTail';
+
+    final split = debugSplitStreamingPreparedContentForTesting(content);
+
+    expect(split['frozenPrefix'], isEmpty);
+    expect(split['mutableTail'], content);
+    expect(split['canIncrementallyCompile'], isFalse);
+    expect(split['fallbackReason'], 'rawHtmlBlock');
+  });
 
   test('splitter keeps loose list continuations in the mutable tail', () {
     const content = '- First paragraph.\n\n  Second paragraph.';
@@ -258,6 +285,85 @@ Body
   );
 
   test(
+    'compose realigns the mutable tail index when a tool_calls details merges across the boundary',
+    () {
+      final frozenToolCall = compilePreparedMarkdownSync(
+        [
+          '<details type="tool_calls" done="true" name="search">',
+          '<summary>search</summary>',
+          '</details>',
+        ].join('\n'),
+      );
+      final tail = compilePreparedMarkdownSync(
+        [
+          '<details type="tool_calls" done="true" name="browser">',
+          '<summary>browser</summary>',
+          '</details>',
+          '',
+          'Visible response',
+        ].join('\n'),
+      ).rebaseRootIds(rootNodeOffset: frozenToolCall.rootNodeCount);
+
+      final composed = CompiledMarkdownDocument.compose(
+        normalizedContent:
+            '${frozenToolCall.normalizedContent}\n${tail.normalizedContent}',
+        segments: <CompiledMarkdownDocument>[frozenToolCall, tail],
+        // Pre-merge index: the frozen prefix contributes one block. The boundary
+        // tool_calls blocks then merge into a single group, shifting the tail.
+        mutableBlockStartIndex: frozenToolCall.rootBlockCount,
+      );
+
+      // Composed list is [group(search, browser), paragraph]. The merged group
+      // still carries the streaming tail item, so it must be the mutable tail —
+      // not left below the (pre-merge) start index and treated as frozen.
+      expect(composed.blocks, hasLength(2));
+      expect(composed.blocks.first, isA<CompiledMarkdownDetailsGroup>());
+      expect(composed.mutableBlockStartIndex, 0);
+      expect(composed.isMutableRootBlock(0), isTrue);
+      expect(composed.isMutableRootBlock(1), isTrue);
+
+      final parts = buildMarkdownDisplayParts(composed, isStreaming: true);
+      expect(parts.first.isMutableTail, isTrue);
+    },
+  );
+
+  test('compose stamps the mutable index on a single tail-only segment', () {
+    final tail = compilePreparedMarkdownSync('### Partial heading');
+    expect(tail.mutableBlockStartIndex, -1); // freshly compiled, no metadata
+
+    final composed = CompiledMarkdownDocument.compose(
+      normalizedContent: tail.normalizedContent,
+      segments: <CompiledMarkdownDocument>[tail],
+      mutableBlockStartIndex: 0,
+    );
+
+    expect(composed.mutableBlockStartIndex, 0);
+    expect(composed.isMutableRootBlock(0), isTrue);
+    expect(
+      composed.blocks.map((block) => block.blockId).toList(),
+      tail.blocks.map((block) => block.blockId).toList(),
+    );
+
+    final parts = buildMarkdownDisplayParts(composed, isStreaming: true);
+    expect(parts.first.isMutableTail, isTrue);
+  });
+
+  test(
+    'compose preserves a requested mutable index when all segments are empty',
+    () {
+      final composed = CompiledMarkdownDocument.compose(
+        normalizedContent: 'some plain text',
+        segments: const <CompiledMarkdownDocument>[],
+        mutableBlockStartIndex: 0,
+      );
+
+      expect(composed.mutableBlockStartIndex, 0);
+      expect(composed.renderTier, MarkdownRenderTier.plainText);
+      expect(composed.blocks, isEmpty);
+    },
+  );
+
+  test(
     'controller recompiles only the mutable tail between streaming updates',
     () async {
       final compiler = _RecordingIncrementalMarkdownCompileService();
@@ -267,7 +373,7 @@ Body
       final controller = MarkdownDocumentController(
         readCompiler: () => compiler,
         isWidgetTest: () => false,
-        onStateChanged: (_, document) => latestDocument = document,
+        onStateChanged: (document) => latestDocument = document,
       );
       addTearDown(controller.dispose);
 
@@ -283,6 +389,9 @@ Body
         latestDocument!.blocks.map((block) => block.blockId).toList(),
         <String>['n0', 'n1'],
       );
+      expect(latestDocument!.mutableBlockStartIndex, 1);
+      expect(latestDocument!.isMutableRootBlock(0), isFalse);
+      expect(latestDocument!.isMutableRootBlock(1), isTrue);
 
       compiler.batchCalls.clear();
       compiler.singleCalls.clear();
@@ -296,6 +405,9 @@ Body
         latestDocument!.blocks.map((block) => block.blockId).toList(),
         <String>['n0', 'n1'],
       );
+      expect(latestDocument!.mutableBlockStartIndex, 1);
+      expect(latestDocument!.isMutableRootBlock(0), isFalse);
+      expect(latestDocument!.isMutableRootBlock(1), isTrue);
 
       compiler.batchCalls.clear();
       compiler.singleCalls.clear();
@@ -313,6 +425,161 @@ Body
         latestDocument!.blocks.map((block) => block.blockId).toList(),
         <String>['n0', 'n1', 'n2'],
       );
+      expect(latestDocument!.mutableBlockStartIndex, 2);
+      expect(latestDocument!.isMutableRootBlock(1), isFalse);
+      expect(latestDocument!.isMutableRootBlock(2), isTrue);
+    },
+  );
+
+  test(
+    'patch controller preserves frozen compilation and compiles only the new tail',
+    () async {
+      final compiler = _RecordingIncrementalMarkdownCompileService();
+      addTearDown(compiler.dispose);
+      final engine = StreamingMarkdownPreparationEngine();
+      var prepared = const PreparedMarkdownText.empty();
+      CompiledMarkdownDocument? latestDocument;
+      final controller = MarkdownDocumentController(
+        readCompiler: () => compiler,
+        isWidgetTest: () => false,
+        onStateChanged: (document) => latestDocument = document,
+      );
+      addTearDown(controller.dispose);
+
+      final firstPatch = engine.prepare(
+        const MarkdownPreparationRequest(
+          sessionId: 'message-1',
+          revision: 1,
+          expectedBaseRevision: 0,
+          content: 'First paragraph.\n\nSecond',
+          streaming: true,
+          collectMetrics: false,
+          verifyParity: true,
+        ),
+      );
+      prepared = prepared.applyPatch(firstPatch);
+      controller.resolveStreamingPreparedPatch(prepared, firstPatch);
+      await _flushAsyncWork();
+
+      expect(compiler.batchCalls, <List<String>>[
+        <String>['First paragraph.\n\n', 'Second'],
+      ]);
+      compiler.batchCalls.clear();
+      compiler.singleCalls.clear();
+
+      final secondPatch = engine.prepare(
+        const MarkdownPreparationRequest(
+          sessionId: 'message-1',
+          revision: 2,
+          expectedBaseRevision: 1,
+          content: 'First paragraph.\n\nSecond grows',
+          streaming: true,
+          collectMetrics: false,
+          verifyParity: true,
+        ),
+      );
+      prepared = prepared.applyPatch(secondPatch);
+      controller.resolveStreamingPreparedPatch(prepared, secondPatch);
+      await _flushAsyncWork();
+
+      expect(compiler.batchCalls, isEmpty);
+      expect(compiler.singleCalls, <String>['Second grows']);
+      expect(latestDocument, isNotNull);
+      expect(latestDocument!.preparedContent.segmentCount, greaterThan(1));
+      expect(
+        latestDocument!.normalizedContent,
+        'First paragraph.\n\nSecond grows',
+      );
+      expect(latestDocument!.mutableBlockStartIndex, 1);
+    },
+  );
+
+  test(
+    'patch controller reuses a verified frozen prefix across skipped revisions',
+    () async {
+      final compiler = _RecordingIncrementalMarkdownCompileService();
+      addTearDown(compiler.dispose);
+      final engine = StreamingMarkdownPreparationEngine();
+      var prepared = const PreparedMarkdownText.empty();
+      final controller = MarkdownDocumentController(
+        readCompiler: () => compiler,
+        isWidgetTest: () => false,
+        onStateChanged: (_) {},
+      );
+      addTearDown(controller.dispose);
+
+      final firstPatch = engine.prepare(
+        const MarkdownPreparationRequest(
+          sessionId: 'message-1',
+          revision: 1,
+          expectedBaseRevision: 0,
+          content: 'First paragraph.\n\nSecond',
+          streaming: true,
+          collectMetrics: false,
+          verifyParity: true,
+        ),
+      );
+      prepared = prepared.applyPatch(firstPatch);
+      controller.resolveStreamingPreparedPatch(prepared, firstPatch);
+      await _flushAsyncWork();
+      compiler.batchCalls.clear();
+      compiler.singleCalls.clear();
+
+      final skippedPatch = engine.prepare(
+        const MarkdownPreparationRequest(
+          sessionId: 'message-1',
+          revision: 2,
+          expectedBaseRevision: 1,
+          content: 'First paragraph.\n\nSecond grows',
+          streaming: true,
+          collectMetrics: false,
+          verifyParity: true,
+        ),
+      );
+      prepared = prepared.applyPatch(skippedPatch);
+
+      final publishedPatch = engine.prepare(
+        const MarkdownPreparationRequest(
+          sessionId: 'message-1',
+          revision: 3,
+          expectedBaseRevision: 2,
+          content: 'First paragraph.\n\nSecond grows more',
+          streaming: true,
+          collectMetrics: false,
+          verifyParity: true,
+        ),
+      );
+      prepared = prepared.applyPatch(publishedPatch);
+      controller.resolveStreamingPreparedPatch(prepared, publishedPatch);
+      await _flushAsyncWork();
+
+      expect(compiler.batchCalls, isEmpty);
+      expect(compiler.singleCalls, <String>['Second grows more']);
+    },
+  );
+
+  test(
+    'controller marks a fully-frozen document with no mutable tail',
+    () async {
+      final compiler = _RecordingIncrementalMarkdownCompileService();
+      addTearDown(compiler.dispose);
+
+      CompiledMarkdownDocument? latestDocument;
+      final controller = MarkdownDocumentController(
+        readCompiler: () => compiler,
+        isWidgetTest: () => false,
+        onStateChanged: (document) => latestDocument = document,
+      );
+      addTearDown(controller.dispose);
+
+      // A closed fenced block freezes entirely, leaving an empty mutable tail.
+      controller.resolveStreamingPrepared('```dart\nprint("done");\n```');
+      await _flushAsyncWork();
+
+      expect(latestDocument, isNotNull);
+      expect(latestDocument!.mutableBlockStartIndex, -1);
+      expect(latestDocument!.hasMutableBlockMetadata, isFalse);
+      expect(latestDocument!.isMutableRootBlock(0), isFalse);
     },
   );
 
@@ -325,7 +592,7 @@ Body
       final controller = MarkdownDocumentController(
         readCompiler: () => compiler,
         isWidgetTest: () => false,
-        onStateChanged: (previousDocument, nextDocument) {},
+        onStateChanged: (_) {},
       );
       addTearDown(controller.dispose);
 
@@ -360,7 +627,7 @@ Body
       final controller = MarkdownDocumentController(
         readCompiler: () => compiler,
         isWidgetTest: () => false,
-        onStateChanged: (previousDocument, nextDocument) {},
+        onStateChanged: (_) {},
       );
       addTearDown(controller.dispose);
 
@@ -397,7 +664,7 @@ Body
       final controller = MarkdownDocumentController(
         readCompiler: () => compiler,
         isWidgetTest: () => false,
-        onStateChanged: (_, document) => latestDocument = document,
+        onStateChanged: (document) => latestDocument = document,
       );
       addTearDown(controller.dispose);
 
@@ -445,7 +712,7 @@ Body
       final controller = MarkdownDocumentController(
         readCompiler: () => compiler,
         isWidgetTest: () => false,
-        onStateChanged: (_, document) => latestDocument = document,
+        onStateChanged: (document) => latestDocument = document,
       );
       addTearDown(controller.dispose);
 
@@ -477,7 +744,7 @@ Body
       final controller = MarkdownDocumentController(
         readCompiler: () => compiler,
         isWidgetTest: () => false,
-        onStateChanged: (_, document) => latestDocument = document,
+        onStateChanged: (document) => latestDocument = document,
       );
       addTearDown(controller.dispose);
 
@@ -555,7 +822,7 @@ Body
       final controller = MarkdownDocumentController(
         readCompiler: () => compiler,
         isWidgetTest: () => false,
-        onStateChanged: (_, document) => latestDocument = document,
+        onStateChanged: (document) => latestDocument = document,
       );
       addTearDown(controller.dispose);
 
@@ -587,7 +854,7 @@ Body
       final controller = MarkdownDocumentController(
         readCompiler: () => compiler,
         isWidgetTest: () => false,
-        onStateChanged: (_, document) => latestDocument = document,
+        onStateChanged: (document) => latestDocument = document,
       );
       addTearDown(controller.dispose);
 
@@ -619,7 +886,7 @@ Body
       final controller = MarkdownDocumentController(
         readCompiler: () => compiler,
         isWidgetTest: () => false,
-        onStateChanged: (_, document) => latestDocument = document,
+        onStateChanged: (document) => latestDocument = document,
       );
       addTearDown(controller.dispose);
 
@@ -651,7 +918,7 @@ Body
       final controller = MarkdownDocumentController(
         readCompiler: () => compiler,
         isWidgetTest: () => false,
-        onStateChanged: (_, document) => latestDocument = document,
+        onStateChanged: (document) => latestDocument = document,
       );
       addTearDown(controller.dispose);
 
@@ -692,7 +959,7 @@ Body
       final controller = MarkdownDocumentController(
         readCompiler: () => compiler,
         isWidgetTest: () => false,
-        onStateChanged: (_, document) => latestDocument = document,
+        onStateChanged: (document) => latestDocument = document,
       );
       addTearDown(controller.dispose);
 

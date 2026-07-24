@@ -25,6 +25,52 @@ const int kPullFetchConcurrency = kAdapterPullFetchConcurrency;
 /// `get_archived_session_user_chat_list`, `limit = 60` — NOT 50).
 const int kOpenWebUiChatListPageSize = 60;
 
+/// Worker-isolate seam for decomposing a full Open WebUI chat blob into
+/// normalized rows before the database transaction begins.
+typedef ChatRowsParseOffload =
+    Future<ChatRows> Function(Map<String, dynamic> response);
+
+/// Top-level callback used by [WorkerManager] through the injected
+/// [ChatRowsParseOffload]. Keeping this pure also makes it directly testable.
+ChatRows parseChatRowsWorker(Map<String, dynamic> response) =>
+    _chatRowsFromResponse(response);
+
+ChatRows _chatRowsFromResponse(Map<String, dynamic> response) {
+  final id = response['id'] as String;
+  final createdAt = _parseServerEpochSeconds(response['created_at']) ?? 0;
+  final updatedAt = _parseServerEpochSeconds(response['updated_at']) ?? 0;
+  final blob = response['chat'];
+  return ChatBlobMapper.blobToRows(
+    chatId: id,
+    blob: blob is Map<String, dynamic>
+        ? blob
+        : (blob is Map ? Map<String, dynamic>.from(blob) : <String, dynamic>{}),
+    title: response['title'] is String ? response['title'] as String : '',
+    folderId: response['folder_id'] is String
+        ? response['folder_id'] as String
+        : null,
+    pinned: response['pinned'] == true,
+    archived: response['archived'] == true,
+    createdAt: createdAt,
+    updatedAt: updatedAt,
+  );
+}
+
+int _chatMessageCount(Map<String, dynamic> response) {
+  final chat = response['chat'];
+  if (chat is! Map) return 0;
+  final history = chat['history'];
+  if (history is! Map) return 0;
+  final messages = history['messages'];
+  return messages is Map ? messages.length : 0;
+}
+
+int? _parseServerEpochSeconds(Object? value) {
+  if (value is int) return value;
+  if (value is num) return value.toInt();
+  return null;
+}
+
 /// Outcome of one pull cycle.
 class PullResult {
   const PullResult({
@@ -75,20 +121,34 @@ class PullSync {
   /// pull completes the remap (folding the `local:` row into the server row)
   /// instead of inserting a duplicate. When null (read-path-only tests) the
   /// heal is skipped and merges proceed verbatim.
+  ///
+  /// [parseOffload] enables worker-isolate offloading for large conversations
+  /// (see [assembleConversationGuarded]). When null, assembly runs synchronously
+  /// on the calling isolate — safe for tests, jank-risk for production pulls
+  /// with large message counts.
   PullSync({
     required SyncApiClient client,
     required AppDatabase db,
     required ConversationLocks locks,
     IdRemapper? remapper,
+    ConversationParseOffload? parseOffload,
+    ChatRowsParseOffload? rowsParseOffload,
+    SyncItemProgressCallback? onProgress,
   }) : _client = client,
        _db = db,
        _locks = locks,
-       _remapper = remapper;
+       _remapper = remapper,
+       _parseOffload = parseOffload,
+       _rowsParseOffload = rowsParseOffload,
+       _onProgress = onProgress;
 
   final SyncApiClient _client;
   final AppDatabase _db;
   final ConversationLocks _locks;
   final IdRemapper? _remapper;
+  final ConversationParseOffload? _parseOffload;
+  final ChatRowsParseOffload? _rowsParseOffload;
+  final SyncItemProgressCallback? _onProgress;
 
   /// Runs one pull cycle. The watermark advances only when every list page
   /// and every chat fetch succeeded (REQ 5); on any failure it stays frozen
@@ -235,10 +295,12 @@ class PullSync {
     // 5. Chat fetches: newest-first (list order already is), worker pool of
     // exactly kPullFetchConcurrency sharing one queue index.
     final toFetch = changed.values.toList(growable: false);
+    _onProgress?.call(0, toFetch.length);
     final hasPendingCreateHashes = _remapper == null
         ? false
         : await _db.outboxDao.hasPendingCreateContentHashes();
     var nextIndex = 0;
+    var completedFetches = 0;
     Future<void> worker() async {
       while (true) {
         if (nextIndex >= toFetch.length) return;
@@ -264,6 +326,9 @@ class PullSync {
             stackTrace: stackTrace,
             data: {'chatId': item.id},
           );
+        } finally {
+          completedFetches++;
+          _onProgress?.call(completedFetches, toFetch.length);
         }
       }
     }
@@ -348,7 +413,11 @@ class PullSync {
       final chat = await _db.chatsDao.getChat(id);
       if (chat == null) return null;
       final messages = await _db.messagesDao.getForChat(id);
-      return assembleConversation(chat, messages);
+      return assembleConversationGuarded(
+        chat,
+        messages,
+        offload: _parseOffload,
+      );
     });
   }
 
@@ -384,24 +453,13 @@ class PullSync {
     final id = resp['id'] as String;
     final createdAt = _asEpochSeconds(resp['created_at']) ?? 0;
     final updatedAt = _asEpochSeconds(resp['updated_at']) ?? 0;
-    final blob = resp['chat'];
     final meta = resp['meta'];
-    final rows = ChatBlobMapper.blobToRows(
-      chatId: id,
-      blob: blob is Map<String, dynamic>
-          ? blob
-          : (blob is Map
-                ? Map<String, dynamic>.from(blob)
-                : <String, dynamic>{}),
-      title: resp['title'] is String ? resp['title'] as String : '',
-      folderId: resp['folder_id'] is String
-          ? resp['folder_id'] as String
-          : null,
-      pinned: resp['pinned'] == true,
-      archived: resp['archived'] == true,
-      createdAt: createdAt,
-      updatedAt: updatedAt,
-    );
+    final rowsParser = _rowsParseOffload;
+    final rows =
+        rowsParser != null &&
+            _chatMessageCount(resp) > kLocalConversationWorkerThreshold
+        ? await rowsParser(resp)
+        : _chatRowsFromResponse(resp);
 
     // §7.3 createChat crash-heal: if this server chat is the materialization of
     // a local createChat that crashed between server-create and remap-commit,
@@ -486,18 +544,27 @@ class PullSync {
       scope: 'sync/pull',
       data: {'from': localId, 'to': serverId, 'seq': op.seq},
     );
+    var healed = false;
     try {
       // We already hold the SERVER id lock (this merge runs under it). The
       // create op was claimed before this LOCAL lock, so a drain worker cannot
       // concurrently claim it and enter pushCreateChat with the opposite lock
       // order.
       await _locks.runExclusive(localId, () async {
-        await remapper.remapChat(
+        final result = await remapper.remapChat(
           localId: localId,
           serverId: serverId,
           serverCreatedAt: serverCreatedAt,
           serverUpdatedAt: serverUpdatedAt,
         );
+        if (result == ChatRemapResult.sourceMissing) {
+          // The fingerprint matched an orphaned create op, but absence of the
+          // local row is not proof that it became this server chat. Drop the
+          // stale create and let the caller normally upsert the fetched B row.
+          await _db.outboxDao.markDone(op.seq);
+          return;
+        }
+        healed = true;
         // The remap repointed the claimed createChat op's chat_id to the server
         // id (§7.3). The chat now exists server-side, so the create is
         // satisfied: drop the op so the drainer never re-POSTs it.
@@ -518,7 +585,7 @@ class PullSync {
       );
       Error.throwWithStackTrace(error, stackTrace);
     }
-    return true;
+    return healed;
   }
 
   _ChangedItem? _parseListItem(Map<String, dynamic> item) {
@@ -543,8 +610,6 @@ class PullSync {
 
   /// Server epoch seconds; never derived from the device clock (REQ 5).
   static int? _asEpochSeconds(Object? value) {
-    if (value is int) return value;
-    if (value is num) return value.toInt();
-    return null;
+    return _parseServerEpochSeconds(value);
   }
 }

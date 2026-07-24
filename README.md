@@ -100,6 +100,7 @@ enough for daily use.
 | Area | Included |
 | --- | --- |
 | Chat | Real-time streaming, model selection, temporary chats, conversation search, and folder management |
+| Direct connections | Multiple OpenAI-compatible or Ollama profiles, Chat Completions or Responses, LM Studio and Azure-compatible settings, custom headers, model prefixes and tags, manual model IDs, image prompts, reasoning, usage, stop, and regenerate without requiring an Open WebUI backend |
 | AI workflows | File and image uploads, re-attaching previously uploaded server files, multimodal prompts, server-side tools, saved prompts with variables, model-specific toggle filters, and optional web search or image generation when supported by your server |
 | Authentication | Username and password, LDAP, JWT, custom headers, SSO/OAuth, and reverse proxy login flows |
 | Productivity | Notes with autosave, pinning, AI-generated titles, AI enhancement, audio attachments, channels with threads and reactions when enabled by the server, and sharing from other apps |
@@ -107,6 +108,7 @@ enough for daily use.
 | Mobile UX | Voice input, full voice-call mode, home screen widgets, app quick actions, clipboard image paste, haptics, and adaptive Material/Cupertino UI |
 | Personalization | Light, dark, and system themes plus a localized interface across 13 supported locales |
 | Privacy | Native secure storage, no third-party analytics or ads, and no developer-operated backend relaying your data |
+| Terminal | Interactive terminal sessions over WebSocket with a file browser, shown only when your server exposes the terminal integration |
 
 ## Built for Self-Hosted Reality
 
@@ -123,6 +125,11 @@ enough for daily use.
   long-running chat reliability.
 - Surfaces optional server capabilities such as notes, channels, web search,
   and image generation only when your Open WebUI deployment exposes them.
+- Can connect directly to OpenAI-compatible APIs—including LM Studio—and
+  native Ollama endpoints. OpenAI-family profiles can use Chat Completions or
+  Responses, Bearer or API-key headers, and an optional Azure API version.
+  Completion traffic travels from your device to that provider. New chat
+  history can use Open WebUI when one is signed in, or remain on this device.
 
 ## Assistant Output That Holds Up on Mobile
 
@@ -154,14 +161,26 @@ surfaces for:
 ## Quickstart
 
 If you just want to use Conduit, install it from the App Store or Google Play,
-connect it to your Open WebUI server, and sign in with the auth flow your
-deployment already exposes.
+then choose either an Open WebUI server or a direct model connection.
 
-1. Launch Conduit.
+For Open WebUI:
+
+1. Launch Conduit and choose Open WebUI.
 2. Enter the base URL for your Open WebUI instance.
 3. Add any required custom headers.
 4. Sign in with username and password, LDAP, JWT, SSO, or proxy auth.
 5. Pick a model and start chatting.
+
+For a direct connection:
+
+1. Launch Conduit and choose Direct connection.
+2. Add an OpenAI-compatible or Ollama profile, including its base URL and any
+   required API key or custom headers.
+3. Test the connection, enable it, and select one of its discovered or manual
+   models.
+4. Choose whether new direct chats should use Open WebUI history when available
+   or remain only on this device. Existing chats keep their current location.
+5. Start chatting. An Open WebUI account is not required.
 
 Features such as channels, notes, web search, image generation, and toggle
 filters appear when they are available on the connected server.
@@ -170,16 +189,16 @@ filters appear when they are available on the connected server.
 
 ### Requirements
 
-- A recent Flutter SDK with Dart `3.8` or newer
+- A recent Flutter SDK with Dart `3.9` or newer
 - Java 17 for Android builds
 - Android 7.0+ (API 24) or iOS 16.0+
-- An Open WebUI instance for normal usage
+- An Open WebUI instance, an OpenAI-compatible API, or an Ollama endpoint
 - Xcode for iOS builds or Android Studio / Android SDK for Android builds
 
 ### Run locally
 
 ```bash
-git clone https://github.com/cogwheel0/conduit.git
+git clone --recursive https://github.com/cogwheel0/conduit.git
 cd conduit
 flutter pub get
 dart run build_runner build
@@ -187,6 +206,11 @@ flutter run -d ios
 # or
 flutter run -d android
 ```
+
+The `--recursive` flag pulls the Mermaid and KaTeX renderer submodules required
+to build the app, plus `openwebui-src`, a vendored Open WebUI checkout used only
+as an API reference. For an existing clone, run
+`git submodule update --init --recursive` before `flutter pub get`.
 
 ### Developer checks
 
@@ -226,7 +250,7 @@ credential handling built into the core layer.
 - Riverpod 3 and `riverpod_generator` for state and dependency wiring
 - GoRouter for navigation
 - Dio plus socket transport for API and streaming
-- Hive and shared preferences for local persistence
+- Drift (SQLite) for structured local data, with shared preferences for settings
 - Flutter Secure Storage for credentials
 
 ### Project layout
@@ -249,10 +273,12 @@ lib/
 <details>
 <summary>Platform permissions</summary>
 
-- Android asks for internet, microphone, camera, and file access for chat,
-  voice input, attachments, and image capture.
-- iOS requests microphone, speech recognition, camera, and photo library access
-  for voice and attachment workflows.
+- Android requests microphone, camera, and optional location permissions for
+  voice input, image capture, and location sharing; attachments use the system
+  photo picker, so no broad storage permission is needed.
+- iOS requests microphone, speech recognition, camera, photo library, and
+  optional location-when-in-use access for voice, attachment, and location
+  sharing workflows.
 
 </details>
 
@@ -277,6 +303,24 @@ lib/
 - Diagnostic logging is local and transient, and Conduit does not relay your
   data through developer-operated backend infrastructure.
 - Additional details are documented in [PRIVACY_POLICY.md](PRIVACY_POLICY.md).
+
+## Acknowledgements
+
+- This project is tested with BrowserStack.
+- Code review for Conduit is provided by <a href="http://macroscope.com/?utm_source=open_source&utm_term=conduit">
+    <picture>
+      <source
+        media="(prefers-color-scheme: dark)"
+        srcset="https://macroscope.com/assets/Brand%20Kit/Macroscope%20Logos/svg/Macroscope%20Logotype%20-%20white.svg"
+      />
+      <img
+        src="https://macroscope.com/assets/Brand%20Kit/Macroscope%20Logos/svg/Macroscope%20Logotype%20-%20black.svg"
+        alt="Macroscope"
+        height="16"
+        align="middle"
+      />
+    </picture>
+  </a>.
 
 ## Contributing
 

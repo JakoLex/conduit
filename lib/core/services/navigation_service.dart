@@ -3,6 +3,23 @@ import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import '../../shared/widgets/themed_dialogs.dart';
 
+/// Marks routes opened after a native sheet dismisses so Flutter does not
+/// layer a second platform transition over the outgoing app surface.
+final class NativeSheetNavigationOrigin {
+  const NativeSheetNavigationOrigin();
+}
+
+typedef NativeSheetNavigationRequest = ({String routeName, Object extra});
+
+/// Direct Connections is launched after the native profile sheet dismisses.
+/// Keep its route and transition marker coupled so this entry point cannot
+/// accidentally restore a second Cupertino transition over the native sheet.
+const NativeSheetNavigationRequest
+directConnectionsNativeSheetNavigationRequest = (
+  routeName: RouteNames.directConnections,
+  extra: NativeSheetNavigationOrigin(),
+);
+
 /// Service for handling navigation throughout the app.
 ///
 /// With GoRouter in place, this class mostly provides convenient wrappers
@@ -13,6 +30,8 @@ class NavigationService {
       GlobalKey<NavigatorState>(debugLabel: 'rootNavigator');
 
   static GoRouter? _router;
+  static int _routeRevision = 0;
+  static String? _lastRoute;
 
   static GoRouter get router {
     final router = _router;
@@ -23,11 +42,25 @@ class NavigationService {
   }
 
   static void attachRouter(GoRouter router) {
+    _router?.routeInformationProvider.removeListener(_handleRouteChanged);
     _router = router;
+    _lastRoute = router.routeInformationProvider.value.uri.toString();
+    _routeRevision += 1;
+    router.routeInformationProvider.addListener(_handleRouteChanged);
+  }
+
+  static void _handleRouteChanged() {
+    final route = _router?.routeInformationProvider.value.uri.toString();
+    if (route == _lastRoute) return;
+    _lastRoute = route;
+    _routeRevision += 1;
   }
 
   static NavigatorState? get navigator => navigatorKey.currentState;
   static BuildContext? get context => navigatorKey.currentContext;
+
+  /// Changes whenever the attached router or its location changes.
+  static int get currentRouteRevision => _routeRevision;
 
   /// The current location reported by GoRouter.
   static String? get currentRoute {
@@ -57,6 +90,13 @@ class NavigationService {
     final router = _router;
     if (router == null) return;
     router.go(routeName);
+  }
+
+  /// Push a route while preserving the current page as the back destination.
+  static Future<T?> pushTo<T extends Object?>(String routeName) async {
+    final router = _router;
+    if (router == null) return null;
+    return router.push<T>(routeName);
   }
 
   /// Navigate back with an optional result payload.
@@ -121,9 +161,9 @@ class Routes {
   static const String chat = '/chat';
   static const String folder = '/folder/:id';
   static const String login = '/login';
+  static const String backendChooser = '/backend-chooser';
   static const String serverConnection = '/server-connection';
   static const String connectionIssue = '/connection-issue';
-  static const String serverIncompatible = '/server-incompatible';
   static const String authentication = '/authentication';
   static const String ssoAuth = '/sso-auth';
   static const String proxyAuth = '/proxy-auth';
@@ -132,13 +172,23 @@ class Routes {
   static const String audioSettings = '/profile/audio';
   static const String accountSettings = '/profile/account';
   static const String notificationSettings = '/profile/notifications';
-  static const String appCustomization = '/profile/customization';
+  static const String appearanceSettings = '/profile/appearance';
+  static const String chatSettings = '/profile/chat';
+  static const String dataConnectionSettings = '/profile/data-connection';
+  static const String directConnections = '/profile/direct-connections';
+  static const String directConnectionEditor =
+      '/profile/direct-connections/:id';
+  static const String hermesSettings = '/profile/hermes';
+  static const String hermesJobs = '/profile/hermes/jobs';
   static const String about = '/profile/about';
   static const String notes = '/notes';
   static const String noteEditor = '/notes/:id';
   static const String channel = '/channel/:id';
+  static const String workspace = '/workspace';
 
   static String folderPath(String id) => '/folder/$id';
+  static String directConnectionEditorPath(String id) =>
+      '/profile/direct-connections/${Uri.encodeComponent(id)}';
 }
 
 /// Friendly names for GoRouter routes to support context.pushNamed.
@@ -147,9 +197,9 @@ class RouteNames {
   static const String chat = 'chat';
   static const String folder = 'folder';
   static const String login = 'login';
+  static const String backendChooser = 'backend-chooser';
   static const String serverConnection = 'server-connection';
   static const String connectionIssue = 'connection-issue';
-  static const String serverIncompatible = 'server-incompatible';
   static const String authentication = 'authentication';
   static const String ssoAuth = 'sso-auth';
   static const String proxyAuth = 'proxy-auth';
@@ -158,9 +208,16 @@ class RouteNames {
   static const String audioSettings = 'audio-settings';
   static const String accountSettings = 'account-settings';
   static const String notificationSettings = 'notification-settings';
-  static const String appCustomization = 'app-customization';
+  static const String appearanceSettings = 'appearance-settings';
+  static const String chatSettings = 'chat-settings';
+  static const String dataConnectionSettings = 'data-connection-settings';
+  static const String directConnections = 'direct-connections';
+  static const String directConnectionEditor = 'direct-connection-editor';
+  static const String hermesSettings = 'hermes-settings';
+  static const String hermesJobs = 'hermes-jobs';
   static const String about = 'about';
   static const String notes = 'notes';
   static const String noteEditor = 'note-editor';
   static const String channel = 'channel';
+  static const String workspace = 'workspace';
 }

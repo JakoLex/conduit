@@ -23,6 +23,13 @@ final class PreferenceKeys {
       'chat_code_interpreter_enabled';
   static const String sendOnEnterKey = 'send_on_enter';
   static const String activeServerId = 'active_server_id';
+
+  /// Fail-closed marker set before logout touches any remote or local state.
+  /// It prevents bearer/credential restoration and proxy-cookie attachment
+  /// after a process death or incomplete secure-storage cleanup.
+  static const String incompleteLogoutFence = 'incomplete_logout_fence_v1';
+  static const String appIntentInvocationLedger =
+      'app_intent_invocation_ledger_v1';
   static const String themeMode = 'theme_mode';
   static const String themePalette = 'theme_palette_v1';
   static const String localeCode = 'locale_code_v1';
@@ -50,6 +57,34 @@ final class PreferenceKeys {
   static const String notificationChatEnabled = 'notification_chat_enabled';
   static const String notificationChannelEnabled =
       'notification_channel_enabled';
+
+  // Hermes Agent (direct second backend) — non-secret config. The API key and
+  // long-term memory session key are secrets and live in SecureCredentialStorage.
+  static const String hermesEnabled = 'hermes_enabled_v1';
+  static const String hermesBaseUrl = 'hermes_base_url_v1';
+  static const String hermesLocalDocumentTrust =
+      'hermes_local_document_trust_v1';
+  static const String hermesLocalDocumentTrustPrincipal =
+      'hermes_local_document_trust_principal_v1';
+  static const String hermesMixedSessionBindingTrust =
+      'hermes_mixed_session_binding_trust_v1';
+
+  /// Which backend onboarding completed against
+  /// ('owui' | 'direct' | 'hermes' | unset).
+  /// Read synchronously by the router for boot-deterministic routing.
+  static const String preferredBackend = 'preferred_backend_v1';
+
+  /// Non-secret boot hint only. Direct profile contents and credentials live
+  /// exclusively in SecureCredentialStorage.
+  static const String directConnectionsConfigured =
+      'direct_connections_configured_v1';
+  static const String directHistoryPolicy = 'direct_history_policy_v1';
+  static const String reasoningEffortByModel = 'reasoning_effort_by_model_v1';
+
+  /// Prefix for the per-server account owner marker that guards reopening an
+  /// OpenWebUI database after process restart.
+  static const String openWebUiAccountOwnerPrefix =
+      'openwebui_account_owner_v1';
 
   // Drawer section collapsed states
   static const String drawerShowPinned = 'drawer_show_pinned';
