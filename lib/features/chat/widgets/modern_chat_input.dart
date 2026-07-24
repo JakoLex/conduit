@@ -145,6 +145,8 @@ List<IosKeyboardAttachmentActionConfig> buildIosKeyboardAttachmentActions({
   required bool webSearchEnabled,
   required bool imageGenerationAvailable,
   required bool imageGenerationEnabled,
+  required bool codeInterpreterAvailable,
+  required bool codeInterpreterEnabled,
   required List<Tool> availableTools,
   required List<String> selectedToolIds,
   required List<ToggleFilter> availableFilters,
@@ -160,6 +162,8 @@ List<IosKeyboardAttachmentActionConfig> buildIosKeyboardAttachmentActions({
     webSearchEnabled: webSearchEnabled,
     imageGenerationAvailable: !restrictedMode && imageGenerationAvailable,
     imageGenerationEnabled: imageGenerationEnabled,
+    codeInterpreterAvailable: !restrictedMode && codeInterpreterAvailable,
+    codeInterpreterEnabled: codeInterpreterEnabled,
     availableTools: restrictedMode ? const <Tool>[] : availableTools,
     selectedToolIds: selectedToolIds,
     availableFilters: restrictedMode
