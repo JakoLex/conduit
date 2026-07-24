@@ -225,16 +225,6 @@ class _ComposerAttachmentKeyboardState
         )
         .toList();
 
-<<<<<<< HEAD
-    final webSearchAvailable = ref.watch(webSearchAvailableProvider);
-    final webSearchEnabled = ref.watch(webSearchEnabledProvider);
-    final imageGenAvailable = ref.watch(imageGenerationAvailableProvider);
-    final imageGenEnabled = ref.watch(imageGenerationEnabledProvider);
-    final codeInterpreterAvailable = ref.watch(
-      codeInterpreterAvailableProvider,
-    );
-    final codeInterpreterEnabled = ref.watch(codeInterpreterEnabledProvider);
-=======
     // Ollama Cloud exposes a permission-aware native web-search tool even
     // though direct connections cannot use OpenWebUI-managed tools.
     final webSearchAvailable =
@@ -245,7 +235,10 @@ class _ComposerAttachmentKeyboardState
         !restrictedMode && ref.watch(imageGenerationAvailableProvider);
     final imageGenEnabled =
         !restrictedMode && ref.watch(imageGenerationEnabledProvider);
->>>>>>> origin/pr-13-head
+    final codeInterpreterAvailable =
+        !restrictedMode && ref.watch(codeInterpreterAvailableProvider);
+    final codeInterpreterEnabled =
+        !restrictedMode && ref.watch(codeInterpreterEnabledProvider);
     final featureTiles =
         buildComposerOverflowFeatureItems(
           l10n: l10n,

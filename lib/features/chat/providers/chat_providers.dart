@@ -43,11 +43,9 @@ import '../../../core/services/settings_service.dart';
 import '../../../core/services/socket_service.dart';
 import '../../../core/services/streaming_response_controller.dart';
 import '../../../core/services/performance_profiler.dart';
-<<<<<<< HEAD
 import '../../../core/services/pyodide_code_runner.dart';
-=======
 import '../../../core/services/conversation_parsing.dart';
->>>>>>> origin/pr-13-head
+import '../../../core/services/pyodide_code_runner.dart';
 import '../../../core/services/worker_manager.dart';
 import '../../../core/utils/debug_logger.dart';
 import '../../../core/utils/json_normalization.dart';
@@ -9604,42 +9602,6 @@ Future<void> durableSend(
     database: db,
     api: sendMutationOwner.openWebUiApi,
   );
-<<<<<<< HEAD
-  final durableFiles = <Map<String, dynamic>>[
-    ...durableAttachmentFiles,
-    ...contextFiles,
-  ];
-
-  final completion = RequestCompletionPayload(
-    assistantMessageId: assistantMessageId,
-    model: selectedModel.id,
-    toolIds: toolIdList,
-    filterIds: filterIds,
-    terminalId: terminalIdForCompletion,
-    enableWebSearch: webSearchEnabled,
-    enableImageGeneration: imageGenerationEnabled,
-    enableCodeInterpreter: codeInterpreterEnabled,
-  );
-
-  var activeConversation = activeAtSendStart;
-
-  if (activeConversation == null) {
-    // ---- NEW local chat ----
-    final pendingFolderId =
-        pendingFolderIdOverride ?? ref.read(pendingFolderIdProvider);
-    final localId = 'local:${const Uuid().v4()}';
-    final title = _titleFromText(message);
-
-    final blob = _buildDurableNewChatBlob(
-      userMsgId: userMessageId,
-      asstId: assistantMessageId,
-      parentId: parentId,
-      text: message,
-      files: durableFiles,
-      modelId: selectedModel.id,
-      modelName: selectedModel.name,
-      now: now,
-=======
   try {
     final durableAttachmentFiles = await _resolveDurableFilesFor(
       ref,
@@ -9648,7 +9610,6 @@ Future<void> durableSend(
       sourceAuthSnapshot: sendMutationOwner.openWebUiAuthSnapshot,
       requireSourceContext: () =>
           _requireChatMutationOpenWebUiAuthSession(ref, sendMutationOwner),
->>>>>>> origin/pr-13-head
     );
     final durableFiles = <Map<String, dynamic>>[
       ...durableAttachmentFiles,
@@ -9663,6 +9624,7 @@ Future<void> durableSend(
       terminalId: terminalIdForCompletion,
       enableWebSearch: webSearchEnabled,
       enableImageGeneration: imageGenerationEnabled,
+      enableCodeInterpreter: codeInterpreterEnabled,
     );
 
     var activeConversation = activeAtSendStart;

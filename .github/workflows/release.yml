@@ -28,12 +28,9 @@ jobs:
         with:
           tag: ${{ github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          allowUpdates: true
           generateReleaseNotes: true
           makeLatest: true
 
-<<<<<<< HEAD
-=======
   build-android:
     name: Build Android
     runs-on: ubuntu-latest
@@ -116,7 +113,6 @@ jobs:
           omitNameDuringUpdate: true
 
 
->>>>>>> origin/pr-13-head
   build-ios:
     name: Build iOS
     runs-on: macos-26

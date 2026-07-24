@@ -15,13 +15,8 @@ class ServerVersionCompat {
   /// The newest Open WebUI server version this app build is known to support.
   ///
   /// Servers reporting a `/api/config` `version` strictly greater than this are
-<<<<<<< HEAD
-  /// gated off. Bump this (and re-verify against `openwebui-src/`) whenever a
-  /// newer server release is validated.
-=======
   /// shown a compatibility warning. Bump this (and re-verify against
   /// `openwebui-src/`) whenever a newer server release is validated.
->>>>>>> origin/pr-13-head
   static const String maxSupportedVersion = '0.10.2';
 
   /// Parsed [maxSupportedVersion] components: `[major, minor, patch]`.

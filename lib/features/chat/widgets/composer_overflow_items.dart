@@ -18,11 +18,8 @@ class ComposerOverflowActionIds {
   static const web = 'web';
   static const webSearch = 'webSearch';
   static const imageGeneration = 'imageGeneration';
-<<<<<<< HEAD
   static const codeInterpreter = 'codeInterpreter';
-=======
   static const _filterPrefix = 'filter:';
->>>>>>> origin/pr-13-head
   static const _toolPrefix = 'tool:';
 
   static String filter(String filterId) => '$_filterPrefix$filterId';

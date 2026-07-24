@@ -911,12 +911,8 @@ class _EnhancedImageAttachmentState
     final imageWidget = CachedNetworkImage(
       key: ValueKey('image_${widget.attachmentId}'),
       imageUrl: _cachedImageData!,
-<<<<<<< HEAD
-      fit: widget.fit,
-=======
       cacheKey: networkCacheKey,
-      fit: BoxFit.cover,
->>>>>>> origin/pr-13-head
+      fit: widget.fit,
       cacheManager: cacheManager,
       httpHeaders: headers,
       memCacheWidth: dimensions.width,

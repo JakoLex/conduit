@@ -1827,31 +1827,6 @@
   "terminalCopied": "Copié dans le presse-papiers",
   "terminalPasteWhileDisconnected": "Connectez-vous pour coller",
   "terminalPortsToggle": "Ports à l’écoute",
-<<<<<<< HEAD
-  "noteConflictCopySuffix": " (conflict copy)",
-  "noteConflictCopyBadge": "Conflict copy",
-  "notificationsTitle": "Notifications",
-  "notificationsSubtitle": "Alerts for replies, messages, and finished responses",
-  "notificationsEnabledTitle": "Enable notifications",
-  "notificationsEnabledDescription": "Receive alerts when the app is in the background and inside the app.",
-  "notificationSystemTitle": "System notifications",
-  "notificationSystemDescription": "Show notifications outside the app when it is in the background.",
-  "notificationInAppBannerTitle": "In-app banners",
-  "notificationInAppBannerDescription": "Show a banner inside the app while it is open.",
-  "notificationSoundTitle": "Sound",
-  "notificationSoundDescription": "Play a cue when a notification arrives.",
-  "notificationSoundAlwaysTitle": "Always play sound",
-  "notificationSoundAlwaysDescription": "Play the cue even when the app is open and focused.",
-  "notificationChannelTitle": "Channel messages",
-  "notificationChannelDescription": "Notify when someone sends a message in a channel or DM.",
-  "notificationChannelMessagesName": "Messages",
-  "notificationChannelMessagesDescription": "Replies, channel messages, and finished responses",
-  "notificationDefaultTitle": "New message",
-  "notificationChatTitle": "Chat responses",
-  "notificationChatDescription": "Notify when a response finishes in a chat you are not viewing.",
-  "notificationViewAction": "View",
-  "notificationsPermissionDenied": "Notifications are turned off in system settings."
-=======
   "workspaceTitle": "Workspace",
   "workspaceSubtitle": "Manage server resources and access.",
   "workspaceModels": "Models",
@@ -2555,5 +2530,4 @@
   "directAttachmentUnsupported": "Ce modèle direct ne prend pas en charge cette pièce jointe.",
   "backendChooserOpenWebUITitle": "Open WebUI",
   "hermesMemoryKeyDescription": "La clé de mémoire associe la mémoire à long terme de l’agent à votre profil (X-Hermes-Session-Key). Si vous laissez ce champ vide, une clé stable est générée automatiquement lors de votre premier chat."
->>>>>>> origin/pr-13-head
 }

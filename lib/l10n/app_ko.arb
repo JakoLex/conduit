@@ -1605,31 +1605,6 @@
   "terminalCopied": "클립보드에 복사됨",
   "terminalPasteWhileDisconnected": "붙여넣으려면 연결하세요",
   "terminalPortsToggle": "수신 대기 포트",
-<<<<<<< HEAD
-  "noteConflictCopySuffix": " (conflict copy)",
-  "noteConflictCopyBadge": "Conflict copy",
-  "notificationsTitle": "Notifications",
-  "notificationsSubtitle": "Alerts for replies, messages, and finished responses",
-  "notificationsEnabledTitle": "Enable notifications",
-  "notificationsEnabledDescription": "Receive alerts when the app is in the background and inside the app.",
-  "notificationSystemTitle": "System notifications",
-  "notificationSystemDescription": "Show notifications outside the app when it is in the background.",
-  "notificationInAppBannerTitle": "In-app banners",
-  "notificationInAppBannerDescription": "Show a banner inside the app while it is open.",
-  "notificationSoundTitle": "Sound",
-  "notificationSoundDescription": "Play a cue when a notification arrives.",
-  "notificationSoundAlwaysTitle": "Always play sound",
-  "notificationSoundAlwaysDescription": "Play the cue even when the app is open and focused.",
-  "notificationChannelTitle": "Channel messages",
-  "notificationChannelDescription": "Notify when someone sends a message in a channel or DM.",
-  "notificationChannelMessagesName": "Messages",
-  "notificationChannelMessagesDescription": "Replies, channel messages, and finished responses",
-  "notificationDefaultTitle": "New message",
-  "notificationChatTitle": "Chat responses",
-  "notificationChatDescription": "Notify when a response finishes in a chat you are not viewing.",
-  "notificationViewAction": "View",
-  "notificationsPermissionDenied": "Notifications are turned off in system settings."
-=======
   "workspaceTitle": "Workspace",
   "workspaceSubtitle": "Manage server resources and access.",
   "workspaceModels": "Models",
@@ -2333,5 +2308,4 @@
   "directAttachmentUnsupported": "이 직접 연결 모델에서는 해당 첨부 파일을 사용할 수 없습니다.",
   "backendChooserOpenWebUITitle": "Open WebUI",
   "hermesMemoryKeyDescription": "메모리 키를 사용하면 에이전트의 장기 메모리가 사용자별로 분리됩니다(X-Hermes-Session-Key). 이 항목을 비워 두면 첫 채팅을 시작할 때 고정 키가 자동으로 생성됩니다."
->>>>>>> origin/pr-13-head
 }

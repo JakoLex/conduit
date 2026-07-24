@@ -70,7 +70,6 @@ class ImageGenerationEnabledNotifier extends Notifier<bool> {
   }
 }
 
-<<<<<<< HEAD
 class CodeInterpreterEnabledNotifier extends Notifier<bool> {
   @override
   bool build() => ref.watch(_chatFeatureDefaultsProvider).codeInterpreterEnabled;
@@ -88,7 +87,8 @@ class CodeInterpreterEnabledNotifier extends Notifier<bool> {
       PyodideCodeRunner.instance.warmUp();
     }
   }
-=======
+}
+
 bool? _explicitModelCapability(Model model, String capability) {
   bool? readCapability(Object? rawCapabilities) {
     if (rawCapabilities is! Map) return null;
@@ -105,7 +105,6 @@ bool? _explicitModelCapability(Model model, String capability) {
       readCapability(meta is Map ? meta['capabilities'] : null) ??
       readCapability(metadata?['capabilities']) ??
       readCapability(model.capabilities);
->>>>>>> origin/pr-13-head
 }
 
 class VisionCapableModelsNotifier extends Notifier<List<String>> {
