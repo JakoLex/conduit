@@ -11,16 +11,17 @@ import 'profile_text_styles.dart';
 class CustomizationTile extends StatelessWidget {
   const CustomizationTile({
     super.key,
-    required this.leading,
+    this.leading,
     required this.title,
     required this.subtitle,
     this.subtitleTrailing,
     this.trailing,
     this.onTap,
     this.showChevron = true,
+    this.subtitleMaxLines = 2,
   });
 
-  final Widget leading;
+  final Widget? leading;
   final String title;
   final String subtitle;
 
@@ -29,6 +30,7 @@ class CustomizationTile extends StatelessWidget {
   final Widget? trailing;
   final VoidCallback? onTap;
   final bool showChevron;
+  final int subtitleMaxLines;
 
   @override
   Widget build(BuildContext context) {
@@ -40,8 +42,7 @@ class CustomizationTile extends StatelessWidget {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          leading,
-          const SizedBox(width: Spacing.md),
+          if (leading != null) ...[leading!, const SizedBox(width: Spacing.md)],
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -60,7 +61,7 @@ class CustomizationTile extends StatelessWidget {
                       child: Text(
                         subtitle,
                         style: profileSubtitleTextStyle(context),
-                        maxLines: 2,
+                        maxLines: subtitleMaxLines,
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),

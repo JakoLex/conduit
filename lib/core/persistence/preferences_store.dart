@@ -1,4 +1,20 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:shared_preferences/shared_preferences.dart';
+
+/// Test-only interception point for preference writes.
+///
+/// Returning null continues to the real platform write. Returning true or
+/// false replaces its result, which lets tests pause or fail a specific write
+/// without replacing SharedPreferences' transitive platform implementation.
+@visibleForTesting
+typedef PreferenceWriteInterceptor =
+    Future<bool?> Function(
+      SharedPreferences preferences,
+      String key,
+      Object? value,
+    );
 
 /// Synchronous key-value preference store backed by a single preloaded
 /// [SharedPreferences] instance.
@@ -21,6 +37,10 @@ class PreferencesStore {
   PreferencesStore._();
 
   static SharedPreferences? _prefs;
+  static PreferenceWriteInterceptor? _debugWriteInterceptor;
+  static bool _appDataClearBlocked = false;
+  static int _activeWrites = 0;
+  static Completer<void>? _writesDrained;
 
   /// True once [ensureInitialized] has completed and synchronous reads are safe.
   static bool get isReady => _prefs != null;
@@ -44,12 +64,22 @@ class PreferencesStore {
 
   /// Test seam: inject a (mock) instance. Pair with
   /// `SharedPreferences.setMockInitialValues({...})`.
-  static void debugOverride(SharedPreferences prefs) {
+  @visibleForTesting
+  static void debugOverride(
+    SharedPreferences prefs, {
+    PreferenceWriteInterceptor? writeInterceptor,
+  }) {
     _prefs = prefs;
+    _debugWriteInterceptor = writeInterceptor;
   }
 
+  @visibleForTesting
   static void debugReset() {
     _prefs = null;
+    _debugWriteInterceptor = null;
+    _appDataClearBlocked = false;
+    _activeWrites = 0;
+    _writesDrained = null;
   }
 
   // --- reads (synchronous) -------------------------------------------------
@@ -77,30 +107,154 @@ class PreferencesStore {
   /// the key. Lists are coerced to `List<String>` (the only list type
   /// shared_preferences supports).
   static Future<void> put(String key, Object? value) async {
-    final prefs = _prefs;
-    if (prefs == null) return;
-    if (value == null) {
-      await prefs.remove(key);
-      return;
+    var blockedByBarrier = false;
+    final succeeded = await _writeValue(
+      key,
+      value,
+      onBarrierBlock: () => blockedByBarrier = true,
+    );
+    if (!succeeded && blockedByBarrier) {
+      throw StateError('Preference changes are unavailable while signing out.');
     }
-    if (value is bool) {
-      await prefs.setBool(key, value);
-    } else if (value is int) {
-      await prefs.setInt(key, value);
-    } else if (value is double) {
-      await prefs.setDouble(key, value);
-    } else if (value is String) {
-      await prefs.setString(key, value);
-    } else if (value is List<String>) {
-      await prefs.setStringList(key, value);
-    } else if (value is List) {
-      await prefs.setStringList(
-        key,
-        value.map((e) => e.toString()).toList(growable: false),
+  }
+
+  /// Persists [value] and throws if the platform reports a failed disk write.
+  ///
+  /// Use this for security boundaries whose in-memory cache must not be treated
+  /// as durable when SharedPreferences returns false (notably trust revocation
+  /// and principal rotation). Ordinary UI preferences retain [put]'s legacy
+  /// best-effort behavior.
+  static Future<void> putChecked(
+    String key,
+    Object? value, {
+    bool bypassAppDataClearBarrier = false,
+  }) async {
+    if (_prefs == null) {
+      throw StateError(
+        'PreferencesStore.ensureInitialized() must be awaited before a checked '
+        'preference write.',
       );
-    } else {
-      await prefs.setString(key, value.toString());
     }
+    if (!await _writeValue(
+      key,
+      value,
+      bypassAppDataClearBarrier: bypassAppDataClearBarrier,
+    )) {
+      throw StateError('Preference write failed for "$key".');
+    }
+  }
+
+  /// Persists a security-sensitive value only if [canWrite] still owns the
+  /// mutation at the exact synchronous cache-write boundary.
+  ///
+  /// The optional test interceptor may yield before a real SharedPreferences
+  /// call. Checking admission inside [_writeValue], after that yield and
+  /// immediately before `set*`/`remove`, prevents a queued stale clear from
+  /// deleting a newer fail-closed marker. Returns false when ownership was
+  /// lost without touching the preference.
+  static Future<bool> putCheckedIf(
+    String key,
+    Object? value, {
+    required bool Function() canWrite,
+    bool bypassAppDataClearBarrier = false,
+  }) async {
+    if (_prefs == null) {
+      throw StateError(
+        'PreferencesStore.ensureInitialized() must be awaited before a checked '
+        'preference write.',
+      );
+    }
+    var admitted = false;
+    final succeeded = await _writeValue(
+      key,
+      value,
+      beforeWrite: () {
+        if (!canWrite()) return false;
+        admitted = true;
+        return true;
+      },
+      bypassAppDataClearBarrier: bypassAppDataClearBarrier,
+    );
+    if (!succeeded) {
+      throw StateError('Preference write failed for "$key".');
+    }
+    return admitted;
+  }
+
+  static Future<bool> _writeValue(
+    String key,
+    Object? value, {
+    bool Function()? beforeWrite,
+    void Function()? onBarrierBlock,
+    bool bypassAppDataClearBarrier = false,
+  }) async {
+    final prefs = _prefs;
+    // Ordinary preference writes are best-effort before bootstrap: true means
+    // the write was intentionally skipped, not that anything reached disk.
+    if (prefs == null) return true;
+    if (_appDataClearBlocked && !bypassAppDataClearBarrier) {
+      onBarrierBlock?.call();
+      return false;
+    }
+    _activeWrites++;
+    try {
+      final interceptor = _debugWriteInterceptor;
+      if (interceptor != null) {
+        final intercepted = await interceptor(prefs, key, value);
+        if (intercepted != null) {
+          if (_appDataClearBlocked && !bypassAppDataClearBarrier) {
+            onBarrierBlock?.call();
+            return false;
+          }
+          if (beforeWrite != null && !beforeWrite()) return true;
+          return intercepted;
+        }
+      }
+      if (_appDataClearBlocked && !bypassAppDataClearBarrier) {
+        onBarrierBlock?.call();
+        return false;
+      }
+      if (beforeWrite != null && !beforeWrite()) return true;
+      if (value == null) {
+        return prefs.remove(key);
+      }
+      if (value is bool) {
+        return prefs.setBool(key, value);
+      } else if (value is int) {
+        return prefs.setInt(key, value);
+      } else if (value is double) {
+        return prefs.setDouble(key, value);
+      } else if (value is String) {
+        return prefs.setString(key, value);
+      } else if (value is List<String>) {
+        return prefs.setStringList(key, value);
+      } else if (value is List) {
+        return prefs.setStringList(
+          key,
+          value.map((e) => e.toString()).toList(growable: false),
+        );
+      } else {
+        return prefs.setString(key, value.toString());
+      }
+    } finally {
+      _activeWrites--;
+      if (_activeWrites == 0) {
+        _writesDrained?.complete();
+        _writesDrained = null;
+      }
+    }
+  }
+
+  /// Rejects new preference writes and waits for writes that already crossed
+  /// the API boundary to settle before a full app-data wipe.
+  static Future<void> blockWritesForAppDataClear() {
+    _appDataClearBlocked = true;
+    if (_activeWrites == 0) return Future<void>.value();
+    return (_writesDrained ??= Completer<void>()).future;
+  }
+
+  static void resumeWritesAfterAppDataClear() {
+    _appDataClearBlocked = false;
   }
 
   static Future<void> putAll(Map<String, Object?> entries) async {
@@ -110,7 +264,7 @@ class PreferencesStore {
   }
 
   static Future<void> remove(String key) async {
-    await _prefs?.remove(key);
+    await put(key, null);
   }
 
   /// Clears all stored values, optionally preserving [preserve] (e.g. the
@@ -123,9 +277,11 @@ class PreferencesStore {
       for (final key in preserve)
         if (prefs.containsKey(key)) key: prefs.get(key),
     };
-    await prefs.clear();
+    if (!await prefs.clear()) {
+      throw StateError('Preference clear failed.');
+    }
     for (final entry in saved.entries) {
-      await put(entry.key, entry.value);
+      await putChecked(entry.key, entry.value, bypassAppDataClearBarrier: true);
     }
   }
 }

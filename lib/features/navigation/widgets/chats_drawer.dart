@@ -7,14 +7,13 @@ import 'package:flutter/material.dart';
 import 'package:conduit/core/services/haptic_service.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../../core/database/local_conversation_loader.dart';
 import '../../../core/providers/app_providers.dart';
 import '../../../core/services/native_sheet_bridge.dart';
 import '../../../shared/theme/theme_extensions.dart';
 import '../../../shared/utils/platform_scroll_physics.dart';
-import '../../chat/providers/chat_providers.dart' as chat;
 import '../../../core/utils/debug_logger.dart';
 import '../../../core/services/navigation_service.dart';
+import '../../../core/services/user_friendly_error_handler.dart';
 import '../../../shared/widgets/conduit_components.dart';
 import '../../../shared/widgets/conduit_loading.dart';
 import '../../../shared/widgets/themed_dialogs.dart';
@@ -29,6 +28,7 @@ import 'create_folder_dialog.dart';
 import 'folder_tree_guides.dart';
 import 'drawer_section_notifiers.dart';
 import 'folder_icon.dart';
+import '../providers/conversation_selection_provider.dart';
 import '../providers/sidebar_providers.dart';
 
 /// Chevron / expand icon for section headers — matches folder row disclosure.
@@ -59,10 +59,9 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
   final ScrollController _listController = ScrollController();
   Timer? _debounce;
   String _query = '';
-  bool _isLoadingConversation = false;
-  String? _pendingConversationId;
   bool _isLoadingMoreConversations = false;
   bool _isRefreshingEmptyState = false;
+  bool _hasVisiblePaginatedRows = false;
 
   @override
   void initState() {
@@ -120,11 +119,27 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
     });
   }
 
+  void _queueArchivedVisibilitySync(bool visible) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _query.isNotEmpty) return;
+      final notifier = ref.read(conversationsProvider.notifier);
+      if (notifier.archivedChatsVisible() == visible) return;
+      unawaited(notifier.setArchivedChatsVisible(visible));
+    });
+  }
+
   Future<void> _maybeLoadMoreConversations() async {
-    if (!mounted || _query.isNotEmpty || _isLoadingMoreConversations) {
+    await _loadMoreConversations(automatic: true);
+  }
+
+  Future<void> _loadMoreConversations({bool automatic = false}) async {
+    if (!mounted ||
+        _query.isNotEmpty ||
+        _isLoadingMoreConversations ||
+        (automatic && !_hasVisiblePaginatedRows)) {
       return;
     }
-    if (!_listController.hasClients) {
+    if (automatic && !_listController.hasClients) {
       return;
     }
 
@@ -138,16 +153,14 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
         notifier.isLoadingMoreRegularChats()) {
       return;
     }
-    if (ref.read(apiServiceProvider) == null) {
-      return;
-    }
-
-    final position = _listController.position;
-    final distanceToBottom = position.maxScrollExtent - position.pixels;
-    final shouldLoadMore =
-        position.maxScrollExtent <= 0 || distanceToBottom <= 240;
-    if (!shouldLoadMore) {
-      return;
+    if (automatic) {
+      final position = _listController.position;
+      final distanceToBottom = position.maxScrollExtent - position.pixels;
+      final shouldLoadMore =
+          position.maxScrollExtent <= 0 || distanceToBottom <= 240;
+      if (!shouldLoadMore) {
+        return;
+      }
     }
 
     setState(() => _isLoadingMoreConversations = true);
@@ -226,6 +239,7 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
   Widget _buildPaginationFooter() {
     final theme = context.conduitTheme;
     final showSpinner = _isLoadingMoreConversations;
+    final showManualLoadMore = !showSpinner && !_hasVisiblePaginatedRows;
 
     return SliverToBoxAdapter(
       child: Padding(
@@ -242,7 +256,48 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
                     ),
                   ),
                 )
+              : showManualLoadMore
+              ? ConduitButton(
+                  key: const ValueKey<String>('chats-load-more'),
+                  text: AppLocalizations.of(context)!.workspaceLoadMore,
+                  onPressed: () => unawaited(_loadMoreConversations()),
+                  isSecondary: true,
+                  isCompact: true,
+                )
               : const SizedBox(height: Spacing.md),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildArchivedPaginationFooter() {
+    final theme = context.conduitTheme;
+    final notifier = ref.read(conversationsProvider.notifier);
+    final showSpinner = notifier.isLoadingMoreArchivedChats();
+    final l10n = AppLocalizations.of(context)!;
+
+    return SliverToBoxAdapter(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: Spacing.sm),
+        child: Center(
+          child: showSpinner
+              ? SizedBox(
+                  width: IconSize.sm,
+                  height: IconSize.sm,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation<Color>(
+                      theme.loadingIndicator,
+                    ),
+                  ),
+                )
+              : ConduitButton(
+                  key: const ValueKey<String>('chats-archived-load-more'),
+                  text: '${l10n.workspaceLoadMore}: ${l10n.archived}',
+                  onPressed: () => unawaited(notifier.loadMoreArchived()),
+                  isSecondary: true,
+                  isCompact: true,
+                ),
         ),
       ),
     );
@@ -331,6 +386,42 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
       return null;
     }
     return parentId;
+  }
+
+  bool _hasVisibleFolderConversationRows({
+    required List<Folder> folders,
+    required Set<String> folderIdsWithConversations,
+    required Map<String, bool> expandedFolders,
+  }) {
+    if (folderIdsWithConversations.isEmpty) return false;
+
+    final foldersById = <String, Folder>{
+      for (final folder in folders) folder.id: folder,
+    };
+    for (final folderId in folderIdsWithConversations) {
+      final startingFolder = foldersById[folderId];
+      if (startingFolder == null) continue;
+      var folder = startingFolder;
+
+      final visitedFolderIds = <String>{};
+      var branchIsVisible = true;
+      while (true) {
+        if (!visitedFolderIds.add(folder.id) ||
+            !(expandedFolders[folder.id] ?? folder.isExpanded)) {
+          branchIsVisible = false;
+          break;
+        }
+
+        final parentId = _normalizeParentId(folder.parentId);
+        if (parentId == null || !foldersById.containsKey(parentId)) {
+          break;
+        }
+        folder = foldersById[parentId]!;
+      }
+
+      if (branchIsVisible) return true;
+    }
+    return false;
   }
 
   List<Widget> _buildFolderSectionSlivers({
@@ -542,10 +633,20 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
 
   Widget _buildConversationList(BuildContext context) {
     final theme = context.conduitTheme;
+    _hasVisiblePaginatedRows = false;
 
     if (_query.isEmpty) {
       final conversationsAsync = ref.watch(conversationsProvider);
       return conversationsAsync.when(
+        // Pagination (loadMore/loadMoreArchived/setArchivedChatsVisible) bumps
+        // a tick dependency that re-runs the whole Conversations build, which
+        // reports as a loading-with-previous-value reload. Keep the previous
+        // rows on screen during that reload instead of replacing the entire
+        // drawer with a spinner and tearing down scroll state; the loading
+        // branch below still renders for the true first load, which has no
+        // previous value. (skipLoadingOnRefresh already defaults to true for
+        // pull-to-refresh style invalidations.)
+        skipLoadingOnReload: true,
         data: (items) {
           final list = items;
           final conversationsNotifier = ref.read(
@@ -561,8 +662,12 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
             orElse: () => const <Folder>[],
           );
           final hasVisibleFolders = foldersEnabled && folders.isNotEmpty;
+          final providerArchivedCount = conversationsNotifier
+              .archivedChatCount();
 
-          if (list.isEmpty && !hasVisibleFolders) {
+          if (list.isEmpty &&
+              !hasVisibleFolders &&
+              providerArchivedCount == 0) {
             return _buildEmptyState(
               AppLocalizations.of(context)!.noConversationsYet,
             );
@@ -601,11 +706,40 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
             }
           }
 
-          final archived = list.where((c) => c.archived == true).toList();
+          final archived = list
+              .where((c) => c.pinned != true && c.archived == true)
+              .toList();
 
           final showPinned = ref.watch(showPinnedProvider);
           final showFolders = ref.watch(showFoldersProvider);
           final showRecent = ref.watch(showRecentProvider);
+          final showArchived = ref.watch(showArchivedProvider);
+          if (showArchived != conversationsNotifier.archivedChatsVisible()) {
+            _queueArchivedVisibilitySync(showArchived);
+          }
+          final archivedCount = providerArchivedCount > archived.length
+              ? providerArchivedCount
+              : archived.length;
+          final hasMoreArchivedChats = conversationsNotifier
+              .hasMoreArchivedChats();
+          final isLoadingMoreArchivedChats = conversationsNotifier
+              .isLoadingMoreArchivedChats();
+          final expandedFolders = showFolders && foldersEnabled
+              ? ref.watch(expandedFoldersProvider)
+              : const <String, bool>{};
+          _hasVisiblePaginatedRows =
+              (showRecent && regular.isNotEmpty) ||
+              (showFolders &&
+                  foldersEnabled &&
+                  _hasVisibleFolderConversationRows(
+                    folders: folders,
+                    folderIdsWithConversations: <String>{
+                      ...folderConversationFallbacks.keys,
+                      for (final folder in folders)
+                        if (folder.conversationIds.isNotEmpty) folder.id,
+                    },
+                    expandedFolders: expandedFolders,
+                  ));
 
           final slivers = <Widget>[
             if (pinned.isNotEmpty) ...[
@@ -674,26 +808,30 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
               ],
             ],
 
-            if (archived.isNotEmpty) ...[
+            if (archivedCount > 0) ...[
               const SliverToBoxAdapter(child: SizedBox(height: Spacing.md)),
               SliverPadding(
                 padding: const EdgeInsets.symmetric(horizontal: Spacing.md),
                 sliver: SliverToBoxAdapter(
-                  child: _buildArchivedHeader(archived.length),
+                  child: _buildArchivedHeader(archivedCount),
                 ),
               ),
-              if (ref.watch(showArchivedProvider)) ...[
-                const SliverToBoxAdapter(child: SizedBox(height: Spacing.xs)),
-                _conversationsSliver(
-                  archived,
-                  foldersEnabled: foldersEnabled,
-                  folders: folders,
-                ),
+              if (showArchived) ...[
+                if (archived.isNotEmpty) ...[
+                  const SliverToBoxAdapter(child: SizedBox(height: Spacing.xs)),
+                  _conversationsSliver(
+                    archived,
+                    foldersEnabled: foldersEnabled,
+                    folders: folders,
+                  ),
+                ],
+                if (isLoadingMoreArchivedChats || hasMoreArchivedChats)
+                  _buildArchivedPaginationFooter(),
               ],
             ],
             if (hasMoreRegularChats) _buildPaginationFooter(),
           ];
-          if (hasMoreRegularChats) {
+          if (hasMoreRegularChats && _hasVisiblePaginatedRows) {
             _queuePaginationCheck();
           }
           return _buildRefreshableScrollableSlivers(slivers: slivers);
@@ -759,7 +897,9 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
           }
         }
 
-        final archived = list.where((c) => c.archived == true).toList();
+        final archived = list
+            .where((c) => c.pinned != true && c.archived == true)
+            .toList();
 
         final showPinned = ref.watch(showPinnedProvider);
         final showFolders = ref.watch(showFoldersProvider);
@@ -1526,41 +1666,50 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
     bool foldersEnabled = false,
     List<Folder> folders = const <Folder>[],
   }) {
+    final conversation = conv as Conversation;
+    final scopedId = conversationScopedId(conversation);
     // Only rebuild this tile when its own selected state changes.
     final isActive = ref.watch(
-      activeConversationProvider.select((c) => c?.id == conv.id),
+      activeConversationProvider.select(
+        (active) => isSameStoredConversation(active, conversation),
+      ),
     );
-    final title = conv.title?.isEmpty == true ? 'Chat' : (conv.title ?? 'Chat');
-    final bool isLoadingSelected =
-        (_pendingConversationId == conv.id) &&
-        (ref.watch(chat.isLoadingConversationProvider) == true);
-    final bool isPinned = conv.pinned == true;
+    final title = conversation.title.isEmpty ? 'Chat' : conversation.title;
+    final isLoadingSelected = ref.watch(
+      conversationSelectionProvider.select(
+        (selection) =>
+            selection.isLoading && selection.pendingConversationId == scopedId,
+      ),
+    );
+    final bool isPinned = conversation.pinned;
     final activeChatIds = ref.watch(activeChatIdsProvider);
-    final bool unread = _conversationUnread(
-      conv,
-      selected: isActive,
-      activeChatIds: activeChatIds,
+    final bool isGenerating = _conversationIsActive(
+      conversation,
+      activeChatIds,
     );
-
-    final bool isGenerating =
-        conv.id != null && activeChatIds.contains(conv.id);
+    final bool unread = _conversationUnread(
+      conversation,
+      selected: isActive,
+      isGenerating: isGenerating,
+    );
 
     final tileWidget = ConversationTile(
-      key: ValueKey<String>('drawer-chat-${conv.id}'),
+      key: ValueKey<String>('drawer-chat-$scopedId'),
       title: title,
       pinned: isPinned,
       selected: isActive,
       unread: unread,
       isLoading: isLoadingSelected,
       isGenerating: isGenerating,
-      onTap: _isLoadingConversation
-          ? null
-          : () => _selectConversation(context, conv.id),
+      badge: isDirectLocalConversation(conversation)
+          ? AppLocalizations.of(context)!.onDevice
+          : null,
+      onTap: () => _selectConversation(conversation),
     );
 
     final wrappedTile = showHierarchyBranch
         ? FolderTreeHierarchyNode(
-            key: ValueKey<String>('tree-guides-chat-${conv.id}'),
+            key: ValueKey<String>('tree-guides-chat-$scopedId'),
             ancestorHasMoreSiblings: ancestorHasMoreSiblings,
             showBranch: true,
             hasMoreSiblings: hasMoreSiblings,
@@ -1572,7 +1721,7 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
       actions: buildConversationActionsWithFolders(
         context: context,
         ref: ref,
-        conversation: conv,
+        conversation: conversation,
         foldersEnabled: foldersEnabled,
         folders: folders,
       ),
@@ -1587,7 +1736,17 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
     final show = ref.watch(showArchivedProvider);
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onTap: () => ref.read(showArchivedProvider.notifier).set(!show),
+      onTap: () {
+        final visible = !show;
+        ref.read(showArchivedProvider.notifier).set(visible);
+        if (_query.isEmpty) {
+          unawaited(
+            ref
+                .read(conversationsProvider.notifier)
+                .setArchivedChatsVisible(visible),
+          );
+        }
+      },
       child: Container(
         decoration: BoxDecoration(
           color: show
@@ -1656,116 +1815,55 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
     );
   }
 
-  Future<void> _selectConversation(BuildContext context, String id) async {
-    if (_isLoadingConversation) return;
-    setState(() => _isLoadingConversation = true);
-    // Keep a reference only if needed in the future; currently unused.
-    // Capture a provider container detached from this widget's lifecycle so
-    // we can continue to read/write providers after the drawer is closed.
-    final container = ProviderScope.containerOf(context, listen: false);
-
-    // Selecting a real conversation exits temporary mode
-    container.read(temporaryChatEnabledProvider.notifier).set(false);
-    final outgoingId = container.read(activeConversationProvider)?.id;
-    if (outgoingId != id) {
-      markConversationRead(container, outgoingId);
-    }
-    final selectedReadAt = DateTime.now();
-    markConversationRead(container, id, readAt: selectedReadAt);
-
-    // Overlay the just-selected read time when it is newer than the source's
-    // own lastReadAt, so the active conversation reflects the optimistic read.
-    Conversation withOptimisticReadAt(Conversation c) {
-      final readAt = c.lastReadAt;
-      return readAt == null || selectedReadAt.isAfter(readAt)
-          ? c.copyWith(lastReadAt: selectedReadAt)
-          : c;
-    }
-
-    try {
-      // Mark global loading to show skeletons in chat
-      container.read(chat.isLoadingConversationProvider.notifier).set(true);
-      _pendingConversationId = id;
-
-      // Immediately clear current chat to show loading skeleton in the chat view
-      container.read(activeConversationProvider.notifier).clear();
-      container.read(chat.chatMessagesProvider.notifier).clearMessages();
-
-      // Clear any pending folder selection when selecting an existing conversation
-      container.read(pendingFolderIdProvider.notifier).clear();
-
-      // Navigate to chat route (needed when sidebar is open from
-      // a non-chat page like notes editor or channel page).
-      NavigationService.router.go(Routes.chat);
-
-      // Close the slide drawer for faster perceived performance
-      // (only on mobile; keep tablet drawer unless user toggles it)
-      if (mounted) {
+  Future<void> _selectConversation(Conversation conversation) async {
+    final originRoute = NavigationService.currentRoute;
+    final originRouteRevision = NavigationService.currentRouteRevision;
+    final result = await ref
+        .read(conversationSelectionProvider.notifier)
+        .select(conversation);
+    switch (result.disposition) {
+      case ConversationSelectionDisposition.committed:
+        if (!mounted ||
+            (NavigationService.currentRoute != originRoute ||
+                NavigationService.currentRouteRevision !=
+                    originRouteRevision)) {
+          return;
+        }
+        NavigationService.router.go(Routes.chat);
         final mediaQuery = MediaQuery.maybeOf(context);
         final isTablet =
             mediaQuery != null && mediaQuery.size.shortestSide >= 600;
         if (!isTablet) {
           ResponsiveDrawerLayout.of(context)?.close();
         }
-      }
-
-      // DB-first open (CDT-RFC-001 Phase 1): a synced local row renders
-      // instantly — offline included — and a background pull freshens it.
-      final local = await loadLocalConversation(container, id);
-      if (local != null) {
-        container
-            .read(activeConversationProvider.notifier)
-            .set(withOptimisticReadAt(local));
-        schedulePullChatNow(container, id);
-      } else {
-        // No row / envelope stub / reviewer mode: load from the server.
-        final api = container.read(apiServiceProvider);
-        if (api != null) {
-          final full = await api.getConversation(id);
-          container
-              .read(activeConversationProvider.notifier)
-              .set(withOptimisticReadAt(full));
-          // Materialize the local row so the next open is DB-first.
-          schedulePullChatNow(container, id);
-        } else {
-          // Fallback: use the lightweight item to update the active
-          // conversation
-          final conversations = await container.read(
-            conversationsProvider.future,
-          );
-          Conversation? fallback;
-          for (final conversation in conversations) {
-            if (conversation.id == id) {
-              fallback = conversation;
-              break;
-            }
-          }
-          if (fallback != null) {
-            container
-                .read(activeConversationProvider.notifier)
-                .set(withOptimisticReadAt(fallback));
-          }
+        return;
+      case ConversationSelectionDisposition.canceled:
+        return;
+      case ConversationSelectionDisposition.failed:
+        if (!mounted ||
+            result.error == null ||
+            (NavigationService.currentRoute != originRoute ||
+                NavigationService.currentRouteRevision !=
+                    originRouteRevision)) {
+          return;
         }
-      }
-
-      // Clear loading after data is ready
-      container.read(chat.isLoadingConversationProvider.notifier).set(false);
-      _pendingConversationId = null;
-    } catch (_) {
-      container.read(chat.isLoadingConversationProvider.notifier).set(false);
-      _pendingConversationId = null;
-    } finally {
-      if (mounted) setState(() => _isLoadingConversation = false);
+        UserFriendlyErrorHandler().showErrorSnackbar(
+          context,
+          result.error,
+          onRetry: () {
+            if (mounted) unawaited(_selectConversation(conversation));
+          },
+        );
     }
   }
 
   bool _conversationUnread(
     dynamic conversation, {
     required bool selected,
-    required Set<String> activeChatIds,
+    required bool isGenerating,
   }) {
     final id = conversation.id?.toString();
-    if (id == null || id.isEmpty || selected || activeChatIds.contains(id)) {
+    if (id == null || id.isEmpty || selected || isGenerating) {
       return false;
     }
     final updatedAt = conversation.updatedAt;
@@ -1773,6 +1871,19 @@ class _ChatsDrawerState extends ConsumerState<ChatsDrawer>
     final lastReadAt = conversation.lastReadAt;
     if (lastReadAt is! DateTime) return true;
     return updatedAt.isAfter(lastReadAt);
+  }
+
+  bool _conversationIsActive(
+    Conversation conversation,
+    Set<String> activeChatIds,
+  ) {
+    if (activeChatIds.contains(conversationScopedId(conversation))) {
+      return true;
+    }
+    // Socket-derived active IDs are raw Open WebUI IDs. Never apply one to an
+    // on-device row that happens to share the same raw ID.
+    return !isDirectLocalConversation(conversation) &&
+        activeChatIds.contains(conversation.id);
   }
 }
 

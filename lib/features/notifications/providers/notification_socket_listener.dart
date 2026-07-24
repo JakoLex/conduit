@@ -12,6 +12,7 @@ import '../../../core/services/socket_service.dart';
 import '../../../core/utils/current_localizations.dart';
 import '../../../core/utils/debug_logger.dart';
 import '../../channels/providers/channel_providers.dart';
+import '../../chat/providers/chat_providers.dart';
 import '../models/app_notification.dart';
 import '../services/active_view_tracker.dart';
 import '../services/local_notification_service.dart';
@@ -86,13 +87,26 @@ Future<void> _handleTap(Ref ref, NotificationTap tap) async {
       case NotificationKind.channelMessage:
         NavigationService.navigateToChannel(tap.sourceId);
       case NotificationKind.chatCompletion:
+        final ownership = captureOpenWebUiConversationRead(ref);
+        if (ownership == null) return;
+        final outgoing = ref.read(activeConversationProvider);
+        if (outgoing == null ||
+            !conversationMatchesScopedId(outgoing, tap.sourceId)) {
+          clearSelectedFiltersForConversationBoundary(ref);
+        }
         // DB-first open, mirroring the conversation-list selection flow.
         await NavigationService.navigateToChat();
-        final local = await loadLocalConversation(ref, tap.sourceId);
+        if (!openWebUiConversationReadIsCurrent(ref, ownership)) return;
+        final local = await loadLocalConversation(
+          ref,
+          tap.sourceId,
+          ownership: ownership,
+        );
+        if (!openWebUiConversationReadIsCurrent(ref, ownership)) return;
         if (local != null) {
           ref.read(activeConversationProvider.notifier).set(local);
         }
-        schedulePullChatNow(ref, tap.sourceId);
+        schedulePullChatNow(ref, tap.sourceId, ownership: ownership);
     }
   } catch (e, st) {
     DebugLogger.error(
@@ -186,8 +200,7 @@ class NotificationSocketListener extends _$NotificationSocketListener {
     });
   }
 
-  String get _currentUserId =>
-      ref.read(currentUserProvider).value?.id ?? '';
+  String get _currentUserId => ref.read(currentUserProvider).value?.id ?? '';
 
   void _onChatEvent(Map<String, dynamic> event) {
     final notification = _classifier.classifyChatEvent(

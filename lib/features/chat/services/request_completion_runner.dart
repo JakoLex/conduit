@@ -4,9 +4,10 @@ import 'package:riverpod_annotation/riverpod_annotation.dart';
 
 import '../../../core/database/app_database.dart';
 import '../../../core/database/daos/outbox_dao.dart';
-import '../../../core/database/database_provider.dart';
 import '../../../core/database/mappers/conversation_assembler.dart';
 import '../../../core/providers/app_providers.dart';
+import '../../../core/services/conversation_parsing.dart';
+import '../../../core/services/worker_manager.dart';
 import '../../../core/sync/outbox_drainer.dart';
 import '../../../core/utils/debug_logger.dart';
 import '../providers/chat_providers.dart';
@@ -49,9 +50,16 @@ class CompletionDatabaseUnavailableException
 /// `{chatId, assistantMessageId}`) updates the SAME placeholder row the
 /// `*WithOutbox` DAO wrote at enqueue, guaranteeing one row per turn (R8).
 class ChatRequestCompletionRunner implements RequestCompletionRunner {
-  ChatRequestCompletionRunner(this._ref);
+  ChatRequestCompletionRunner(
+    this._ref, {
+    int recoveryAttempts = 6,
+    Duration recoveryDelay = const Duration(seconds: 2),
+  }) : _recoveryAttempts = recoveryAttempts,
+       _recoveryDelay = recoveryDelay;
 
   final Ref _ref;
+  final int _recoveryAttempts;
+  final Duration _recoveryDelay;
 
   @override
   Future<void> run({
@@ -61,7 +69,12 @@ class ChatRequestCompletionRunner implements RequestCompletionRunner {
     final decoded = RequestCompletionPayload.fromJson(payload);
     final assistantMessageId = decoded.assistantMessageId;
 
-    final db = _ref.read(appDatabaseProvider);
+    // Capture database, API, auth epoch, and database certification as one
+    // synchronous ownership tuple. Reading only the database first leaves an
+    // ABA window where the same object can be reused by a different account
+    // before the completion owner is captured.
+    final conversationOwnership = captureOpenWebUiConversationRead(_ref);
+    final db = conversationOwnership?.database;
     if (db == null) {
       DebugLogger.log(
         'completion-deferred-no-db',
@@ -70,33 +83,54 @@ class ChatRequestCompletionRunner implements RequestCompletionRunner {
       );
       throw const CompletionDatabaseUnavailableException();
     }
+    final ownedConversationSession = conversationOwnership!;
 
-    // 1. Streaming-conflict guard (R5): if a LIVE interactive stream owns this
-    //    exact chat, defer (throw-transient) so we never clobber it.
-    final isStreaming = _ref.read(isChatStreamingProvider);
-    final activeId = _ref.read(activeConversationProvider)?.id;
-    final activeMessages = _ref.read(chatMessagesProvider);
-    final activeLastMessage = activeMessages.isNotEmpty
-        ? activeMessages.last
-        : null;
-    final activeStreamingAssistantId =
-        activeLastMessage?.role == 'assistant' &&
-            activeLastMessage?.isStreaming == true
-        ? activeLastMessage?.id
-        : null;
-    final isOwnOptimisticPlaceholder =
-        activeStreamingAssistantId == assistantMessageId;
-    if (isStreaming && activeId == chatId && !isOwnOptimisticPlaceholder) {
-      DebugLogger.log(
-        'completion-deferred-busy',
-        scope: 'chat/completion',
-        data: {
-          'chatId': chatId,
-          'assistantMessageId': assistantMessageId,
-          'activeStreamingAssistantId': activeStreamingAssistantId,
-        },
-      );
-      throw CompletionBusyException(chatId);
+    final owner = OpenWebUiCompletionOwner(
+      chatId: chatId,
+      database: db,
+      api: ownedConversationSession.api,
+      authSessionEpoch: ownedConversationSession.authSessionEpoch,
+      contextWasCoherent: true,
+    );
+
+    void requireCurrentConversationOwner() {
+      if (!openWebUiConversationReadIsCurrent(_ref, ownedConversationSession) ||
+          !openWebUiCompletionContextIsCurrent(_ref, owner)) {
+        throw const CompletionDatabaseUnavailableException();
+      }
+    }
+
+    requireCurrentConversationOwner();
+
+    // Streaming-conflict guard (R5): if a LIVE interactive stream owns this
+    // exact chat, unsent work defers so it can never clobber that stream.
+    void deferIfTargetIsBusy() {
+      requireCurrentConversationOwner();
+      if (activeOpenWebUiChatIdForMutation(_ref, owner) == null ||
+          !_ref.read(isChatStreamingProvider)) {
+        return;
+      }
+      final activeMessages = _ref.read(chatMessagesProvider);
+      final activeLastMessage = activeMessages.isNotEmpty
+          ? activeMessages.last
+          : null;
+      final activeStreamingAssistantId =
+          activeLastMessage?.role == 'assistant' &&
+              activeLastMessage?.isStreaming == true
+          ? activeLastMessage?.id
+          : null;
+      if (activeStreamingAssistantId != assistantMessageId) {
+        DebugLogger.log(
+          'completion-deferred-busy',
+          scope: 'chat/completion',
+          data: {
+            'chatId': chatId,
+            'assistantMessageId': assistantMessageId,
+            'activeStreamingAssistantId': activeStreamingAssistantId,
+          },
+        );
+        throw CompletionBusyException(chatId);
+      }
     }
 
     // 2. Idempotency / already-completed guard (R3): a completed turn leaves a
@@ -107,6 +141,7 @@ class ChatRequestCompletionRunner implements RequestCompletionRunner {
       chatId,
       assistantMessageId,
     );
+    requireCurrentConversationOwner();
     if (placeholder == null) {
       DebugLogger.log(
         'completion-placeholder-absent',
@@ -123,6 +158,12 @@ class ChatRequestCompletionRunner implements RequestCompletionRunner {
       );
       return;
     }
+    final completionWasSubmitted = _placeholderMarkedSubmitted(placeholder);
+    // Once the POST crossed the server boundary this op is pull-only recovery;
+    // another live stream must not prevent collecting the accepted response.
+    if (!completionWasSubmitted) {
+      deferIfTargetIsBusy();
+    }
 
     // 3. Path choice (Option B):
     //    - The target chat IS the one the user is viewing → drive the LIVE
@@ -131,6 +172,7 @@ class ChatRequestCompletionRunner implements RequestCompletionRunner {
     //      HEADLESS: fire the completion, let the server persist it, pull it
     //      into the local DB — WITHOUT switching the user's active conversation.
     final chatRow = await db.chatsDao.getChat(chatId);
+    requireCurrentConversationOwner();
     if (chatRow == null) {
       // Chat row vanished (e.g. a delete won the race): nothing to complete.
       DebugLogger.log(
@@ -141,7 +183,34 @@ class ChatRequestCompletionRunner implements RequestCompletionRunner {
       return;
     }
 
-    if (activeId == chatId &&
+    if (completionWasSubmitted) {
+      // The POST already crossed the server boundary before a prior run lost
+      // foreground ownership or its byte stream failed. Recover by pull only;
+      // replaying the request here would duplicate the assistant generation.
+      owner.chatId = await resolveOpenWebUiCompletionChatId(
+        _ref,
+        owner: owner,
+        assistantMessageId: assistantMessageId,
+      );
+      requireCurrentConversationOwner();
+      await recoverSubmittedOpenWebUiCompletion(
+        _ref,
+        owner: owner,
+        assistantMessageId: assistantMessageId,
+        recoveryAttempts: _recoveryAttempts,
+        recoveryDelay: _recoveryDelay,
+      );
+      requireCurrentConversationOwner();
+      return;
+    }
+
+    // Both database reads above are async. Re-read the global owner and stream
+    // state now; the user may have navigated while either query was queued.
+    deferIfTargetIsBusy();
+    final targetIsActive =
+        activeOpenWebUiChatIdForMutation(_ref, owner) != null;
+
+    if (targetIsActive &&
         _ref
             .read(chatMessagesProvider)
             .any((message) => message.id == assistantMessageId)) {
@@ -160,6 +229,7 @@ class ChatRequestCompletionRunner implements RequestCompletionRunner {
         enableImageGeneration: decoded.enableImageGeneration,
         enableCodeInterpreter: decoded.enableCodeInterpreter,
         sessionIdOverride: decoded.sessionIdOverride,
+        completionOwner: owner,
       );
       return;
     }
@@ -167,7 +237,19 @@ class ChatRequestCompletionRunner implements RequestCompletionRunner {
     // Headless drive — no active-conversation switch, no chatMessagesProvider
     // mutation. Builds the request from this chat's DB rows.
     final rows = await db.messagesDao.getForChat(chatId);
-    final conversation = assembleConversation(chatRow, rows);
+    requireCurrentConversationOwner();
+    final conversation = await assembleConversationGuarded(
+      chatRow,
+      rows,
+      offload: (envelope) => _ref
+          .read(workerManagerProvider)
+          .schedule(
+            parseFullConversationModelWorker,
+            envelope,
+            debugLabel: 'headless.assembleConversation',
+          ),
+    );
+    requireCurrentConversationOwner();
     await runHeadlessCompletion(
       _ref,
       chatId: chatId,
@@ -182,6 +264,7 @@ class ChatRequestCompletionRunner implements RequestCompletionRunner {
       enableImageGeneration: decoded.enableImageGeneration,
       enableCodeInterpreter: decoded.enableCodeInterpreter,
       sessionIdOverride: decoded.sessionIdOverride,
+      completionOwner: owner,
     );
   }
 }
@@ -192,6 +275,12 @@ bool _placeholderMarkedComplete(MessageRow placeholder) {
   return metadata['responseDone'] == true ||
       payload['done'] == true ||
       payload['isStreaming'] == false;
+}
+
+bool _placeholderMarkedSubmitted(MessageRow placeholder) {
+  final payload = _decodeMessagePayload(placeholder.payload);
+  final metadata = _asJsonMap(payload['metadata']);
+  return metadata['completionSubmitted'] == true;
 }
 
 Map<String, dynamic> _decodeMessagePayload(String raw) {

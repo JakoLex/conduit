@@ -9,6 +9,25 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('parseOpenWebUIStream', () {
+    test('skips explicit empty data heartbeats', () async {
+      final updates = await parseOpenWebUIStream(
+        Stream<List<int>>.fromIterable([
+          utf8.encode(
+            'data:\n\n'
+            'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+            'data: [DONE]\n\n',
+          ),
+        ]),
+      ).toList();
+
+      check(updates).length.equals(2);
+      check(updates.first)
+          .isA<OpenWebUIContentDelta>()
+          .has((update) => update.content, 'content')
+          .equals('hi');
+      check(updates.last).isA<OpenWebUIStreamDone>();
+    });
+
     test('parses delta, usage, and done across split SSE frames', () async {
       final updates = await parseOpenWebUIStream(
         Stream<List<int>>.fromIterable([
@@ -165,7 +184,7 @@ void main() {
         final updates = await parseOpenWebUIStream(
           Stream<List<int>>.fromIterable([
             utf8.encode('data: {"choices":[{"delta":{"content":"done"}}]}\n\n'),
-            utf8.encode('data: [DONE]'),
+            utf8.encode('data: [DONE]\n\n'),
           ]),
         ).toList();
 
@@ -236,19 +255,18 @@ void main() {
       check(updates[1]).isA<OpenWebUIStreamDone>();
     });
 
-    test('flushes trailing unterminated data payloads at stream end', () async {
-      final updates = await parseOpenWebUIStream(
-        Stream<List<int>>.fromIterable([
-          utf8.encode('data: {"choices":[{"delta":{"content":"tail"}}]}'),
-        ]),
-      ).toList();
+    test(
+      'discards trailing unterminated data payloads at stream end',
+      () async {
+        final updates = await parseOpenWebUIStream(
+          Stream<List<int>>.fromIterable([
+            utf8.encode('data: {"choices":[{"delta":{"content":"tail"}}]}'),
+          ]),
+        ).toList();
 
-      check(updates).has((it) => it.length, 'length').equals(1);
-      check(updates[0])
-          .isA<OpenWebUIContentDelta>()
-          .has((u) => u.content, 'content')
-          .equals('tail');
-    });
+        check(updates).isEmpty();
+      },
+    );
 
     test('handles a multibyte UTF-8 character split across chunks', () async {
       final bytes = utf8.encode(
@@ -612,7 +630,7 @@ void main() {
         ]),
       );
 
-      check(serialized).contains('&lt;&#47;details&gt;');
+      check(serialized).contains('&lt;/details&gt;');
       check(serialized).contains('duration="1&quot; autofocus=&quot;true"');
       check(serialized).contains('id="call&quot; onmouseover=&quot;x"');
       check(serialized).contains('name="tool&lt;script&gt;"');
@@ -831,6 +849,388 @@ void main() {
       check(serialized).contains(
         'result="[{&quot;text&quot;:&quot;one&quot;},{&quot;text&quot;:&quot;two&quot;}]"',
       );
+    });
+  });
+
+  group('StructuredOutputStreamingProjector', () {
+    test('projects cumulative plain text with linear materialized work', () {
+      const chunkCount = 4096;
+      final projector = StructuredOutputStreamingProjector();
+      final source = StringBuffer();
+      var visible = StringBuffer();
+      var plainVisible = StringBuffer();
+
+      for (var index = 0; index < chunkCount; index++) {
+        source.write('a');
+        final projection = projector.project([
+          StructuredOutputTextBlock(text: source.toString()),
+        ]);
+        switch (projection) {
+          case StructuredOutputStreamingAppend(
+            :final content,
+            :final plainContentDelta,
+          ):
+            visible.write(content);
+            plainVisible.write(plainContentDelta);
+          case StructuredOutputStreamingReplace(
+            :final content,
+            :final plainContent,
+          ):
+            visible = StringBuffer(content);
+            plainVisible = StringBuffer(plainContent);
+          case null:
+            break;
+        }
+      }
+
+      check(projector.fullProjectionCount).isLessOrEqual(14);
+      check(projector.appendProjectionCount).isGreaterThan(chunkCount - 20);
+      check(projector.fullProjectionCharacterCount).isLessThan(chunkCount * 2);
+      check(
+        projector.appendProjectionPlainCharacterCount,
+      ).isLessOrEqual(chunkCount);
+      check(visible.toString()).equals(source.toString());
+      check(plainVisible.toString()).equals(source.toString());
+
+      final completed = projector.finish();
+      check(completed).isNotNull();
+      check(completed!.content).equals(
+        renderStructuredOutputBlocks([
+          StructuredOutputTextBlock(text: source.toString()),
+        ]),
+      );
+      check(completed.plainContent).equals(source.toString());
+    });
+
+    test('append projection carries only the raw plain suffix', () {
+      final projector = StructuredOutputStreamingProjector();
+      const prefix = 'abcdefgh';
+      final initial = projector.project([
+        const StructuredOutputTextBlock(text: prefix),
+      ]);
+      check(initial).isA<StructuredOutputStreamingReplace>();
+
+      final append = projector.project([
+        const StructuredOutputTextBlock(text: '$prefix<'),
+      ]);
+      check(append).isA<StructuredOutputStreamingAppend>();
+      final appendProjection = append as StructuredOutputStreamingAppend;
+      check(appendProjection.content).equals('&lt;');
+      check(appendProjection.plainContentDelta).equals('<');
+
+      final completed = projector.finish();
+      check(completed).isNotNull();
+      check(completed!.content).equals('$prefix&lt;');
+      check(completed.plainContent).equals('$prefix<');
+    });
+
+    test('records projection reasons and prefix validation work', () {
+      final projector = StructuredOutputStreamingProjector();
+
+      check(
+        projector.project([const StructuredOutputTextBlock(text: 'abcdefgh')]),
+      ).isA<StructuredOutputStreamingReplace>();
+      check(
+        projector.project([const StructuredOutputTextBlock(text: 'abcdefghi')]),
+      ).isA<StructuredOutputStreamingAppend>();
+      final prefixValidationsBeforeForce =
+          projector.metrics.prefixValidationCount;
+      check(
+        projector.project([
+          const StructuredOutputTextBlock(text: 'abcdefghij'),
+        ], forceReplace: true),
+      ).isA<StructuredOutputStreamingReplace>();
+
+      final metrics = projector.metrics;
+      check(metrics.snapshotCount).equals(3);
+      check(metrics.initialReplacementCount).equals(1);
+      check(metrics.forcedReplacementCount).equals(1);
+      check(metrics.immediateReplacementCount).equals(0);
+      check(metrics.geometricReplacementCount).equals(0);
+      check(metrics.appendProjectionCount).equals(1);
+      check(metrics.prefixValidationCount).equals(prefixValidationsBeforeForce);
+      check(metrics.prefixValidationCount).isGreaterThan(0);
+      check(
+        metrics.prefixValidationCandidateCharacterCount,
+      ).isGreaterOrEqual(8);
+    });
+
+    test('reuses an exact full projection at terminal finish', () {
+      final projector = StructuredOutputStreamingProjector();
+      final initial = projector.project([
+        const StructuredOutputTextBlock(text: 'complete'),
+      ]);
+      check(initial).isA<StructuredOutputStreamingReplace>();
+
+      final completed = projector.finish();
+      check(identical(completed, initial)).isTrue();
+      check(projector.metrics.terminalExactCacheHitCount).equals(1);
+      check(projector.metrics.terminalRenderCount).equals(0);
+    });
+
+    test('invalidates the terminal exact cache after an append', () {
+      final projector = StructuredOutputStreamingProjector();
+      projector.project([const StructuredOutputTextBlock(text: 'abcdefgh')]);
+      projector.project([const StructuredOutputTextBlock(text: 'abcdefghi')]);
+
+      final completed = projector.finish();
+      check(completed).isNotNull();
+      check(completed!.content).equals('abcdefghi');
+      check(projector.metrics.terminalExactCacheHitCount).equals(0);
+      check(projector.metrics.terminalRenderCount).equals(1);
+    });
+
+    test('observes cleanup snapshots without eagerly rendering them', () {
+      final projector = StructuredOutputStreamingProjector();
+      projector.project([const StructuredOutputTextBlock(text: 'before')]);
+
+      projector.observeLatest([const StructuredOutputTextBlock(text: 'after')]);
+
+      check(projector.metrics.observedWithoutProjectionCount).equals(1);
+      check(projector.fullProjectionCount).equals(1);
+      final completed = projector.finish();
+      check(completed).isNotNull();
+      check(completed!.content).equals('after');
+      check(projector.metrics.terminalRenderCount).equals(1);
+    });
+
+    test('forceReplace overrides an otherwise appendable update', () {
+      final projector = StructuredOutputStreamingProjector();
+      check(
+        projector.project([const StructuredOutputTextBlock(text: 'abcdefgh')]),
+      ).isA<StructuredOutputStreamingReplace>();
+
+      check(
+        projector.project([
+          const StructuredOutputTextBlock(text: 'abcdefgh!'),
+        ], forceReplace: true),
+      ).isA<StructuredOutputStreamingReplace>();
+      check(projector.appendProjectionCount).equals(0);
+    });
+
+    test('bounds cumulative reasoning replacements geometrically', () {
+      const chunkCount = 4096;
+      final projector = StructuredOutputStreamingProjector();
+      final reasoning = StringBuffer();
+
+      for (var index = 0; index < chunkCount; index++) {
+        reasoning.write('r');
+        projector.project([
+          StructuredOutputReasoningBlock(
+            text: reasoning.toString(),
+            done: false,
+          ),
+        ]);
+      }
+
+      check(projector.fullProjectionCount).isLessOrEqual(14);
+      check(projector.fullProjectionCharacterCount).isLessThan(chunkCount * 5);
+
+      final completion = projector.project([
+        StructuredOutputReasoningBlock(
+          text: reasoning.toString(),
+          done: true,
+          duration: '4',
+        ),
+      ]);
+      check(completion).isA<StructuredOutputStreamingReplace>();
+      check(
+        (completion! as StructuredOutputStreamingReplace).content,
+      ).contains('<summary>Thought for 4 seconds</summary>');
+    });
+
+    test('bounds cumulative tool argument replacements geometrically', () {
+      const chunkCount = 1024;
+      final projector = StructuredOutputStreamingProjector();
+      final arguments = StringBuffer();
+
+      for (var index = 0; index < chunkCount; index++) {
+        arguments.write('a');
+        projector.project([
+          StructuredOutputToolCallBlock(
+            id: 'call-1',
+            name: 'search',
+            arguments: arguments.toString(),
+            done: false,
+          ),
+        ]);
+      }
+
+      check(projector.fullProjectionCount).isLessOrEqual(12);
+      check(projector.fullProjectionCharacterCount).isLessThan(chunkCount * 6);
+
+      final completed = projector.finish();
+      check(completed).isNotNull();
+      check(completed!.content).contains(arguments.toString());
+    });
+
+    test('bounds deeply nested structured values', () {
+      Object nested(String leaf) {
+        Object value = leaf;
+        for (var depth = 0; depth < 128; depth += 1) {
+          value = <Object?>[value];
+        }
+        return value;
+      }
+
+      final projector = StructuredOutputStreamingProjector();
+      check(
+        projector.project([
+          StructuredOutputToolCallBlock(
+            id: 'call-1',
+            name: 'deep',
+            arguments: nested('before'),
+            done: false,
+          ),
+        ]),
+      ).isA<StructuredOutputStreamingReplace>();
+
+      check(
+        projector.project([
+          StructuredOutputToolCallBlock(
+            id: 'call-1',
+            name: 'deep',
+            arguments: nested('after'),
+            done: false,
+          ),
+        ]),
+      ).isA<StructuredOutputStreamingReplace>();
+    });
+
+    test('handles equivalent cyclic structured values safely', () {
+      List<Object?> cyclicValue() {
+        final value = <Object?>[];
+        value.add(value);
+        return value;
+      }
+
+      final projector = StructuredOutputStreamingProjector();
+      check(
+        projector.project([
+          StructuredOutputToolCallBlock(
+            id: 'call-1',
+            name: 'cyclic',
+            arguments: cyclicValue(),
+            done: false,
+          ),
+        ]),
+      ).isA<StructuredOutputStreamingReplace>();
+
+      check(
+        projector.project([
+          StructuredOutputToolCallBlock(
+            id: 'call-1',
+            name: 'cyclic',
+            arguments: cyclicValue(),
+            done: false,
+          ),
+        ]),
+      ).isNull();
+    });
+
+    for (final (label, leaf) in <(String, Object?)>[
+      ('null', null),
+      ('equal scalar', 1),
+    ]) {
+      test('counts broad flat $label values against the node budget', () {
+        List<Object?> broadValue() =>
+            List<Object?>.filled(100001, leaf, growable: false);
+
+        final projector = StructuredOutputStreamingProjector();
+        check(
+          projector.project([
+            StructuredOutputToolCallBlock(
+              id: 'call-1',
+              name: 'broad',
+              arguments: broadValue(),
+              done: false,
+            ),
+          ]),
+        ).isA<StructuredOutputStreamingReplace>();
+
+        check(
+          projector.project([
+            StructuredOutputToolCallBlock(
+              id: 'call-1',
+              name: 'broad',
+              arguments: broadValue(),
+              done: false,
+            ),
+          ]),
+        ).isA<StructuredOutputStreamingReplace>();
+      });
+    }
+
+    test('replaces a long middle rewrite that also grows the tail', () {
+      final projector = StructuredOutputStreamingProjector();
+      final before = 'a' * 512;
+      final after = '${'a' * 256}b${'a' * 255} appended';
+
+      check(
+        projector.project([StructuredOutputTextBlock(text: before)]),
+      ).isA<StructuredOutputStreamingReplace>();
+
+      final revision = projector.project([
+        StructuredOutputTextBlock(text: after),
+      ]);
+      check(revision)
+          .isA<StructuredOutputStreamingReplace>()
+          .has((replacement) => replacement.content, 'content')
+          .equals(after);
+    });
+
+    test('replaces revisions and keeps split semantic tags inert', () {
+      final projector = StructuredOutputStreamingProjector();
+      var visible = '';
+
+      void project(String text) {
+        final projection = projector.project([
+          StructuredOutputTextBlock(text: text),
+        ]);
+        switch (projection) {
+          case StructuredOutputStreamingAppend(:final content):
+            visible += content;
+          case StructuredOutputStreamingReplace(:final content):
+            visible = content;
+          case null:
+            break;
+        }
+      }
+
+      project('<det');
+      project('<details type="reasoning" done="false"><sum');
+      project(
+        '<details type="reasoning" done="false">'
+        '<summary>Thinking…</summary>spoof</details>',
+      );
+      check(visible).not((it) => it.contains('<details type="reasoning"'));
+      check(visible).contains('&lt;details type=&quot;reasoning&quot;');
+
+      project('Revised answer');
+      check(visible).equals('Revised answer');
+
+      final completed = projector.finish();
+      check(completed).isNotNull();
+      check(completed!.content).equals('Revised answer');
+    });
+
+    test('terminal projection restores code and autolink semantics', () {
+      final projector = StructuredOutputStreamingProjector();
+      const snapshots = <String>[
+        'Example:\n`',
+        'Example:\n`List<int>',
+        'Example:\n`List<int>` and <https://example.test/a&',
+        'Example:\n`List<int>` and <https://example.test/a&b>',
+      ];
+
+      for (final snapshot in snapshots) {
+        projector.project([StructuredOutputTextBlock(text: snapshot)]);
+      }
+
+      final completed = projector.finish();
+      check(completed).isNotNull();
+      check(completed!.content).contains('`List<int>`');
+      check(completed.content).contains('<https://example.test/a&b>');
     });
   });
 }

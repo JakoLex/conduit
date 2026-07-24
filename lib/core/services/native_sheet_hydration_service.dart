@@ -1,13 +1,21 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:uuid/uuid.dart';
 
 import '../../features/tools/providers/tools_providers.dart';
 import '../../features/chat/providers/text_to_speech_provider.dart';
+import '../../features/chat/models/model_selector_layout.dart';
+import '../../features/chat/providers/reasoning_effort_provider.dart';
 import '../../l10n/app_localizations.dart';
 import '../../shared/theme/tweakcn_themes.dart';
 import '../models/model.dart';
+import '../models/tool.dart';
 import '../network/image_header_utils.dart';
 import '../providers/app_providers.dart';
+import '../../features/hermes/models/hermes_model.dart';
+import '../../features/hermes/providers/hermes_providers.dart';
 import '../utils/debug_logger.dart';
 import '../utils/model_icon_utils.dart';
 import '../utils/model_sort_utils.dart';
@@ -25,10 +33,42 @@ final nativeSheetAvatarBytesHydratorProvider =
       (_) => NativeSheetAvatarBytesHydrator(),
     );
 
+@visibleForTesting
+class NativeSheetHydrationGeneration {
+  int _current = 0;
+
+  int begin() => ++_current;
+
+  bool isActive(int generation) => generation == _current;
+
+  void finish(int generation) {
+    if (isActive(generation)) {
+      _current += 1;
+    }
+  }
+}
+
+@visibleForTesting
+class NativeSheetPresentationAdmission {
+  bool _active = false;
+
+  bool tryBegin() {
+    if (_active) return false;
+    _active = true;
+    return true;
+  }
+
+  void finish() => _active = false;
+}
+
 class NativeSheetHydrationService {
   NativeSheetHydrationService(this._ref);
 
   final Ref _ref;
+  final NativeSheetHydrationGeneration _modelSelectorHydration =
+      NativeSheetHydrationGeneration();
+  final NativeSheetPresentationAdmission _modelSelectorPresentation =
+      NativeSheetPresentationAdmission();
 
   Future<List<Model>> loadModels({bool refreshOnError = true}) async {
     final modelsAsync = _ref.read(modelsProvider);
@@ -51,56 +91,165 @@ class NativeSheetHydrationService {
     bool allowsPinning = false,
     bool rethrowErrors = true,
   }) async {
-    final api = _ref.read(apiServiceProvider);
-    final avatarHeaders =
-        buildImageHeadersFromContainer(
-          ProviderScope.containerOf(context, listen: false),
-        ) ??
-        const <String, String>{};
-    final l10n = AppLocalizations.of(context);
-    final pinnedModelIds = allowsPinning
-        ? _ref.read(effectivePinnedModelIdsProvider)
-        : const <String>[];
-    final orderedModels = allowsPinning
-        ? sortModelsWithPinnedOrder(models, pinnedModelIds)
-        : List<Model>.of(models, growable: false);
-    final canTogglePinnedModels =
-        allowsPinning && _ref.read(canTogglePinnedModelsProvider);
+    // Native permits only one selector at a time. Reject overlap before a
+    // second call can advance the hydration generation and silence progressive
+    // avatar updates for the selector that is already visible.
+    if (!_modelSelectorPresentation.tryBegin()) return null;
+    int? hydrationGeneration;
+    try {
+      final api = _ref.read(apiServiceProvider);
+      final container = ProviderScope.containerOf(context, listen: false);
+      final l10n = AppLocalizations.of(context);
+      final pinnedModelIds = allowsPinning
+          ? _ref.read(effectivePinnedModelIdsProvider)
+          : const <String>[];
+      // The Hermes agent has its own dedicated tab; never list it in the picker.
+      final pickerModels = models.where((m) => !isHermesModel(m)).toList();
+      final orderedModels = allowsPinning
+          ? sortModelsWithPinnedOrder(pickerModels, pinnedModelIds)
+          : List<Model>.of(pickerModels, growable: false);
+      final canTogglePinnedModels =
+          allowsPinning && _ref.read(canTogglePinnedModelsProvider);
+      final hasOpenWebUiAccount = _ref.read(openWebUiAccountAvailableProvider);
+      final localDefaultModelId = _ref.read(appSettingsProvider).defaultModel;
+      final defaultModelId = hasOpenWebUiAccount
+          ? _ref
+                    .read(personalizationSettingsProvider)
+                    .asData
+                    ?.value
+                    .defaultModelId ??
+                localDefaultModelId
+          : localDefaultModelId;
+      final layout = buildModelSelectorLayout(
+        models: orderedModels,
+        pinnedModelIds: pinnedModelIds,
+        defaultModelId: defaultModelId,
+      );
+      final effortModel = orderedModels
+          .where((model) => model.id == selectedModelId)
+          .firstOrNull;
+      final allowsCustomEffort =
+          effortModel != null &&
+          reasoningEffortAllowsCustomForModel(_ref.read, effortModel);
+      final effortOptions = effortModel == null
+          ? const <String>[]
+          : <String>[...kReasoningEffortOptions];
 
-    final modelOptions = [
-      ...leadingOptions,
-      for (final model in orderedModels)
-        NativeSheetModelOption(
-          id: model.id,
-          name: model.name,
-          subtitle: model.description,
-          avatarUrl: resolveModelIconUrlForModel(api, model),
-          avatarHeaders: avatarHeaders,
-          tags: model.modelTags,
-        ),
-    ];
+      final modelOptions = [
+        ...leadingOptions,
+        ...orderedModels.map((model) {
+          final avatarUrl = resolveModelIconUrlForModel(api, model);
+          final avatarHeaders = avatarUrl == null
+              ? const <String, String>{}
+              : buildImageHeadersForUrlFromContainer(container, avatarUrl) ??
+                    const <String, String>{};
+          return NativeSheetModelOption(
+            id: model.id,
+            name: model.name,
+            subtitle: model.description,
+            avatarUrl: avatarUrl,
+            avatarHeaders: avatarHeaders,
+            tags: model.modelTags,
+          );
+        }),
+      ];
 
-    final hydratedModelOptions = await _ref
-        .read(nativeSheetAvatarBytesHydratorProvider)
-        .hydrateModelOptions(api: api, options: modelOptions);
-    if (!context.mounted) {
-      return null;
+      // Present immediately. Same-server custom-TLS URLs are withheld from
+      // native URLSession because it cannot inherit Dart's TLS identity/trust;
+      // those rows use initials until Dart progressively supplies bytes.
+      final bridge = NativeSheetBridge.instance;
+      final avatarHydrator = _ref.read(nativeSheetAvatarBytesHydratorProvider);
+      final nativePresentationOptions = avatarHydrator
+          .prepareForNativePresentation(api: api, options: modelOptions);
+      final activeHydrationGeneration = _modelSelectorHydration.begin();
+      hydrationGeneration = activeHydrationGeneration;
+      final presentationId = const Uuid().v4();
+      final result = bridge.presentModelSelector(
+        presentationId: presentationId,
+        title: title,
+        selectedModelId: selectedModelId,
+        pinnedModelIds: pinnedModelIds,
+        featuredModelIds: <String>[
+          ...leadingOptions.map((option) => option.id),
+          ...layout.featured.map((model) => model.id),
+        ],
+        pinTitle: allowsPinning ? l10n?.pin : null,
+        unpinTitle: allowsPinning ? l10n?.unpin : null,
+        moreModelsTitle: l10n?.moreModels ?? 'More models',
+        searchModelsTitle: l10n?.searchModels ?? 'Search models',
+        reasoningEffortTitle: l10n?.reasoningEffort ?? 'Effort',
+        reasoningEffortValue: effortModel == null
+            ? kAutomaticReasoningEffort
+            : reasoningEffortForModel(_ref.read, effortModel),
+        reasoningEffortOptions: effortOptions,
+        reasoningEffortLabels: <String, String>{
+          kAutomaticReasoningEffort:
+              l10n?.ollamaThinkingAutomatic ?? 'Automatic',
+          'low': l10n?.reasoningEffortLow ?? 'Low',
+          'medium': l10n?.reasoningEffortMedium ?? 'Medium',
+          'high': l10n?.reasoningEffortHigh ?? 'High',
+          'max': l10n?.reasoningEffortMaximum ?? 'Maximum',
+        },
+        allowsCustomReasoningEffort: allowsCustomEffort,
+        customReasoningEffortTitle:
+            l10n?.customReasoningEffort ?? 'Custom effort',
+        customReasoningEffortHint:
+            l10n?.customReasoningEffortHint ?? 'Enter effort',
+        onTogglePinned: canTogglePinnedModels
+            ? (modelId) => _ref
+                  .read(personalizationSettingsProvider.notifier)
+                  .togglePinnedModel(modelId)
+            : null,
+        onReasoningEffortChanged: effortModel == null
+            ? null
+            : (value) =>
+                  setReasoningEffortForModel(_ref.read, effortModel, value),
+        models: nativePresentationOptions,
+        rethrowErrors: rethrowErrors,
+      );
+      unawaited(
+        avatarHydrator
+            .hydrateModelOptions(
+              api: api,
+              options: modelOptions,
+              maxWait: const Duration(seconds: 5),
+              onProgress: (models) {
+                if (_modelSelectorHydration.isActive(
+                  activeHydrationGeneration,
+                )) {
+                  unawaited(
+                    bridge.updateModelSelectorModels(
+                      avatarHydrator.prepareForNativePresentation(
+                        api: api,
+                        options: models,
+                      ),
+                      presentationId: presentationId,
+                    ),
+                  );
+                }
+              },
+              isActive: () =>
+                  context.mounted &&
+                  _modelSelectorHydration.isActive(activeHydrationGeneration) &&
+                  identical(_ref.read(apiServiceProvider), api),
+            )
+            .catchError((Object error, StackTrace stackTrace) {
+              DebugLogger.error(
+                'native-model-avatar-progressive-hydration-failed',
+                scope: 'native-sheet/model-avatar-hydration',
+                error: error,
+                stackTrace: stackTrace,
+              );
+              return nativePresentationOptions;
+            }),
+      );
+      return await result;
+    } finally {
+      if (hydrationGeneration != null) {
+        _modelSelectorHydration.finish(hydrationGeneration);
+      }
+      _modelSelectorPresentation.finish();
     }
-
-    return NativeSheetBridge.instance.presentModelSelector(
-      title: title,
-      selectedModelId: selectedModelId,
-      pinnedModelIds: pinnedModelIds,
-      pinTitle: allowsPinning ? l10n?.pin : null,
-      unpinTitle: allowsPinning ? l10n?.unpin : null,
-      onTogglePinned: canTogglePinnedModels
-          ? (modelId) => _ref
-                .read(personalizationSettingsProvider.notifier)
-                .togglePinnedModel(modelId)
-          : null,
-      models: hydratedModelOptions,
-      rethrowErrors: rethrowErrors,
-    );
   }
 
   Future<void> hydrateDetail(String detailId) async {
@@ -175,10 +324,13 @@ class NativeSheetHydrationService {
     String detailId = NativeSheetRoutes.about,
   }) async {
     try {
-      final packageInfoFuture = _ref.read(packageInfoProvider.future);
-      final aboutFuture = _ref.read(serverAboutInfoProvider.future);
-      final packageInfo = await packageInfoFuture;
-      final about = await aboutFuture;
+      // Hermes-only has no Open WebUI server, so skip the server lookup and omit
+      // the server name/version rows entirely.
+      final hermesOnly = _ref.read(hermesOnlyModeProvider);
+      final packageInfo = await _ref.read(packageInfoProvider.future);
+      final about = hermesOnly
+          ? null
+          : await _ref.read(serverAboutInfoProvider.future);
       if (!context.mounted) return;
 
       final appVersionLabel = packageInfo.buildNumber.isEmpty
@@ -205,20 +357,22 @@ class NativeSheetHydrationService {
               sfSymbol: 'app.badge',
               kind: NativeSheetItemKind.info,
             ),
-            NativeSheetItemConfig(
-              id: 'server-name',
-              title: l10n.serverNameLabel,
-              subtitle: serverName,
-              sfSymbol: 'server.rack',
-              kind: NativeSheetItemKind.info,
-            ),
-            NativeSheetItemConfig(
-              id: 'server-version',
-              title: l10n.serverVersionLabel,
-              subtitle: serverVersion,
-              sfSymbol: 'number',
-              kind: NativeSheetItemKind.info,
-            ),
+            if (!hermesOnly)
+              NativeSheetItemConfig(
+                id: 'server-name',
+                title: l10n.serverNameLabel,
+                subtitle: serverName,
+                sfSymbol: 'server.rack',
+                kind: NativeSheetItemKind.info,
+              ),
+            if (!hermesOnly)
+              NativeSheetItemConfig(
+                id: 'server-version',
+                title: l10n.serverVersionLabel,
+                subtitle: serverVersion,
+                sfSymbol: 'number',
+                kind: NativeSheetItemKind.info,
+              ),
             NativeSheetItemConfig(
               id: 'github',
               title: l10n.githubRepository,
@@ -310,6 +464,7 @@ class NativeSheetHydrationService {
       final models = await modelsFuture;
       if (!context.mounted) return;
 
+      final hasOpenWebUiAccount = _ref.read(openWebUiAccountAvailableProvider);
       final appSettings = _ref.read(appSettingsProvider);
       final defaultModelSubtitle =
           resolveNativeSheetModelName(models, appSettings.defaultModel) ??
@@ -341,14 +496,15 @@ class NativeSheetHydrationService {
                   : l10n.memoryDisabledDescription,
               sfSymbol: 'bookmark',
             ),
-            NativeSheetItemConfig(
-              id: 'advanced-prompt-overrides',
-              title: l10n.advancedPromptOverrides,
-              subtitle: models.isEmpty
-                  ? l10n.noAccessibleModelsFound
-                  : l10n.accessibleModelsCount(models.length),
-              sfSymbol: 'cube.box.fill',
-            ),
+            if (hasOpenWebUiAccount)
+              NativeSheetItemConfig(
+                id: 'advanced-prompt-overrides',
+                title: l10n.advancedPromptOverrides,
+                subtitle: models.isEmpty
+                    ? l10n.noAccessibleModelsFound
+                    : l10n.accessibleModelsCount(models.length),
+                sfSymbol: 'cube.box.fill',
+              ),
           ],
         ),
         detailSheets: [
@@ -372,12 +528,13 @@ class NativeSheetHydrationService {
                 ? l10n.memoryEnabledDescription
                 : l10n.memoryDisabledDescription,
           ),
-          buildNativeLoadingDetail(
-            l10n: l10n,
-            id: 'advanced-prompt-overrides',
-            title: l10n.advancedPromptOverrides,
-            subtitle: l10n.advancedPromptOverridesDescription,
-          ),
+          if (hasOpenWebUiAccount)
+            buildNativeLoadingDetail(
+              l10n: l10n,
+              id: 'advanced-prompt-overrides',
+              title: l10n.advancedPromptOverrides,
+              subtitle: l10n.advancedPromptOverridesDescription,
+            ),
         ],
       );
     } catch (error, stackTrace) {
@@ -405,6 +562,7 @@ class NativeSheetHydrationService {
       final models = await modelsFuture;
       if (!context.mounted) return;
 
+      final hasOpenWebUiAccount = _ref.read(openWebUiAccountAvailableProvider);
       await _applyNativeDetail(
         NativeSheetDetailConfig(
           id: NativeSheetRoutes.aiMemory,
@@ -425,14 +583,15 @@ class NativeSheetHydrationService {
                   : l10n.memoryDisabledDescription,
               sfSymbol: 'bookmark',
             ),
-            NativeSheetItemConfig(
-              id: 'advanced-prompt-overrides',
-              title: l10n.advancedPromptOverrides,
-              subtitle: models.isEmpty
-                  ? l10n.noAccessibleModelsFound
-                  : l10n.accessibleModelsCount(models.length),
-              sfSymbol: 'cube.box.fill',
-            ),
+            if (hasOpenWebUiAccount)
+              NativeSheetItemConfig(
+                id: 'advanced-prompt-overrides',
+                title: l10n.advancedPromptOverrides,
+                subtitle: models.isEmpty
+                    ? l10n.noAccessibleModelsFound
+                    : l10n.accessibleModelsCount(models.length),
+                sfSymbol: 'cube.box.fill',
+              ),
           ],
         ),
         detailSheets: [
@@ -450,12 +609,13 @@ class NativeSheetHydrationService {
                 ? l10n.memoryEnabledDescription
                 : l10n.memoryDisabledDescription,
           ),
-          buildNativeLoadingDetail(
-            l10n: l10n,
-            id: 'advanced-prompt-overrides',
-            title: l10n.advancedPromptOverrides,
-            subtitle: l10n.advancedPromptOverridesDescription,
-          ),
+          if (hasOpenWebUiAccount)
+            buildNativeLoadingDetail(
+              l10n: l10n,
+              id: 'advanced-prompt-overrides',
+              title: l10n.advancedPromptOverrides,
+              subtitle: l10n.advancedPromptOverridesDescription,
+            ),
         ],
       );
     } catch (error, stackTrace) {
@@ -592,10 +752,12 @@ class NativeSheetHydrationService {
   ) async {
     try {
       final platformBrightness = MediaQuery.platformBrightnessOf(context);
+      final hasOpenWebUiAccount = _ref.read(openWebUiAccountAvailableProvider);
       final modelsFuture = _ref.read(modelsProvider.future);
-      final toolsFuture = _ref.read(toolsListProvider.future);
       final models = await modelsFuture;
-      final tools = await toolsFuture;
+      final tools = hasOpenWebUiAccount
+          ? await _ref.read(toolsListProvider.future)
+          : const <Tool>[];
       if (!context.mounted) return;
 
       final appSettings = _ref.read(appSettingsProvider);
@@ -707,12 +869,13 @@ class NativeSheetHydrationService {
               subtitle: defaultModelSubtitle,
               sfSymbol: 'wand.and.stars',
             ),
-            NativeSheetItemConfig(
-              id: 'quick-pills',
-              title: quickActionsTitle,
-              subtitle: quickPillsSubtitle,
-              sfSymbol: 'bolt.fill',
-            ),
+            if (hasOpenWebUiAccount)
+              NativeSheetItemConfig(
+                id: 'quick-pills',
+                title: quickActionsTitle,
+                subtitle: quickPillsSubtitle,
+                sfSymbol: 'bolt.fill',
+              ),
             NativeSheetItemConfig(
               id: 'send-on-enter',
               title: l10n.sendOnEnter,
@@ -729,12 +892,13 @@ class NativeSheetHydrationService {
               kind: NativeSheetItemKind.toggle,
               value: appSettings.temporaryChatByDefault,
             ),
-            NativeSheetItemConfig(
-              id: 'advanced-prompt-overrides',
-              title: l10n.advancedPromptOverrides,
-              subtitle: advancedPromptSubtitle,
-              sfSymbol: 'cube.box.fill',
-            ),
+            if (hasOpenWebUiAccount)
+              NativeSheetItemConfig(
+                id: 'advanced-prompt-overrides',
+                title: l10n.advancedPromptOverrides,
+                subtitle: advancedPromptSubtitle,
+                sfSymbol: 'cube.box.fill',
+              ),
           ],
         ),
         detailSheets: [
@@ -744,18 +908,20 @@ class NativeSheetHydrationService {
             title: l10n.defaultModel,
             subtitle: l10n.autoSelectDescription,
           ),
-          buildNativeLoadingDetail(
-            l10n: l10n,
-            id: 'quick-pills',
-            title: quickActionsTitle,
-            subtitle: quickPillsSubtitle,
-          ),
-          buildNativeLoadingDetail(
-            l10n: l10n,
-            id: 'advanced-prompt-overrides',
-            title: l10n.advancedPromptOverrides,
-            subtitle: l10n.advancedPromptOverridesDescription,
-          ),
+          if (hasOpenWebUiAccount)
+            buildNativeLoadingDetail(
+              l10n: l10n,
+              id: 'quick-pills',
+              title: quickActionsTitle,
+              subtitle: quickPillsSubtitle,
+            ),
+          if (hasOpenWebUiAccount)
+            buildNativeLoadingDetail(
+              l10n: l10n,
+              id: 'advanced-prompt-overrides',
+              title: l10n.advancedPromptOverrides,
+              subtitle: l10n.advancedPromptOverridesDescription,
+            ),
         ],
       );
 
@@ -854,10 +1020,12 @@ class NativeSheetHydrationService {
   ) async {
     try {
       final platformBrightness = MediaQuery.platformBrightnessOf(context);
+      final hasOpenWebUiAccount = _ref.read(openWebUiAccountAvailableProvider);
       final modelsFuture = _ref.read(modelsProvider.future);
-      final toolsFuture = _ref.read(toolsListProvider.future);
       final models = await modelsFuture;
-      final tools = await toolsFuture;
+      final tools = hasOpenWebUiAccount
+          ? await _ref.read(toolsListProvider.future)
+          : const <Tool>[];
       if (!context.mounted) return;
       final appSettings = _ref.read(appSettingsProvider);
       final themeMode = _ref.read(appThemeModeProvider);
@@ -929,12 +1097,13 @@ class NativeSheetHydrationService {
               subtitle: transportNavLabel,
               sfSymbol: 'bubble.left.and.bubble.right.fill',
             ),
-            NativeSheetItemConfig(
-              id: 'advanced-prompt-overrides',
-              title: l10n.advancedPromptOverrides,
-              subtitle: advancedPromptSubtitle,
-              sfSymbol: 'cube.box.fill',
-            ),
+            if (hasOpenWebUiAccount)
+              NativeSheetItemConfig(
+                id: 'advanced-prompt-overrides',
+                title: l10n.advancedPromptOverrides,
+                subtitle: advancedPromptSubtitle,
+                sfSymbol: 'cube.box.fill',
+              ),
             if (socketService != null)
               NativeSheetItemConfig(
                 id: 'socket-health',
@@ -981,12 +1150,13 @@ class NativeSheetHydrationService {
                     ),
                 ],
               ),
-              NativeSheetItemConfig(
-                id: 'quick-pills',
-                title: quickActionsTitle,
-                subtitle: quickPillsSubtitle,
-                sfSymbol: 'bolt.fill',
-              ),
+              if (hasOpenWebUiAccount)
+                NativeSheetItemConfig(
+                  id: 'quick-pills',
+                  title: quickActionsTitle,
+                  subtitle: quickPillsSubtitle,
+                  sfSymbol: 'bolt.fill',
+                ),
             ],
           ),
           NativeSheetDetailConfig(
@@ -1005,12 +1175,13 @@ class NativeSheetHydrationService {
               ),
             ],
           ),
-          buildNativeLoadingDetail(
-            l10n: l10n,
-            id: 'quick-pills',
-            title: quickActionsTitle,
-            subtitle: quickPillsSubtitle,
-          ),
+          if (hasOpenWebUiAccount)
+            buildNativeLoadingDetail(
+              l10n: l10n,
+              id: 'quick-pills',
+              title: quickActionsTitle,
+              subtitle: quickPillsSubtitle,
+            ),
           NativeSheetDetailConfig(
             id: 'app-chat-settings',
             title: l10n.chatSettings,
@@ -1070,12 +1241,13 @@ class NativeSheetHydrationService {
               ),
             ],
           ),
-          buildNativeLoadingDetail(
-            l10n: l10n,
-            id: 'advanced-prompt-overrides',
-            title: l10n.advancedPromptOverrides,
-            subtitle: l10n.advancedPromptOverridesDescription,
-          ),
+          if (hasOpenWebUiAccount)
+            buildNativeLoadingDetail(
+              l10n: l10n,
+              id: 'advanced-prompt-overrides',
+              title: l10n.advancedPromptOverrides,
+              subtitle: l10n.advancedPromptOverridesDescription,
+            ),
           if (socketService != null)
             NativeSheetDetailConfig(
               id: 'socket-health',

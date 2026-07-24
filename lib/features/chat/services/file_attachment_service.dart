@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
 import 'dart:ui' as ui;
@@ -10,10 +9,11 @@ import 'package:image_picker/image_picker.dart';
 import 'package:path/path.dart' as path;
 import '../../../core/providers/app_providers.dart';
 import '../../../core/models/file_info.dart';
-import '../../../core/services/share_staging_cleanup.dart';
 import '../../../shared/utils/file_type_utils.dart';
 import '../../../core/services/worker_manager.dart';
 import '../../../core/utils/debug_logger.dart';
+import '../../direct_connections/direct_connections.dart';
+import '../../hermes/models/hermes_model.dart';
 
 /// Standard web image formats that LLMs can process directly.
 const Set<String> _standardImageFormats = {
@@ -700,9 +700,16 @@ final fileAttachmentServiceProvider = Provider<dynamic>((ref) {
     return MockFileAttachmentService();
   }
 
-  // Guard: only provide service when user is logged in
+  final selectedModel = ref.watch(selectedModelProvider);
+  final directEnabled =
+      selectedModel != null &&
+      ref.watch(directModelRegistryProvider).resolve(selectedModel) != null;
+  final hermesEnabled = selectedModel != null && isHermesModel(selectedModel);
+
+  // OpenWebUI uploads require an API, while direct/Hermes attachments are
+  // prepared locally before their provider-specific dispatch.
   final apiService = ref.watch(apiServiceProvider);
-  if (apiService == null) return null;
+  if (apiService == null && !directEnabled && !hermesEnabled) return null;
 
   return FileAttachmentService();
 });
@@ -756,16 +763,22 @@ class AttachedFilesNotifier extends Notifier<List<FileUploadState>> {
   }
 
   void removeFile(String filePath) {
-    unawaited(deleteShareStagingFile(filePath));
     state = state
         .where((fileState) => fileState.file.path != filePath)
         .toList();
   }
 
+  /// Removes only the exact attachment owner captured by an async boundary.
+  /// A newer session may reuse the same pathname with a different state object;
+  /// path-only removal would incorrectly retire that replacement.
+  bool removeFileIfIdentical(FileUploadState attachment) {
+    final hasOwner = state.any((entry) => identical(entry, attachment));
+    if (!hasOwner) return false;
+    state = state.where((entry) => !identical(entry, attachment)).toList();
+    return true;
+  }
+
   void clearAll() {
-    for (final fileState in state) {
-      unawaited(deleteShareStagingFile(fileState.file.path));
-    }
     state = [];
   }
 }

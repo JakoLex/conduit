@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
@@ -6,6 +7,7 @@ import 'package:riverpod_annotation/riverpod_annotation.dart';
 // Types are used through app_providers.dart
 import '../providers/app_providers.dart';
 import '../models/user.dart';
+import '../models/server_config.dart';
 import '../services/api_service.dart';
 import '../services/optimized_storage_service.dart';
 import '../services/worker_manager.dart';
@@ -14,8 +16,59 @@ import 'auth_cache_manager.dart';
 import 'webview_cookie_helper.dart';
 import '../utils/debug_logger.dart';
 import '../utils/user_avatar_utils.dart';
+import '../persistence/persistence_keys.dart';
+import '../persistence/preferences_store.dart';
+import 'openwebui_account_owner_marker.dart';
 
 part 'auth_state_manager.g.dart';
+
+typedef SavedCredentialAuthApiFactory =
+    ApiService Function({
+      required ServerConfig serverConfig,
+      required WorkerManager workerManager,
+    });
+
+const _newerAuthAttemptSettleGrace = Duration(milliseconds: 500);
+
+final class _AuthPublicationRolledBack implements Exception {
+  const _AuthPublicationRolledBack(this.cause);
+
+  final Object cause;
+
+  @override
+  String toString() => 'Authentication publication was rolled back';
+}
+
+enum FullAppDataClearOutcome { cleared, incomplete, ownershipYielded }
+
+/// Testable construction seam for the short-lived client used to validate
+/// saved credentials against their owning server before a silent-login commit.
+@Riverpod(keepAlive: true)
+SavedCredentialAuthApiFactory savedCredentialAuthApiFactory(Ref ref) =>
+    ({required serverConfig, required workerManager}) {
+      // Saved-credential validation deliberately uses a short-lived client,
+      // but it is still created from the configured server headers. Keep the
+      // incomplete-logout Cookie fence on that client too: otherwise silent
+      // login can reattach a surviving reverse-proxy session while logout
+      // cleanup is pending. Fail closed if provider teardown races creation.
+      bool shouldSuppressCookieHeader() {
+        try {
+          return ref.read(incompleteLogoutFenceProvider) ||
+              ref
+                  .read(incompleteLogoutFenceProvider.notifier)
+                  .desiredSuppressed;
+        } catch (_) {
+          return true;
+        }
+      }
+
+      return ApiService(
+        serverConfig: serverConfig,
+        workerManager: workerManager,
+        suppressCookieCustomHeader: shouldSuppressCookieHeader(),
+        shouldSuppressCookieCustomHeader: shouldSuppressCookieHeader,
+      );
+    };
 
 /// Comprehensive auth state representation
 @immutable
@@ -123,22 +176,91 @@ bool bootstrapShouldFallbackToUnauthenticated({
       !hasValidToken;
 }
 
+/// Runs a delayed retry reset only while it still owns the latest generation.
+@visibleForTesting
+Future<void> resetAuthRetryStateWhenCurrent({
+  required Future<void> delay,
+  required int scheduledGeneration,
+  required int Function() currentGeneration,
+  required void Function() reset,
+}) async {
+  await delay;
+  if (currentGeneration() == scheduledGeneration) reset();
+}
+
+typedef OpenWebUiCachedAccountOwnerResolution = ({
+  bool retainCachedUser,
+  bool ownerMismatch,
+});
+
+/// Resolves ownership only for the provisional cached-user auth fast path.
+///
+/// A missing marker is the expected state for installations upgrading from a
+/// version that did not persist account ownership. The cached identity can be
+/// shown provisionally while the token is validated, but it does not certify
+/// the server-scoped database: the storage-isolation barrier performs its own
+/// strict marker check and purges markerless storage before opening it.
+///
+/// Once a marker exists, any token or cached-user mismatch is explicit and the
+/// cached identity must not be published.
+@visibleForTesting
+OpenWebUiCachedAccountOwnerResolution resolveOpenWebUiCachedAccountOwner({
+  required OpenWebUiAccountOwnerMarker? marker,
+  required String token,
+  required String? cachedUserId,
+}) {
+  final normalizedCachedUserId = cachedUserId?.trim();
+  final hasScopedCachedUser =
+      normalizedCachedUserId != null && normalizedCachedUserId.isNotEmpty;
+  if (marker == null) {
+    return (retainCachedUser: hasScopedCachedUser, ownerMismatch: false);
+  }
+
+  final tokenMatches = openWebUiAccountOwnerMarkerMatchesToken(
+    marker: marker,
+    token: token,
+  );
+  if (!hasScopedCachedUser) {
+    return (retainCachedUser: false, ownerMismatch: !tokenMatches);
+  }
+
+  final ownerMatches = openWebUiAccountOwnerMarkerMatches(
+    marker: marker,
+    token: token,
+    userId: normalizedCachedUserId,
+  );
+  return (
+    retainCachedUser: ownerMatches,
+    ownerMismatch: !tokenMatches || !ownerMatches,
+  );
+}
+
 /// Unified auth state manager - single source of truth for all auth operations
 @Riverpod(keepAlive: true)
 class AuthStateManager extends _$AuthStateManager {
   final AuthCacheManager _cacheManager = AuthCacheManager();
   Future<bool>? _silentLoginFuture;
   int _authAttemptRevision = 0;
+  int _authAttemptSafetyEpoch = 0;
+  int _sessionSafetyEpoch = 0;
+  int? _lastTransactionalSessionRevision;
+  final List<String> _recentlyRevokedTokens = <String>[];
+  int _activeLogoutOperations = 0;
+  AuthState _lastSettledState = const AuthState(status: AuthStatus.initial);
 
   // Prevent infinite retry loops
   int _retryCount = 0;
   static const int _maxRetries = 3;
   DateTime? _lastRetryTime;
+  int _retryResetGeneration = 0;
 
   AuthState get _current =>
       state.asData?.value ?? const AuthState(status: AuthStatus.initial);
 
-  int _beginAuthAttempt() => ++_authAttemptRevision;
+  int _beginAuthAttempt() {
+    _authAttemptSafetyEpoch = _sessionSafetyEpoch;
+    return ++_authAttemptRevision;
+  }
 
   /// True when a newer auth attempt (login / logout / token-invalidation, each
   /// of which calls [_beginAuthAttempt]) has started since [attemptRevision] was
@@ -146,30 +268,34 @@ class AuthStateManager extends _$AuthStateManager {
   /// persisting a token or publishing state so a slow attempt can't overwrite a
   /// newer one's result.
   bool _authAttemptSuperseded(int attemptRevision) =>
-      !ref.mounted || _authAttemptRevision != attemptRevision;
+      !ref.mounted ||
+      _authAttemptRevision != attemptRevision ||
+      _authAttemptSafetyEpoch != _sessionSafetyEpoch;
 
-  /// Rolls back a superseded foreground login's persisted writes: value-match
-  /// deletes the token (and remembered credentials) it just wrote, so the next
-  /// cold start can't restore the rejected session. Value-matched so a newer
-  /// login's writes are never clobbered.
-  Future<void> _rollbackUncommittedLoginWrites({
-    required OptimizedStorageService storage,
-    required String token,
-    Map<String, String>? credentials,
-  }) async {
-    try {
-      await storage.deleteAuthTokenIfMatches(token);
-      if (credentials != null) {
-        await storage.deleteSavedCredentialsIfMatches(credentials);
-      }
-    } catch (error, stack) {
-      DebugLogger.error(
-        'superseded-login-rollback-failed',
-        scope: 'auth/state',
-        error: error,
-        stackTrace: stack,
-      );
+  void _resolveAbortedAuthAttempt(int attemptRevision) {
+    // A disposed notifier no longer owns an API provider. In particular, do
+    // not touch `ref` while resolving a late validation continuation.
+    if (!ref.mounted) return;
+    if (_authAttemptRevision != attemptRevision) {
+      _restoreApiServiceTokenToCurrent();
+      return;
     }
+
+    final current = _current;
+    if (!current.isLoading && current.status != AuthStatus.loading) {
+      // The owned attempt already published its terminal credential/network
+      // error. Abort resolution is only the fallback for a state still stuck
+      // in loading and must not erase that actionable result.
+      return;
+    }
+
+    // A current attempt can abort because its server ownership changed even
+    // when no newer auth attempt bumped the auth revision. Never restore the
+    // loading state's old token onto the newly selected API origin; settle the
+    // owned attempt explicitly and rebuild the API client tokenless.
+    _set(const AuthState(status: AuthStatus.unauthenticated, isLoading: false));
+    _updateApiServiceToken(null);
+    ref.invalidate(apiServiceProvider);
   }
 
   /// `_validateIssuedToken` installs the candidate token on the shared
@@ -200,67 +326,158 @@ class AuthStateManager extends _$AuthStateManager {
     return canCommitNow;
   }
 
-  Future<void> _restoreStaleSilentLoginPersistence({
-    required OptimizedStorageService storage,
-    required String staleServerId,
-    required String? previousServerId,
-    required String staleToken,
-    required String? previousToken,
+  Future<ServerSessionOwnershipSnapshot> _captureLoginServerOwnership(
+    OptimizedStorageService storage,
+    ApiService api, {
+    required bool requireActive,
   }) async {
-    try {
-      final stateToken = _current.hasValidToken ? _current.token : null;
-      final replacementToken = stateToken ?? previousToken;
-      // Atomic value-matched restore: only entries that still hold the stale
-      // token/server are reverted, so a newer login's writes aren't clobbered.
-      await storage.restoreActiveServerAndTokenIfStale(
-        staleServerId: staleServerId,
-        previousServerId: previousServerId,
-        staleToken: staleToken,
-        replacementToken: replacementToken,
+    final ownership = await storage.captureServerSessionOwnership(
+      validatedConfig: api.serverConfig,
+      requireActive: requireActive,
+    );
+    if (ownership == null) {
+      throw Exception(
+        'Server configuration changed during authentication. Please retry.',
       );
+    }
+    return ownership;
+  }
 
-      ref.invalidate(activeServerProvider);
-      ref.invalidate(apiServiceProvider);
-    } catch (error, stack) {
-      DebugLogger.error(
-        'stale-silent-login-restore-failed',
-        scope: 'auth/state',
-        error: error,
-        stackTrace: stack,
+  Future<bool> _commitValidatedExistingServerSession({
+    required OptimizedStorageService storage,
+    required ServerSessionOwnershipSnapshot ownership,
+    required String token,
+    required User user,
+    required int attemptRevision,
+    Map<String, String>? rememberedCredentials,
+    bool invalidateServerProviders = false,
+  }) async {
+    final previousState =
+        _current.isLoading || _current.status == AuthStatus.loading
+        ? _lastSettledState
+        : _current;
+    final publicationSafetyEpoch = _sessionSafetyEpoch;
+    var publicationAttempted = false;
+    try {
+      return await storage.commitExistingServerSession(
+        ownership: ownership,
+        token: token,
+        rememberedCredentials: rememberedCredentials,
+        canCommit: () => !_authAttemptSuperseded(attemptRevision),
+        onRollbackUncertain: () {
+          if (!ref.mounted) return;
+          _poisonUncertainServerSession(failedAttemptRevision: attemptRevision);
+        },
+        publish: () {
+          publicationAttempted = true;
+          return _publishCommittedAuthenticatedSession(
+            attemptRevision: attemptRevision,
+            candidateToken: token,
+            publish: () {
+              _setIncompleteLogoutFenceInMemory(false);
+              _updateApiServiceToken(token);
+              if (invalidateServerProviders) {
+                ref.invalidate(activeServerProvider);
+                ref.invalidate(apiServiceProvider);
+              }
+              if (_authAttemptSuperseded(attemptRevision)) {
+                throw StateError(
+                  'Authentication attempt was superseded during publication.',
+                );
+              }
+              _lastTransactionalSessionRevision = attemptRevision;
+              // Auth state is the final externally observable commit point. No
+              // stale ownership metadata may be written after listeners run.
+              _update(
+                (current) => current.copyWith(
+                  status: AuthStatus.authenticated,
+                  token: token,
+                  user: user,
+                  isLoading: false,
+                  clearError: true,
+                ),
+                cache: true,
+              );
+            },
+          );
+        },
       );
+    } catch (error, stackTrace) {
+      if (publicationAttempted &&
+          _restoreRolledBackAuthPublication(
+            attemptRevision: attemptRevision,
+            capturedSessionSafetyEpoch: publicationSafetyEpoch,
+            previousState: previousState,
+          ) &&
+          error is! ServerConfigSessionRollbackException) {
+        Error.throwWithStackTrace(
+          _AuthPublicationRolledBack(error),
+          stackTrace,
+        );
+      }
+      Error.throwWithStackTrace(error, stackTrace);
     }
   }
 
   void _set(AuthState next, {bool cache = false}) {
     final storage = ref.read(optimizedStorageServiceProvider);
-    if (next.user != null && next.isAuthenticated) {
-      // Persist user and avatar asynchronously without blocking state update
-      unawaited(_persistUserWithAvatar(next, storage));
-    } else if (_shouldClearPersistedUser(next)) {
+    final shouldPersistAuthenticatedUser =
+        next.user != null && next.isAuthenticated;
+    final shouldClearPersistedUser =
+        !shouldPersistAuthenticatedUser && _shouldClearPersistedUser(next);
+    final userCacheAttemptRevision = _authAttemptRevision;
+    final userCacheSafetyEpoch = _sessionSafetyEpoch;
+    if (!next.isLoading && next.status != AuthStatus.loading) {
+      _lastSettledState = next;
+    }
+    // Riverpod listeners run synchronously during this assignment. Any cache
+    // derived from the publication must therefore be fenced after listeners
+    // have had a chance to replace it or start a newer auth operation.
+    state = AsyncValue.data(next);
+    // Publish token/user removal before starting durable cleanup. A rejected
+    // bearer must stop authorizing live requests immediately even when the
+    // Keychain/Drift cleanup is slow or fails.
+    final stillOwnsPersistedUserClear =
+        shouldClearPersistedUser &&
+        ref.mounted &&
+        _authAttemptRevision == userCacheAttemptRevision &&
+        _sessionSafetyEpoch == userCacheSafetyEpoch &&
+        !_current.hasValidToken &&
+        _current.user == null;
+    if (stillOwnsPersistedUserClear) {
       unawaited(
         storage.saveLocalUser(null).onError((error, stack) {
-          DebugLogger.error(
-            'Failed to clear local user on logout',
-            scope: 'auth/persistence',
-            error: error,
-            stackTrace: stack,
-          );
-        }),
-      );
-      unawaited(
-        storage.saveLocalUserAvatar(null).onError((error, stack) {
-          DebugLogger.error(
-            'Failed to clear local user avatar on logout',
-            scope: 'auth/persistence',
-            error: error,
+          _logAuthenticationFailure(
+            'local-user-clear-failed',
+            error,
             stackTrace: stack,
           );
         }),
       );
     }
-    state = AsyncValue.data(next);
-    if (cache) {
+    final stillOwnsAuthenticatedPublication =
+        shouldPersistAuthenticatedUser &&
+        _ownsUserCachePersistence(
+          next,
+          attemptRevision: userCacheAttemptRevision,
+          safetyEpoch: userCacheSafetyEpoch,
+        );
+    if (cache && stillOwnsAuthenticatedPublication) {
       _cacheManager.cacheAuthState(next);
+    }
+    if (stillOwnsAuthenticatedPublication) {
+      // Riverpod listeners run synchronously during the assignment above. They
+      // may immediately start logout, rotate accounts, or replace this state.
+      // Start the durable cache write only after publication, and fence it to
+      // the exact auth operation/session that is still current.
+      unawaited(
+        _persistUserWithAvatar(
+          next,
+          storage,
+          attemptRevision: userCacheAttemptRevision,
+          safetyEpoch: userCacheSafetyEpoch,
+        ),
+      );
     }
   }
 
@@ -271,11 +488,39 @@ class AuthStateManager extends _$AuthStateManager {
         next.status == AuthStatus.credentialError;
   }
 
+  void _publishTokenlessAuthRejection({
+    required AuthStatus status,
+    String? error,
+    required bool isLoading,
+  }) {
+    _lastTransactionalSessionRevision = null;
+    _updateApiServiceToken(null);
+    _update(
+      (current) => current.copyWith(
+        status: status,
+        error: error,
+        isLoading: isLoading,
+        clearToken: true,
+        clearUser: true,
+        clearError: error == null,
+      ),
+    );
+  }
+
   Future<void> _persistUserWithAvatar(
     AuthState authState,
-    OptimizedStorageService storage,
-  ) async {
+    OptimizedStorageService storage, {
+    required int attemptRevision,
+    required int safetyEpoch,
+  }) async {
     try {
+      if (!_ownsUserCachePersistence(
+        authState,
+        attemptRevision: attemptRevision,
+        safetyEpoch: safetyEpoch,
+      )) {
+        return;
+      }
       final api = ref.read(apiServiceProvider);
       final user = authState.user!;
       final resolvedAvatar = resolveUserProfileImageUrl(
@@ -286,18 +531,40 @@ class AuthStateManager extends _$AuthStateManager {
           resolvedAvatar != null && resolvedAvatar != user.profileImage
           ? user.copyWith(profileImage: resolvedAvatar)
           : user;
-      await storage.saveLocalUser(userWithAvatar);
-      if (resolvedAvatar != null) {
-        await storage.saveLocalUserAvatar(resolvedAvatar);
+      // Keep this check immediately adjacent to the storage call. The storage
+      // service serializes user writes with auth cleanup, so a write admitted
+      // here completes before any later logout/account transition can clear or
+      // replace it; a continuation that lost ownership never enters the queue.
+      if (!_ownsUserCachePersistence(
+        authState,
+        attemptRevision: attemptRevision,
+        safetyEpoch: safetyEpoch,
+      )) {
+        return;
       }
-    } catch (error, stack) {
-      DebugLogger.error(
-        'Failed to persist user with avatar',
-        scope: 'auth/persistence',
-        error: error,
-        stackTrace: stack,
+      await storage.saveLocalUserWithAvatar(
+        userWithAvatar,
+        avatarUrl: resolvedAvatar,
       );
+    } catch (error) {
+      _logAuthenticationFailure('local-user-persist-failed', error);
     }
+  }
+
+  bool _ownsUserCachePersistence(
+    AuthState expected, {
+    required int attemptRevision,
+    required int safetyEpoch,
+  }) {
+    if (!ref.mounted ||
+        _authAttemptRevision != attemptRevision ||
+        _sessionSafetyEpoch != safetyEpoch) {
+      return false;
+    }
+    final current = _current;
+    return current.isAuthenticated &&
+        current.token == expected.token &&
+        current.user == expected.user;
   }
 
   void _update(
@@ -310,37 +577,123 @@ class AuthStateManager extends _$AuthStateManager {
 
   @override
   Future<AuthState> build() async {
-    await _initialize();
+    final attemptRevision = _beginAuthAttempt();
+    await _initialize(attemptRevision: attemptRevision);
     return _current;
   }
 
   /// Initialize auth state from storage
-  Future<void> _initialize() async {
+  Future<void> _initialize({
+    required int attemptRevision,
+    int? inheritedTransactionalRevision,
+    String? inheritedTransactionalToken,
+  }) async {
+    if (_authAttemptSuperseded(attemptRevision)) return;
     _update(
       (current) =>
           current.copyWith(status: AuthStatus.loading, isLoading: true),
     );
+    if (_authAttemptSuperseded(attemptRevision)) return;
+
+    final canInheritTransactionalOwnership =
+        inheritedTransactionalRevision != null &&
+        inheritedTransactionalToken != null;
+
+    void clearInheritedTransactionalOwnership() {
+      if (!canInheritTransactionalOwnership ||
+          _authAttemptSuperseded(attemptRevision)) {
+        return;
+      }
+      if (_lastTransactionalSessionRevision == inheritedTransactionalRevision) {
+        _lastTransactionalSessionRevision = null;
+      }
+    }
+
+    bool promoteInheritedTransactionalOwnershipIfSessionStillIntact() {
+      if (!canInheritTransactionalOwnership ||
+          _authAttemptSuperseded(attemptRevision) ||
+          _lastTransactionalSessionRevision != inheritedTransactionalRevision) {
+        return false;
+      }
+      final current = _current;
+      if (current.token != inheritedTransactionalToken ||
+          !current.hasValidToken ||
+          current.user == null) {
+        return false;
+      }
+      _lastTransactionalSessionRevision = attemptRevision;
+      return true;
+    }
 
     try {
       final storage = ref.read(optimizedStorageServiceProvider);
 
-      // On cold start, secure storage (iOS Keychain) can be slow or
-      // transiently fail. Retry a few times before giving up to avoid
-      // incorrectly showing the sign-in page.
-      String? token;
-      const maxAttempts = 3;
-      for (var attempt = 1; attempt <= maxAttempts; attempt++) {
-        token = await storage.getAuthToken();
-        if (token != null) break;
-
-        // Only retry if this might be a cold start issue
-        if (attempt < maxAttempts) {
-          DebugLogger.auth(
-            'Token read returned null, retrying ($attempt/$maxAttempts)',
+      // A logout begins by durably fencing restoration before any remote or
+      // local cleanup. If the prior process died mid-sign-out, never restore a
+      // surviving bearer or saved credential. Retry the token/config scrub and
+      // remain explicitly signed out if secure storage is still unavailable.
+      final logoutFence = ref.read(incompleteLogoutFenceProvider.notifier);
+      if (logoutFence.desiredSuppressed ||
+          ref.read(incompleteLogoutFenceProvider) ||
+          PreferencesStore.getBool(PreferenceKeys.incompleteLogoutFence) ==
+              true) {
+        clearInheritedTransactionalOwnership();
+        _updateApiServiceToken(null);
+        _setIncompleteLogoutFenceInMemory(true);
+        try {
+          await storage.clearAuthData();
+        } catch (error) {
+          if (_authAttemptSuperseded(attemptRevision)) return;
+          _logAuthenticationFailure('incomplete-logout-recovery-failed', error);
+          _set(
+            const AuthState(
+              status: AuthStatus.unauthenticated,
+              isLoading: false,
+              error: 'Sign out did not finish. Please try again.',
+            ),
           );
-          // Exponential backoff: 50ms, 100ms
-          await Future.delayed(Duration(milliseconds: 50 * attempt));
+          return;
         }
+        if (_authAttemptSuperseded(attemptRevision)) return;
+        final webViewDataCleared =
+            await WebViewCookieHelper.ensurePendingLogoutDataCleared();
+        if (_authAttemptSuperseded(attemptRevision)) return;
+        if (!webViewDataCleared) {
+          _set(
+            const AuthState(
+              status: AuthStatus.unauthenticated,
+              isLoading: false,
+              error: 'Sign out did not finish. Please try again.',
+            ),
+          );
+          return;
+        }
+
+        const safeState = AuthState(
+          status: AuthStatus.unauthenticated,
+          isLoading: false,
+        );
+        clearInheritedTransactionalOwnership();
+        _set(safeState);
+        _updateApiServiceToken(null);
+        _clearIncompleteLogoutFenceAfterTokenlessCleanup();
+        ref.invalidate(serverConfigsProvider);
+        ref.invalidate(activeServerProvider);
+        ref.invalidate(apiServiceProvider);
+        return;
+      }
+
+      // A confirmed missing token is the normal signed-out state and should
+      // not pay retry delays. The strict storage read retries only actual
+      // transient Keychain failures and propagates an exhausted failure.
+      final token = await storage.getAuthTokenStrict();
+      if (_authAttemptSuperseded(attemptRevision)) return;
+      final inheritsTransactionalOwnership =
+          canInheritTransactionalOwnership &&
+          token == inheritedTransactionalToken &&
+          _lastTransactionalSessionRevision == inheritedTransactionalRevision;
+      if (!inheritsTransactionalOwnership) {
+        clearInheritedTransactionalOwnership();
       }
 
       if (token != null && token.isNotEmpty) {
@@ -349,16 +702,16 @@ class AuthStateManager extends _$AuthStateManager {
         // Check if stored token is an API key - force logout if so
         if (TokenValidator.isApiKey(token)) {
           DebugLogger.auth('Detected API key token, forcing logout');
-          await storage.deleteAuthToken();
-          await storage.deleteSavedCredentials();
-          _update(
-            (current) => current.copyWith(
-              status: AuthStatus.credentialError,
-              error: 'apiKeyNoLongerSupported',
-              isLoading: false,
-              clearToken: true,
-            ),
+          clearInheritedTransactionalOwnership();
+          _publishTokenlessAuthRejection(
+            status: AuthStatus.credentialError,
+            error: 'apiKeyNoLongerSupported',
+            isLoading: false,
           );
+          final cleared = await storage.clearAuthDataIf(
+            canClear: () => !_authAttemptSuperseded(attemptRevision),
+          );
+          if (!cleared || _authAttemptSuperseded(attemptRevision)) return;
           return;
         }
 
@@ -366,31 +719,49 @@ class AuthStateManager extends _$AuthStateManager {
         final formatOk = _isValidTokenFormat(token);
         if (formatOk) {
           _updateApiServiceToken(token);
-          await _activateCachedTokenSession(
+          final activated = await _activateCachedTokenSession(
             storage: storage,
             token: token,
             reason: 'stored-token-fast-path',
+            attemptRevision: attemptRevision,
+            inheritedTransactionalRevision: inheritsTransactionalOwnership
+                ? inheritedTransactionalRevision
+                : null,
           );
-          _validateStoredTokenInBackground(storage: storage, token: token);
+          if (!activated || _authAttemptSuperseded(attemptRevision)) return;
+          _validateStoredTokenInBackground(
+            token: token,
+            inheritedTransactionalRevision: inheritsTransactionalOwnership
+                ? inheritedTransactionalRevision
+                : null,
+          );
           return;
         } else {
           // Token format invalid; clear and require login
           DebugLogger.auth('Token format invalid, deleting token');
-          await storage.deleteAuthToken();
-          _update(
-            (current) => current.copyWith(
-              status: AuthStatus.unauthenticated,
-              isLoading: false,
-              clearToken: true,
-              clearError: true,
-            ),
+          clearInheritedTransactionalOwnership();
+          _publishTokenlessAuthRejection(
+            status: AuthStatus.unauthenticated,
+            isLoading: false,
           );
+          await storage.deleteAuthTokenIfMatches(token);
+          if (_authAttemptSuperseded(attemptRevision)) return;
         }
       } else {
-        // No token found after retries. Check if we have saved credentials
-        // and attempt silent login immediately to avoid showing sign-in page.
-        final hasCreds = await storage.hasCredentials();
-        if (hasCreds) {
+        // A strict missing-token result rejects any inherited live session.
+        // Clear the shared client and in-memory user before the slower saved
+        // credential lookup/cleanup path can yield.
+        clearInheritedTransactionalOwnership();
+        _publishTokenlessAuthRejection(
+          status: AuthStatus.loading,
+          isLoading: true,
+        );
+        // Snapshot saved credentials once through the strict Keychain path.
+        // A transient failure must not be cached as absence, and the exact
+        // snapshot is passed into bootstrap so it is not re-read/raced.
+        final savedCredentials = await storage.getSavedCredentialsStrict();
+        if (_authAttemptSuperseded(attemptRevision)) return;
+        if (savedCredentials != null) {
           DebugLogger.auth(
             'No token but credentials exist - starting background silent login',
           );
@@ -407,7 +778,7 @@ class AuthStateManager extends _$AuthStateManager {
               clearError: true,
             ),
           );
-          unawaited(_bootstrapSilentLogin());
+          unawaited(_bootstrapSilentLogin(savedCredentials));
           return;
         }
         // No credentials - set to unauthenticated
@@ -422,23 +793,57 @@ class AuthStateManager extends _$AuthStateManager {
         );
       }
     } catch (e) {
-      DebugLogger.error('auth-init-failed', scope: 'auth/state', error: e);
+      if (_authAttemptSuperseded(attemptRevision)) return;
+      if (!promoteInheritedTransactionalOwnershipIfSessionStillIntact()) {
+        clearInheritedTransactionalOwnership();
+      }
+      _logAuthenticationFailure('auth-init-failed', e);
       _update(
         (current) => current.copyWith(
           status: AuthStatus.error,
-          error: 'Failed to initialize auth: $e',
+          error: 'Failed to initialize authentication',
           isLoading: false,
         ),
       );
     }
   }
 
-  Future<void> _activateCachedTokenSession({
+  Future<bool> _activateCachedTokenSession({
     required OptimizedStorageService storage,
     required String token,
     required String reason,
+    required int attemptRevision,
+    int? inheritedTransactionalRevision,
   }) async {
-    final cachedUser = await _readCachedUserWithAvatar(storage);
+    var cachedUser = await _readCachedUserWithAvatar(storage);
+    if (_authAttemptSuperseded(attemptRevision)) return false;
+    final serverId = PreferencesStore.getString(PreferenceKeys.activeServerId);
+    final marker = serverId == null || serverId.isEmpty
+        ? null
+        : ref.read(openWebUiAccountOwnerMarkerStoreProvider).read(serverId);
+    final ownerResolution = resolveOpenWebUiCachedAccountOwner(
+      marker: marker,
+      token: token,
+      cachedUserId: cachedUser?.id,
+    );
+    ref
+        .read(openWebUiCachedAccountOwnerMismatchProvider.notifier)
+        .set(ownerResolution.ownerMismatch);
+    if (!ownerResolution.retainCachedUser) {
+      cachedUser = null;
+      if (ownerResolution.ownerMismatch) {
+        DebugLogger.warning(
+          'cached-account-owner-mismatch',
+          scope: 'auth/state',
+          data: {'hasServer': serverId != null, 'hasMarker': marker != null},
+        );
+      } else {
+        DebugLogger.log(
+          'cached-account-user-awaiting-validation',
+          scope: 'auth/state',
+        );
+      }
+    }
     DebugLogger.auth(
       'cached-token-session-activated',
       scope: 'auth/state',
@@ -459,7 +864,12 @@ class AuthStateManager extends _$AuthStateManager {
           clearError: true,
         ),
       );
-      return;
+      return true;
+    }
+    if (_authAttemptSuperseded(attemptRevision)) return false;
+    if (inheritedTransactionalRevision != null &&
+        _lastTransactionalSessionRevision == inheritedTransactionalRevision) {
+      _lastTransactionalSessionRevision = attemptRevision;
     }
     _update(
       (current) => current.copyWith(
@@ -471,6 +881,7 @@ class AuthStateManager extends _$AuthStateManager {
       ),
       cache: true,
     );
+    return true;
   }
 
   /// Terminal resolution for the no-cached-user bootstrap when background
@@ -499,102 +910,122 @@ class AuthStateManager extends _$AuthStateManager {
   }
 
   void _validateStoredTokenInBackground({
-    required OptimizedStorageService storage,
     required String token,
+    int? inheritedTransactionalRevision,
   }) {
+    final validationRevision = _authAttemptRevision;
+    final validationSafetyEpoch = _sessionSafetyEpoch;
+
+    bool stillOwnsValidation() {
+      if (!ref.mounted ||
+          _authAttemptRevision != validationRevision ||
+          _sessionSafetyEpoch != validationSafetyEpoch) {
+        return false;
+      }
+      final current = _current;
+      return current.token == token && current.hasValidToken;
+    }
+
+    void clearUnpromotedInheritedOwnership() {
+      if (inheritedTransactionalRevision != null &&
+          _lastTransactionalSessionRevision == inheritedTransactionalRevision) {
+        _lastTransactionalSessionRevision = null;
+      }
+    }
+
     unawaited(
       Future<void>(() async {
-        try {
-          final apiReady = await _waitForApiReadiness(
-            timeout: const Duration(seconds: 10),
-          );
-          if (!ref.mounted) return;
+        // Cold starts behind slow tunnels (for example Cloudflare) can keep
+        // the API service or the first /auths request failing transiently for
+        // several seconds. Retry for roughly seven seconds in total before
+        // resolving the no-cached-user bootstrap to re-login, mirroring the
+        // pre-hardening 10s API-readiness wait.
+        const retryDelays = <Duration>[
+          Duration.zero,
+          Duration(milliseconds: 200),
+          Duration(milliseconds: 500),
+          Duration(seconds: 1),
+          Duration(seconds: 2),
+          Duration(seconds: 3),
+        ];
+        Object? lastTransientError;
 
-          if (!apiReady) {
-            DebugLogger.auth(
-              'API not reachable during background auth validation',
-            );
-            _failBootstrapWithoutCachedUser(token);
-            return;
-          }
+        for (var attempt = 0; attempt < retryDelays.length; attempt++) {
+          final delay = retryDelays[attempt];
+          if (delay > Duration.zero) await Future<void>.delayed(delay);
+          if (!stillOwnsValidation()) return;
 
           final api = ref.read(apiServiceProvider);
-          final user = await api?.getCurrentUser(
-            suppressAuthFailureNotification: true,
-          );
-          if (!ref.mounted) return;
-
-          if (user == null) {
-            DebugLogger.auth(
-              'Background auth validation skipped: API service unavailable',
+          if (api == null || api.authToken != token) {
+            lastTransientError = StateError(
+              'API service unavailable for the stored auth session',
             );
-            _failBootstrapWithoutCachedUser(token);
-            return;
+            continue;
           }
 
-          final current = _current;
-          if (current.token != token || !current.hasValidToken) {
-            DebugLogger.auth(
-              'Background auth validation ignored stale token result',
+          final authSnapshot = api.captureAuthSnapshot();
+          try {
+            final user = await api.getCurrentUser(
+              suppressAuthFailureNotification: true,
+              authSnapshot: authSnapshot,
             );
-            return;
-          }
-
-          _update(
-            (current) => current.copyWith(
-              status: AuthStatus.authenticated,
-              token: token,
-              user: user,
-              isLoading: false,
-              clearError: true,
-            ),
-            cache: true,
-          );
-
-          _preloadDefaultModel();
-        } catch (error) {
-          if (!ref.mounted) return;
-          if (_isConfirmedAuthFailure(error)) {
-            final current = _current;
-            if (current.token != token || !current.hasValidToken) {
+            if (!stillOwnsValidation()) {
               DebugLogger.auth(
-                'Background auth validation ignored stale token failure',
+                'Background auth validation ignored stale token result',
               );
               return;
             }
-            DebugLogger.auth('Stored token rejected during background check');
-            await onTokenInvalidated();
-            return;
-          }
 
-          DebugLogger.warning(
-            'background-auth-validation-deferred',
-            scope: 'auth/state',
-            data: {'error': error.toString()},
-          );
-          // A transient (non-auth) failure must not strand the no-cached-user
-          // bootstrap on the loading state forever; resolve it to re-login.
-          _failBootstrapWithoutCachedUser(token);
+            if (inheritedTransactionalRevision != null &&
+                _lastTransactionalSessionRevision ==
+                    inheritedTransactionalRevision) {
+              _lastTransactionalSessionRevision = validationRevision;
+            }
+
+            _update(
+              (current) => current.copyWith(
+                status: AuthStatus.authenticated,
+                token: token,
+                user: user,
+                isLoading: false,
+                clearError: true,
+              ),
+              cache: true,
+            );
+
+            return;
+          } catch (error) {
+            if (!stillOwnsValidation()) return;
+            if (_isConfirmedAuthFailure(error)) {
+              DebugLogger.auth('Stored token rejected during background check');
+              clearUnpromotedInheritedOwnership();
+              await onTokenInvalidated();
+              return;
+            }
+
+            lastTransientError = error;
+          }
         }
+
+        if (!stillOwnsValidation()) return;
+        if (lastTransientError != null) {
+          _logAuthenticationFailure(
+            'background-auth-validation-deferred',
+            lastTransientError,
+          );
+        }
+        // A transient (non-auth) failure must not strand the no-cached-user
+        // bootstrap on the loading state forever; resolve it to re-login.
+        if (_current.user == null) {
+          clearUnpromotedInheritedOwnership();
+        }
+        _failBootstrapWithoutCachedUser(token);
       }),
     );
   }
 
-  Future<User?> _readCachedUserWithAvatar(
-    OptimizedStorageService storage,
-  ) async {
-    final cachedUser = await storage.getLocalUser();
-    if (cachedUser == null) return null;
-
-    final cachedAvatar = await storage.getLocalUserAvatar();
-    if (cachedAvatar == null ||
-        cachedAvatar.isEmpty ||
-        cachedUser.profileImage == cachedAvatar) {
-      return cachedUser;
-    }
-
-    return cachedUser.copyWith(profileImage: cachedAvatar);
-  }
+  Future<User?> _readCachedUserWithAvatar(OptimizedStorageService storage) =>
+      storage.getLocalUserWithAvatar();
 
   /// Perform login with JWT token.
   ///
@@ -607,6 +1038,7 @@ class AuthStateManager extends _$AuthStateManager {
     String apiKey, {
     bool rememberCredentials = false,
     String authType = 'token',
+    ServerConfig? expectedServerConfig,
     bool showLoading = true,
     bool publishErrors = true,
   }) {
@@ -614,15 +1046,360 @@ class AuthStateManager extends _$AuthStateManager {
       apiKey,
       rememberCredentials: rememberCredentials,
       authType: authType,
+      expectedServerConfig: expectedServerConfig,
       showLoading: showLoading,
       publishErrors: publishErrors,
     );
+  }
+
+  /// Selects a newly verified server while making both durable and in-memory
+  /// auth tokenless before the new API provider can be observed.
+  Future<void> selectUnauthenticatedServerConfig(ServerConfig config) async {
+    final currentState = _current;
+    final previousState =
+        currentState.isLoading || currentState.status == AuthStatus.loading
+        ? _lastSettledState
+        : currentState;
+    final capturedSessionSafetyEpoch = _sessionSafetyEpoch;
+    final attemptRevision = _beginAuthAttempt();
+    final storage = ref.read(optimizedStorageServiceProvider);
+    try {
+      await storage.selectUnauthenticatedServerConfig(
+        config,
+        canCommit: () => !_authAttemptSuperseded(attemptRevision),
+        onRollbackUncertain: () {
+          if (!ref.mounted) return;
+          _poisonUncertainServerSession(failedAttemptRevision: attemptRevision);
+        },
+        publish: () {
+          if (_authAttemptSuperseded(attemptRevision)) {
+            throw StateError(
+              'Server selection was superseded before publication.',
+            );
+          }
+          const safeState = AuthState(
+            status: AuthStatus.unauthenticated,
+            isLoading: false,
+          );
+          _lastSettledState = safeState;
+          _lastTransactionalSessionRevision = null;
+          _set(safeState);
+          if (_authAttemptSuperseded(attemptRevision)) {
+            throw StateError(
+              'Server selection was superseded during publication.',
+            );
+          }
+          _updateApiServiceToken(null);
+          ref.invalidate(serverConfigsProvider);
+          if (_authAttemptSuperseded(attemptRevision)) {
+            throw StateError(
+              'Server selection was superseded during publication.',
+            );
+          }
+          ref.invalidate(activeServerProvider);
+          if (_authAttemptSuperseded(attemptRevision)) {
+            throw StateError(
+              'Server selection was superseded during publication.',
+            );
+          }
+          ref.invalidate(apiServiceProvider);
+          if (_authAttemptSuperseded(attemptRevision)) {
+            throw StateError(
+              'Server selection was superseded during publication.',
+            );
+          }
+          _clearIncompleteLogoutFenceAfterTokenlessCleanup();
+        },
+      );
+    } catch (error, stackTrace) {
+      if (error is! ServerConfigSessionRollbackException) {
+        _restoreRolledBackAuthPublication(
+          attemptRevision: attemptRevision,
+          capturedSessionSafetyEpoch: capturedSessionSafetyEpoch,
+          previousState: previousState,
+        );
+      }
+      Error.throwWithStackTrace(error, stackTrace);
+    }
+  }
+
+  bool _restoreRolledBackAuthPublication({
+    required int attemptRevision,
+    required int capturedSessionSafetyEpoch,
+    required AuthState previousState,
+  }) {
+    if (!ref.mounted ||
+        _authAttemptRevision != attemptRevision ||
+        _sessionSafetyEpoch != capturedSessionSafetyEpoch) {
+      return false;
+    }
+    try {
+      _lastTransactionalSessionRevision = null;
+      final previousToken = previousState.token;
+      final safeState =
+          previousToken != null &&
+              _recentlyRevokedTokens.contains(previousToken)
+          ? const AuthState(
+              status: AuthStatus.unauthenticated,
+              isLoading: false,
+            )
+          : previousState;
+      _set(safeState);
+      _updateApiServiceToken(safeState.hasValidToken ? safeState.token : null);
+      ref.invalidate(serverConfigsProvider);
+      ref.invalidate(activeServerProvider);
+      ref.invalidate(apiServiceProvider);
+      final fence = ref.read(incompleteLogoutFenceProvider.notifier);
+      if (fence.desiredSuppressed || ref.read(incompleteLogoutFenceProvider)) {
+        _setIncompleteLogoutFenceInMemory(true);
+      }
+      return true;
+    } catch (error, stackTrace) {
+      _logAuthenticationFailure(
+        'auth-publication-rollback-restore-failed',
+        error,
+        stackTrace: stackTrace,
+      );
+      return false;
+    }
+  }
+
+  /// Accepts a bearer the server just handed to an interactive sign-in.
+  ///
+  /// Older Open WebUI servers (no jti claim, `JWT_EXPIRES_IN=-1`) issue a
+  /// byte-identical token for every login of the same account. Without this
+  /// hook, `_recentlyRevokedTokens` would keep rejecting logout -> login until
+  /// the app restarts. A token freshly returned by the server during the
+  /// current interactive attempt is a live session, so its stale revocation
+  /// marker is dropped.
+  ///
+  /// The removal is skipped while any logout is still executing: that logout's
+  /// remote revocation may still land, and the revocation list must keep
+  /// rejecting a resurrection of the exact bearer it is signing out (including
+  /// stale async capture tasks completing mid-logout).
+  void _acceptFreshlyIssuedServerToken(String token, {required String source}) {
+    if (_activeLogoutOperations > 0) return;
+    if (_recentlyRevokedTokens.remove(token)) {
+      DebugLogger.auth(
+        'Server reissued a previously revoked bearer during $source sign-in; '
+        'accepting it as a fresh session',
+      );
+    }
+  }
+
+  /// Commits a proxy/trusted-header session whose token and user were already
+  /// validated with the cookie-scoped discovery client.
+  ///
+  /// This deliberately skips a second network validation after the provisional
+  /// server config is written. The config, active-server id, and token are
+  /// committed as one revision-owned attempt; a persistence failure restores
+  /// the previous config/session, while a newer auth attempt always wins.
+  Future<bool> commitPrevalidatedProxySession({
+    required ServerConfig serverConfig,
+    required String token,
+    required User user,
+  }) async {
+    final tokenStr = token.trim();
+    if (tokenStr.isEmpty) {
+      throw Exception('Token cannot be empty');
+    }
+    if (TokenValidator.isApiKey(tokenStr)) {
+      throw Exception('apiKeyNotSupported');
+    }
+    if (!_isValidTokenFormat(tokenStr)) {
+      throw Exception('Invalid token format');
+    }
+    // An interactive proxy commit validated this token with the server during
+    // the current connect attempt; a completed logout's marker no longer
+    // applies. While a logout is still in flight, the marker keeps rejecting
+    // resurrection of the bearer being revoked.
+    _acceptFreshlyIssuedServerToken(tokenStr, source: 'proxy');
+    if (_recentlyRevokedTokens.contains(tokenStr)) {
+      throw Exception(
+        'This sign-in session was already signed out. Please authenticate again.',
+      );
+    }
+
+    final currentState = _current;
+    final previousState =
+        currentState.isLoading || currentState.status == AuthStatus.loading
+        ? _lastSettledState
+        : currentState;
+    final capturedSessionSafetyEpoch = _sessionSafetyEpoch;
+    final attemptRevision = _beginAuthAttempt();
+    _update(
+      (current) => current.copyWith(
+        status: AuthStatus.loading,
+        isLoading: true,
+        clearError: true,
+      ),
+    );
+
+    final storage = ref.read(optimizedStorageServiceProvider);
+    ServerConfigCandidateSnapshot? candidateSnapshot;
+    try {
+      if (_authAttemptSuperseded(attemptRevision)) return false;
+      final snapshot = await storage.stageServerConfigCandidate(serverConfig);
+      candidateSnapshot = snapshot;
+      if (_authAttemptSuperseded(attemptRevision)) {
+        await _restorePrevalidatedProxyConfig(
+          storage: storage,
+          candidate: serverConfig,
+          snapshot: snapshot,
+        );
+        return false;
+      }
+
+      final committed = await _commitSilentLoginResult(
+        storage: storage,
+        token: tokenStr,
+        user: user,
+        canCommit: () => !_authAttemptSuperseded(attemptRevision),
+        commitPersistenceAndPublish: ({required publish}) {
+          return storage.commitServerConfigCandidateSession(
+            candidate: serverConfig,
+            transactionId: snapshot.transactionId,
+            token: tokenStr,
+            canCommit: () => !_authAttemptSuperseded(attemptRevision),
+            publish: () async {
+              await publish();
+              ref.invalidate(serverConfigsProvider);
+              _lastTransactionalSessionRevision = attemptRevision;
+            },
+            onRollbackUncertain: () {
+              if (!ref.mounted) return;
+              _poisonUncertainServerSession(
+                failedAttemptRevision: attemptRevision,
+              );
+            },
+          );
+        },
+      );
+      if (!committed) {
+        await _restorePrevalidatedProxyConfig(
+          storage: storage,
+          candidate: serverConfig,
+          snapshot: snapshot,
+        );
+        _restorePrevalidatedProxyAttemptState(
+          attemptRevision: attemptRevision,
+          capturedSessionSafetyEpoch: capturedSessionSafetyEpoch,
+          previousState: previousState,
+        );
+      }
+      return committed;
+    } catch (error, stackTrace) {
+      final rollbackUncertain = error is ServerConfigSessionRollbackException;
+      if (rollbackUncertain &&
+          capturedSessionSafetyEpoch == _sessionSafetyEpoch) {
+        // Poison the prior session before any provider invalidation. A newer
+        // attempt may already be loading while still carrying the old token;
+        // revision checks alone cannot make that cross-origin state safe.
+        _poisonUncertainServerSession(failedAttemptRevision: attemptRevision);
+      }
+      final snapshot = candidateSnapshot;
+      if (snapshot != null) {
+        await _restorePrevalidatedProxyConfig(
+          storage: storage,
+          candidate: serverConfig,
+          snapshot: snapshot,
+        );
+      }
+      if (!rollbackUncertain) {
+        _restorePrevalidatedProxyAttemptState(
+          attemptRevision: attemptRevision,
+          capturedSessionSafetyEpoch: capturedSessionSafetyEpoch,
+          previousState: previousState,
+        );
+      }
+      final failureMessage = _safeLoginFailureMessage(error);
+      _logAuthenticationFailure(
+        'prevalidated-proxy-session-commit-failed',
+        error,
+        stackTrace: stackTrace,
+      );
+      Error.throwWithStackTrace(Exception(failureMessage), stackTrace);
+    }
+  }
+
+  void _restorePrevalidatedProxyAttemptState({
+    required int attemptRevision,
+    required int capturedSessionSafetyEpoch,
+    required AuthState previousState,
+  }) {
+    if (!ref.mounted || _authAttemptRevision != attemptRevision) return;
+    if (capturedSessionSafetyEpoch == _sessionSafetyEpoch) {
+      _set(previousState);
+      _restoreApiServiceTokenToCurrent();
+      return;
+    }
+
+    // Another overlapping proxy attempt encountered an incomplete durable
+    // rollback. This attempt's captured previousState may contain the poisoned
+    // token, so it must settle tokenless if it cannot publish a fresh session.
+    _set(const AuthState(status: AuthStatus.unauthenticated, isLoading: false));
+    _updateApiServiceToken(null);
+    ref.invalidate(apiServiceProvider);
+  }
+
+  void _poisonUncertainServerSession({required int failedAttemptRevision}) {
+    _sessionSafetyEpoch++;
+    final current = _current;
+    final newerTransactionalSession =
+        _authAttemptRevision != failedAttemptRevision &&
+        _currentRevisionOwnsCommittedSession();
+    if (newerTransactionalSession) {
+      // A newer transaction has already published a complete server/token
+      // pair after the uncertain lock was released; it supersedes the poison.
+      return;
+    }
+
+    _lastTransactionalSessionRevision = null;
+    const safeState = AuthState(
+      status: AuthStatus.unauthenticated,
+      isLoading: false,
+    );
+    _lastSettledState = safeState;
+    final newerAttemptOwnsLoading =
+        _authAttemptRevision != failedAttemptRevision &&
+        (current.isLoading || current.status == AuthStatus.loading);
+    if (newerAttemptOwnsLoading) {
+      // Preserve the newer attempt's loading ownership while stripping the
+      // prior token/user. Its epoch fence prevents failure from restoring them.
+      _set(const AuthState(status: AuthStatus.loading, isLoading: true));
+    } else {
+      _set(safeState);
+    }
+    _updateApiServiceToken(null);
+    ref.invalidate(apiServiceProvider);
+  }
+
+  Future<void> _restorePrevalidatedProxyConfig({
+    required OptimizedStorageService storage,
+    required ServerConfig candidate,
+    required ServerConfigCandidateSnapshot snapshot,
+  }) async {
+    try {
+      await storage.discardServerConfigCandidate(
+        candidate: candidate,
+        transactionId: snapshot.transactionId,
+      );
+    } catch (error, stackTrace) {
+      _logAuthenticationFailure(
+        'prevalidated-proxy-config-restore-failed',
+        error,
+        stackTrace: stackTrace,
+      );
+    } finally {
+      if (ref.mounted) ref.invalidate(serverConfigsProvider);
+    }
   }
 
   Future<bool> _loginWithApiKeyInternal(
     String apiKey, {
     bool rememberCredentials = false,
     String authType = 'token',
+    ServerConfig? expectedServerConfig,
     bool showLoading = true,
     bool publishErrors = true,
   }) async {
@@ -639,8 +1416,6 @@ class AuthStateManager extends _$AuthStateManager {
     }
 
     final attemptRevision = _authAttemptRevision;
-    String? persistedToken;
-    Map<String, String>? writtenCredentials;
     try {
       // Validate token is not empty
       if (apiKey.trim().isEmpty) {
@@ -661,13 +1436,38 @@ class AuthStateManager extends _$AuthStateManager {
         throw Exception('No server connection available');
       }
 
-      // Validate token format
+      // Reject malformed local input before taking the strict Keychain/config
+      // ownership snapshot.
       if (!_isValidTokenFormat(tokenStr)) {
         throw Exception('Invalid token format');
+      }
+      final storage = ref.read(optimizedStorageServiceProvider);
+      final expectedOwnership = expectedServerConfig == null
+          ? null
+          : await storage.captureServerSessionOwnership(
+              validatedConfig: expectedServerConfig,
+              requireActive: true,
+            );
+      final ownership = await _captureLoginServerOwnership(
+        storage,
+        api,
+        requireActive: true,
+      );
+      if (expectedServerConfig != null &&
+          (expectedOwnership == null ||
+              expectedOwnership.revision != ownership.revision ||
+              expectedOwnership.serverConfig.id != ownership.serverConfig.id)) {
+        throw Exception(
+          'SSO server configuration changed before token validation. Please retry.',
+        );
       }
 
       // Validate by attempting to fetch user info
       try {
+        if (_authAttemptSuperseded(attemptRevision)) {
+          _resolveAbortedAuthAttempt(attemptRevision);
+          return false;
+        }
         final user = await _validateIssuedToken(api, tokenStr);
 
         // A concurrent login / logout that started during validation owns the
@@ -676,66 +1476,29 @@ class AuthStateManager extends _$AuthStateManager {
           DebugLogger.auth(
             'JWT login superseded by a newer attempt; not committing',
           );
-          _restoreApiServiceTokenToCurrent();
+          _resolveAbortedAuthAttempt(attemptRevision);
           return false;
         }
 
-        // Save token to storage
-        final storage = ref.read(optimizedStorageServiceProvider);
-        await storage.saveAuthToken(tokenStr);
-        persistedToken = tokenStr;
-
-        // Save JWT token if requested
-        if (rememberCredentials) {
-          final activeServer = await ref.read(activeServerProvider.future);
-          if (activeServer != null) {
-            // Store JWT as a special credential type
-            await storage.saveCredentials(
-              serverId: activeServer.id,
-              username: 'jwt_user', // Special username to indicate JWT auth
-              password: tokenStr, // Store JWT in password field
-              authType: authType, // 'token' for manual entry, 'sso' for OAuth
-            );
-            // Mark rollback-owned only AFTER the write succeeds (see
-            // _loginInternal).
-            writtenCredentials = {
-              'serverId': activeServer.id,
-              'username': 'jwt_user',
-              'password': tokenStr,
-            };
-          }
-        }
-
-        // Re-check after the persistence awaits: a newer login/logout may have
-        // started, and must not be overwritten by this attempt's state.
-        if (_authAttemptSuperseded(attemptRevision)) {
-          DebugLogger.auth(
-            'JWT login superseded after persistence; not publishing',
-          );
-          await _rollbackUncommittedLoginWrites(
-            storage: storage,
-            token: tokenStr,
-            credentials: writtenCredentials,
-          );
-          _restoreApiServiceTokenToCurrent();
-          return false;
-        }
-
-        // Update state with the validated user data.
-        _update(
-          (current) => current.copyWith(
-            status: AuthStatus.authenticated,
-            token: tokenStr,
-            user: user,
-            isLoading: false,
-            clearError: true,
-          ),
-          cache: true,
+        final committed = await _commitValidatedExistingServerSession(
+          storage: storage,
+          ownership: ownership,
+          token: tokenStr,
+          user: user,
+          attemptRevision: attemptRevision,
+          rememberedCredentials: rememberCredentials
+              ? {
+                  'serverId': ownership.serverConfig.id,
+                  'username': 'jwt_user',
+                  'password': tokenStr,
+                  'authType': authType,
+                }
+              : null,
         );
-
-        // Update API service with token and kick off dependent background work
-        _updateApiServiceToken(tokenStr);
-        _preloadDefaultModel();
+        if (!committed) {
+          _resolveAbortedAuthAttempt(attemptRevision);
+          return false;
+        }
 
         DebugLogger.auth('JWT token login successful');
         return true;
@@ -749,39 +1512,26 @@ class AuthStateManager extends _$AuthStateManager {
         rethrow;
       }
     } catch (e, stack) {
-      DebugLogger.error(
-        'api-key-login-failed',
-        scope: 'auth/state',
-        error: e,
-        stackTrace: stack,
-      );
-      // A failed login must not leave its token/credentials in storage; value-
-      // match roll them back so a cold start can't restore a failed session.
-      if (persistedToken != null) {
-        await _rollbackUncommittedLoginWrites(
-          storage: ref.read(optimizedStorageServiceProvider),
-          token: persistedToken,
-          credentials: writtenCredentials,
-        );
-      }
+      final failureMessage = _safeLoginFailureMessage(e);
+      _logAuthenticationFailure('api-key-login-failed', e, stackTrace: stack);
       // Don't clear the API token or publish an error over a newer attempt;
       // restore the interceptor token to the newer attempt's state instead.
       if (_authAttemptSuperseded(attemptRevision)) {
-        _restoreApiServiceTokenToCurrent();
-      } else {
+        _resolveAbortedAuthAttempt(attemptRevision);
+      } else if (e is! _AuthPublicationRolledBack) {
         _updateApiServiceToken(null);
         if (publishErrors) {
           _update(
             (current) => current.copyWith(
               status: AuthStatus.error,
-              error: e.toString(),
+              error: failureMessage,
               isLoading: false,
               clearToken: true,
             ),
           );
         }
       }
-      rethrow;
+      Error.throwWithStackTrace(Exception(failureMessage), stack);
     }
   }
 
@@ -822,8 +1572,6 @@ class AuthStateManager extends _$AuthStateManager {
     }
 
     final attemptRevision = _authAttemptRevision;
-    String? persistedToken;
-    Map<String, String>? writtenCredentials;
     try {
       // Ensure API service is available (active server/provider rebuild race)
       await _ensureApiServiceAvailable();
@@ -831,9 +1579,24 @@ class AuthStateManager extends _$AuthStateManager {
       if (api == null) {
         throw Exception('No server connection available');
       }
+      final storage = ref.read(optimizedStorageServiceProvider);
+      final ownership = await _captureLoginServerOwnership(
+        storage,
+        api,
+        requireActive: true,
+      );
+
+      if (_authAttemptSuperseded(attemptRevision)) {
+        _resolveAbortedAuthAttempt(attemptRevision);
+        return false;
+      }
 
       // Perform login API call
       final response = await api.login(username, password);
+      if (_authAttemptSuperseded(attemptRevision)) {
+        _resolveAbortedAuthAttempt(attemptRevision);
+        return false;
+      }
 
       // Extract and validate token
       final token = response['token'] ?? response['access_token'];
@@ -845,6 +1608,10 @@ class AuthStateManager extends _$AuthStateManager {
       if (!_isValidTokenFormat(tokenStr)) {
         throw Exception('Invalid authentication token format');
       }
+      // This exact bearer was just returned by the server's signin endpoint
+      // for this interactive attempt, so any completed logout's revocation
+      // marker for it is stale.
+      _acceptFreshlyIssuedServerToken(tokenStr, source: 'credentials');
 
       // Validate the issued token before publishing authenticated state. Some
       // servers can return a token that is then rejected by /api/v1/auths/.
@@ -854,100 +1621,56 @@ class AuthStateManager extends _$AuthStateManager {
       // session now; don't persist this token or publish over its state.
       if (_authAttemptSuperseded(attemptRevision)) {
         DebugLogger.auth('Login superseded by a newer attempt; not committing');
-        _restoreApiServiceTokenToCurrent();
+        _resolveAbortedAuthAttempt(attemptRevision);
         return false;
       }
 
-      // Save token to storage
-      final storage = ref.read(optimizedStorageServiceProvider);
-      await storage.saveAuthToken(tokenStr);
-      persistedToken = tokenStr;
-
-      // Save credentials if requested
-      if (rememberCredentials) {
-        final activeServer = await ref.read(activeServerProvider.future);
-        if (activeServer != null) {
-          await storage.saveCredentials(
-            serverId: activeServer.id,
-            username: username,
-            password: password,
-          );
-          // Mark rollback-owned only AFTER the write succeeds, so a failed
-          // saveCredentials doesn't make the catch delete a pre-existing
-          // identical remembered credential this attempt never wrote.
-          writtenCredentials = {
-            'serverId': activeServer.id,
-            'username': username,
-            'password': password,
-          };
-        }
-      }
-
-      // Re-check after the persistence awaits: a newer login/logout may have
-      // started, and must not be overwritten by this attempt's published state.
-      if (_authAttemptSuperseded(attemptRevision)) {
-        DebugLogger.auth('Login superseded after persistence; not publishing');
-        await _rollbackUncommittedLoginWrites(
-          storage: storage,
-          token: tokenStr,
-          credentials: writtenCredentials,
-        );
-        _restoreApiServiceTokenToCurrent();
-        return false;
-      }
-
-      // Update state and API service
-      _update(
-        (current) => current.copyWith(
-          status: AuthStatus.authenticated,
-          token: tokenStr,
-          user: user,
-          isLoading: false,
-          clearError: true,
-        ),
-        cache: true,
+      final committed = await _commitValidatedExistingServerSession(
+        storage: storage,
+        ownership: ownership,
+        token: tokenStr,
+        user: user,
+        attemptRevision: attemptRevision,
+        rememberedCredentials: rememberCredentials
+            ? {
+                'serverId': ownership.serverConfig.id,
+                'username': username,
+                'password': password,
+                'authType': 'credentials',
+              }
+            : null,
       );
-
-      _updateApiServiceToken(tokenStr);
-      _preloadDefaultModel();
+      if (!committed) {
+        _resolveAbortedAuthAttempt(attemptRevision);
+        return false;
+      }
 
       DebugLogger.auth('Login successful');
       return true;
     } catch (e, stack) {
-      DebugLogger.error(
-        'login-failed',
-        scope: 'auth/state',
-        error: e,
-        stackTrace: stack,
+      final failureMessage = _safeLoginFailureMessage(
+        e,
+        credentialRequest: true,
       );
-      // A failed login must not leave its token/credentials in storage (a later
-      // exception can follow a successful token write); value-match roll them
-      // back so a cold start can't restore a session presented as failed.
-      if (persistedToken != null) {
-        await _rollbackUncommittedLoginWrites(
-          storage: ref.read(optimizedStorageServiceProvider),
-          token: persistedToken,
-          credentials: writtenCredentials,
-        );
-      }
+      _logAuthenticationFailure('login-failed', e, stackTrace: stack);
       // Don't clear the API token or publish an error over a newer attempt;
       // restore the interceptor token to the newer attempt's state instead.
       if (_authAttemptSuperseded(attemptRevision)) {
-        _restoreApiServiceTokenToCurrent();
-      } else {
+        _resolveAbortedAuthAttempt(attemptRevision);
+      } else if (e is! _AuthPublicationRolledBack) {
         _updateApiServiceToken(null);
         if (publishErrors) {
           _update(
             (current) => current.copyWith(
               status: AuthStatus.error,
-              error: e.toString(),
+              error: failureMessage,
               isLoading: false,
               clearToken: true,
             ),
           );
         }
       }
-      rethrow;
+      Error.throwWithStackTrace(Exception(failureMessage), stack);
     }
   }
 
@@ -970,8 +1693,6 @@ class AuthStateManager extends _$AuthStateManager {
     );
 
     final attemptRevision = _authAttemptRevision;
-    String? persistedToken;
-    Map<String, String>? writtenCredentials;
     try {
       // Ensure API service is available
       await _ensureApiServiceAvailable();
@@ -979,9 +1700,24 @@ class AuthStateManager extends _$AuthStateManager {
       if (api == null) {
         throw Exception('No server connection available');
       }
+      final storage = ref.read(optimizedStorageServiceProvider);
+      final ownership = await _captureLoginServerOwnership(
+        storage,
+        api,
+        requireActive: true,
+      );
+
+      if (_authAttemptSuperseded(attemptRevision)) {
+        _resolveAbortedAuthAttempt(attemptRevision);
+        return false;
+      }
 
       // Perform LDAP login API call
       final response = await api.ldapLogin(username, password);
+      if (_authAttemptSuperseded(attemptRevision)) {
+        _resolveAbortedAuthAttempt(attemptRevision);
+        return false;
+      }
 
       // Check if notifier is still mounted after async call
       if (!ref.mounted) return false;
@@ -996,6 +1732,10 @@ class AuthStateManager extends _$AuthStateManager {
       if (!_isValidTokenFormat(tokenStr)) {
         throw Exception('Invalid authentication token format');
       }
+      // This exact bearer was just returned by the server's signin endpoint
+      // for this interactive attempt, so any completed logout's revocation
+      // marker for it is stale.
+      _acceptFreshlyIssuedServerToken(tokenStr, source: 'credentials');
 
       // Validate the issued token before publishing authenticated state. Some
       // servers can return a token that is then rejected by /api/v1/auths/.
@@ -1007,130 +1747,54 @@ class AuthStateManager extends _$AuthStateManager {
         DebugLogger.auth(
           'LDAP login superseded by a newer attempt; not committing',
         );
-        _restoreApiServiceTokenToCurrent();
+        _resolveAbortedAuthAttempt(attemptRevision);
         return false;
       }
 
-      // Save token to storage
-      final storage = ref.read(optimizedStorageServiceProvider);
-      await storage.saveAuthToken(tokenStr);
-      persistedToken = tokenStr;
-
-      if (!ref.mounted) {
-        await _rollbackUncommittedLoginWrites(
-          storage: storage,
-          token: tokenStr,
-          credentials: writtenCredentials,
-        );
-        return false;
-      }
-
-      // Save JWT token for re-authentication if requested
-      // We store the token (not the raw LDAP password) for security:
-      // - JWT tokens can be revoked server-side
-      // - Avoids storing the user's directory password
-      // - Consistent with SSO token storage approach
-      if (rememberCredentials) {
-        final activeServer = await ref.read(activeServerProvider.future);
-        if (!ref.mounted) {
-          await _rollbackUncommittedLoginWrites(
-            storage: storage,
-            token: tokenStr,
-            credentials: writtenCredentials,
-          );
-          return false;
-        }
-        if (activeServer != null) {
-          await storage.saveCredentials(
-            serverId: activeServer.id,
-            // Prefix with ldap: to preserve original username for debugging
-            // while indicating this is token-based auth
-            username: 'ldap:$username',
-            password: tokenStr, // Store JWT token, not LDAP password
-            authType: 'ldap', // Track that this originated from LDAP login
-          );
-          // Mark rollback-owned only AFTER the write succeeds (see _loginInternal).
-          writtenCredentials = {
-            'serverId': activeServer.id,
-            'username': 'ldap:$username',
-            'password': tokenStr,
-          };
-        }
-      }
-
-      if (!ref.mounted) {
-        await _rollbackUncommittedLoginWrites(
-          storage: storage,
-          token: tokenStr,
-          credentials: writtenCredentials,
-        );
-        return false;
-      }
-
-      // Re-check after the persistence awaits: a newer login/logout may have
-      // started, and must not be overwritten by this attempt's published state.
-      if (_authAttemptSuperseded(attemptRevision)) {
-        DebugLogger.auth(
-          'LDAP login superseded after persistence; not publishing',
-        );
-        await _rollbackUncommittedLoginWrites(
-          storage: storage,
-          token: tokenStr,
-          credentials: writtenCredentials,
-        );
-        _restoreApiServiceTokenToCurrent();
-        return false;
-      }
-
-      // Update state and API service
-      _update(
-        (current) => current.copyWith(
-          status: AuthStatus.authenticated,
-          token: tokenStr,
-          user: user,
-          isLoading: false,
-          clearError: true,
-        ),
-        cache: true,
+      final committed = await _commitValidatedExistingServerSession(
+        storage: storage,
+        ownership: ownership,
+        token: tokenStr,
+        user: user,
+        attemptRevision: attemptRevision,
+        rememberedCredentials: rememberCredentials
+            ? {
+                'serverId': ownership.serverConfig.id,
+                'username': 'ldap:$username',
+                'password': tokenStr,
+                'authType': 'ldap',
+              }
+            : null,
       );
-
-      _updateApiServiceToken(tokenStr);
-      _preloadDefaultModel();
+      if (!committed) {
+        _resolveAbortedAuthAttempt(attemptRevision);
+        return false;
+      }
 
       DebugLogger.auth('LDAP login successful');
       return true;
     } catch (e, stack) {
-      DebugLogger.error(
-        'ldap-login-failed',
-        scope: 'auth/state',
-        error: e,
-        stackTrace: stack,
+      final failureMessage = _safeLoginFailureMessage(
+        e,
+        credentialRequest: true,
       );
-      // A failed login must not leave its token/credentials in storage; value-
-      // match roll them back so a cold start can't restore a failed session.
-      if (persistedToken != null) {
-        await _rollbackUncommittedLoginWrites(
-          storage: ref.read(optimizedStorageServiceProvider),
-          token: persistedToken,
-          credentials: writtenCredentials,
-        );
-      }
+      _logAuthenticationFailure('ldap-login-failed', e, stackTrace: stack);
       // Don't clear the API token or publish an error over a newer attempt;
       // restore the interceptor token to the newer attempt's state instead.
       if (_authAttemptSuperseded(attemptRevision)) {
-        _restoreApiServiceTokenToCurrent();
-      } else {
+        _resolveAbortedAuthAttempt(attemptRevision);
+      } else if (e is! _AuthPublicationRolledBack) {
         _update(
           (current) => current.copyWith(
             status: AuthStatus.error,
-            error: e.toString(),
+            error: failureMessage,
             isLoading: false,
             clearToken: true,
           ),
         );
         _updateApiServiceToken(null);
       }
-      rethrow;
+      Error.throwWithStackTrace(Exception(failureMessage), stack);
     }
   }
 
@@ -1147,11 +1811,12 @@ class AuthStateManager extends _$AuthStateManager {
   }
 
   Future<User> _validateIssuedToken(ApiService api, String token) async {
-    api.updateAuthToken(token);
     try {
-      return await api.getCurrentUser(suppressAuthFailureNotification: true);
+      return await api.getCurrentUser(
+        suppressAuthFailureNotification: true,
+        candidateAuthToken: token,
+      );
     } catch (error, stackTrace) {
-      api.updateAuthToken(null);
       Error.throwWithStackTrace(
         Exception(_loginValidationMessage(error)),
         stackTrace,
@@ -1172,16 +1837,104 @@ class AuthStateManager extends _$AuthStateManager {
         text.contains('Forbidden');
   }
 
+  void _logAuthenticationFailure(
+    String event,
+    Object? error, {
+    StackTrace? stackTrace,
+  }) {
+    DebugLogger.error(
+      event,
+      stackTrace: stackTrace,
+      scope: 'auth/state',
+      data: {
+        'errorType': error?.runtimeType.toString() ?? 'unknown',
+        if (error is DioException) ...{
+          'dioType': error.type.name,
+          'statusCode': error.response?.statusCode,
+        },
+      },
+    );
+  }
+
+  String _safeLoginFailureMessage(
+    Object error, {
+    bool credentialRequest = false,
+  }) {
+    final statusCode = error is DioException
+        ? error.response?.statusCode
+        : null;
+
+    // Only recognize the one server response that has a dedicated, safe UI
+    // message. Never surface arbitrary response text here: credential errors
+    // can reflect request data, headers, or upstream diagnostics.
+    final responseData = error is DioException ? error.response?.data : null;
+    final responseDetail = responseData is Map
+        ? responseData['detail']
+        : responseData;
+    final text = error.toString().toLowerCase();
+    final ldapDisabled =
+        responseDetail is String &&
+            responseDetail.trim().toLowerCase() ==
+                'ldap authentication is not enabled' ||
+        text.contains('ldap authentication is not enabled');
+    if (ldapDisabled) {
+      return 'LDAP authentication is not enabled';
+    }
+
+    if (statusCode == 401 ||
+        statusCode == 403 ||
+        (credentialRequest && statusCode == 400)) {
+      return '401 Unauthorized: sign-in rejected by server';
+    }
+
+    if (text.contains('apikeynolongersupported')) {
+      return 'apiKeyNoLongerSupported';
+    }
+    if (text.contains('apikeynotsupported')) {
+      return 'apiKeyNotSupported';
+    }
+    if (text.contains('authentication failed')) {
+      return '401 Unauthorized: sign-in rejected by server';
+    }
+    if (text.contains('token cannot be empty')) {
+      return 'Token cannot be empty';
+    }
+    if (text.contains('invalid token format')) {
+      return 'Invalid token format';
+    }
+    if (text.contains('no server connection available')) {
+      return 'No server connection available';
+    }
+    if (text.contains('redirect')) {
+      return 'Server redirect detected. Please check your server URL configuration.';
+    }
+
+    final timedOut =
+        error is DioException &&
+        (error.type == DioExceptionType.connectionTimeout ||
+            error.type == DioExceptionType.sendTimeout ||
+            error.type == DioExceptionType.receiveTimeout);
+    if (timedOut || text.contains('timeout')) {
+      return 'Sign-in request timed out';
+    }
+
+    final connectionFailed =
+        error is DioException &&
+        (error.type == DioExceptionType.connectionError ||
+            error.type == DioExceptionType.unknown);
+    if (connectionFailed ||
+        text.contains('socketexception') ||
+        text.contains('connection')) {
+      return 'Unable to connect to server';
+    }
+    return 'Sign-in failed. Please try again.';
+  }
+
   String _loginValidationMessage(Object error) {
     if (error is DioException) {
       final statusCode = error.response?.statusCode;
       if (statusCode == 401 || statusCode == 403) {
         return '$statusCode Unauthorized: sign-in token rejected by server';
-      }
-
-      final detail = error.response?.data;
-      if (detail is Map && detail['detail'] != null) {
-        return 'Sign-in validation failed: ${detail['detail']}';
       }
     }
 
@@ -1190,61 +1943,6 @@ class AuthStateManager extends _$AuthStateManager {
       return '401 Unauthorized: sign-in token rejected by server';
     }
     return 'Unable to validate sign-in session';
-  }
-
-  /// Wait for the API to be reachable (network readiness gate).
-  ///
-  /// On cold starts with Cloudflare tunnels or other proxy setups, the network
-  /// connection may not be established immediately. This method performs a
-  /// health check with retries to ensure we don't show the wrong screen due to
-  /// a race condition between auth state initialization and network readiness.
-  ///
-  /// Returns true if the API is reachable within the timeout, false otherwise.
-  Future<bool> _waitForApiReadiness({
-    Duration timeout = const Duration(seconds: 3),
-    Duration retryDelay = const Duration(milliseconds: 300),
-  }) async {
-    final stopwatch = Stopwatch()..start();
-
-    // First ensure the API service provider is available
-    await _ensureApiServiceAvailable(timeout: const Duration(seconds: 1));
-
-    while (stopwatch.elapsed < timeout) {
-      if (!ref.mounted) return false;
-
-      final api = ref.read(apiServiceProvider);
-      if (api == null) {
-        await Future.delayed(retryDelay);
-        continue;
-      }
-
-      try {
-        // Use checkHealth which hits the /health endpoint
-        final healthy = await api.checkHealth();
-        if (healthy) {
-          DebugLogger.auth(
-            'API readiness confirmed in ${stopwatch.elapsedMilliseconds}ms',
-          );
-          return true;
-        }
-      } catch (e) {
-        DebugLogger.auth(
-          'API readiness check failed (${stopwatch.elapsedMilliseconds}ms): $e',
-        );
-      }
-
-      // Wait before retrying
-      if (stopwatch.elapsed + retryDelay < timeout) {
-        await Future.delayed(retryDelay);
-      } else {
-        break;
-      }
-    }
-
-    DebugLogger.auth(
-      'API readiness timed out after ${stopwatch.elapsedMilliseconds}ms',
-    );
-    return false;
   }
 
   /// Perform silent auto-login with saved credentials
@@ -1275,7 +1973,7 @@ class AuthStateManager extends _$AuthStateManager {
     int? claimRevision;
     bool canCommit() {
       final expectedRevision = claimRevision ?? startRevision;
-      return ref.mounted && _authAttemptRevision == expectedRevision;
+      return !_authAttemptSuperseded(expectedRevision);
     }
 
     bool claimCommit() {
@@ -1284,12 +1982,16 @@ class AuthStateManager extends _$AuthStateManager {
       return true;
     }
 
-    return _performSilentLoginInternal(
+    final committed = await _performSilentLoginInternal(
       showLoading: true,
       publishNetworkErrors: true,
       canCommit: canCommit,
       claimCommit: claimCommit,
     );
+    if (!committed) {
+      _resolveAbortedAuthAttempt(claimRevision ?? startRevision);
+    }
+    return committed;
   }
 
   /// Bootstrap path (no stored token but saved credentials): runs the
@@ -1298,14 +2000,18 @@ class AuthStateManager extends _$AuthStateManager {
   /// nothing (auth/network/unknown failure all `return false` without touching
   /// state in background mode), fall back to `unauthenticated` so the app
   /// reaches the sign-in page instead of hanging on the splash.
-  Future<void> _bootstrapSilentLogin() async {
+  Future<void> _bootstrapSilentLogin(
+    Map<String, String> savedCredentials,
+  ) async {
     // Capture the attempt revision: every foreground login / logout /
     // token-invalidation bumps it via `_beginAuthAttempt`. If one starts while
     // this background login runs, it is also briefly `loading` with no token, so
     // the fallback below must NOT fire — otherwise this stale task would clobber
     // the newer attempt with `unauthenticated` and bounce the user to sign-in.
     final bootstrapRevision = _authAttemptRevision;
-    final committed = await _performSilentLoginInBackground();
+    final committed = await _performSilentLoginInBackground(
+      savedCredentials: Map<String, String>.unmodifiable(savedCredentials),
+    );
     if (!ref.mounted) return;
     if (bootstrapShouldFallbackToUnauthenticated(
       committed: committed,
@@ -1328,8 +2034,11 @@ class AuthStateManager extends _$AuthStateManager {
     }
   }
 
-  Future<bool> _performSilentLoginInBackground() async {
+  Future<bool> _performSilentLoginInBackground({
+    Map<String, String>? savedCredentials,
+  }) async {
     final startRevision = _authAttemptRevision;
+    final startSafetyEpoch = _sessionSafetyEpoch;
     int? claimRevision;
 
     bool canCommit() {
@@ -1341,8 +2050,12 @@ class AuthStateManager extends _$AuthStateManager {
       final commitableStatus =
           current.status == AuthStatus.unauthenticated ||
           current.status == AuthStatus.loading;
+      final ownsFence = claimRevision == null
+          ? _sessionSafetyEpoch == startSafetyEpoch &&
+                _authAttemptRevision == expectedRevision
+          : !_authAttemptSuperseded(expectedRevision);
       return ref.mounted &&
-          _authAttemptRevision == expectedRevision &&
+          ownsFence &&
           commitableStatus &&
           !current.hasValidToken;
     }
@@ -1354,19 +2067,19 @@ class AuthStateManager extends _$AuthStateManager {
     }
 
     try {
-      return await _performSilentLoginInternal(
+      final committed = await _performSilentLoginInternal(
         showLoading: false,
         publishNetworkErrors: false,
         canCommit: canCommit,
         claimCommit: claimCommit,
+        savedCredentialsSnapshot: savedCredentials,
       );
-    } catch (error, stack) {
-      DebugLogger.error(
-        'background-silent-login-failed',
-        scope: 'auth/state',
-        error: error,
-        stackTrace: stack,
-      );
+      if (!committed && claimRevision != null) {
+        _resolveAbortedAuthAttempt(claimRevision!);
+      }
+      return committed;
+    } catch (error) {
+      _logAuthenticationFailure('background-silent-login-failed', error);
       return false;
     }
   }
@@ -1376,6 +2089,7 @@ class AuthStateManager extends _$AuthStateManager {
     required bool publishNetworkErrors,
     bool Function()? canCommit,
     bool Function()? claimCommit,
+    Map<String, String>? savedCredentialsSnapshot,
   }) async {
     if (showLoading) {
       _update(
@@ -1391,23 +2105,25 @@ class AuthStateManager extends _$AuthStateManager {
     // login attempt AND the failure cleanup, so a confirmed-auth-failure clears
     // exactly the credentials that were tried (not a re-read that may have
     // changed) and never a concurrent login's freshly saved credentials.
-    final attemptedCredentials = await ref
-        .read(optimizedStorageServiceProvider)
-        .getSavedCredentials();
+    Map<String, String>? attemptedCredentials = savedCredentialsSnapshot;
 
     try {
+      // Keep the Keychain read inside the same failure boundary as the network
+      // attempt. Secure-storage failures are now intentionally propagated; a
+      // foreground silent login must publish a terminal error rather than throw
+      // past this handler and leave the auth state stuck in `loading`.
+      attemptedCredentials ??= await ref
+          .read(optimizedStorageServiceProvider)
+          .getSavedCredentialsStrict();
       return await _performSilentLoginAttempt(
         savedCredentials: attemptedCredentials,
         canCommit: canCommit,
         claimCommit: claimCommit,
       );
-    } catch (e, stack) {
-      DebugLogger.error(
-        'silent-login-failed',
-        scope: 'auth/state',
-        error: e,
-        stackTrace: stack,
-      );
+    } catch (e) {
+      _logAuthenticationFailure('silent-login-failed', e);
+
+      if (e is _AuthPublicationRolledBack) return false;
 
       return await _handleSilentLoginFailure(
         e,
@@ -1442,13 +2158,14 @@ class AuthStateManager extends _$AuthStateManager {
     final username = savedCredentials['username']!;
     final password = savedCredentials['password']!;
 
-    // Ensure the saved server still exists before switching
-    final serverConfigs = await ref.read(serverConfigsProvider.future);
-    final serverConfig = serverConfigs
-        .where((config) => config.id == serverId)
-        .firstOrNull;
+    // Resolve against locked storage, not a potentially stale provider cache.
+    // This is both the exact config used for validation and proof that a
+    // missing id is safe to clean up below.
+    final ownership = await storage.captureSavedServerSessionOwnership(
+      serverId,
+    );
 
-    if (serverConfig == null) {
+    if (ownership == null) {
       // The saved credentials point at a server that no longer exists, so they
       // can never log in: clear them (and the dangling active server) so cold
       // start doesn't re-enter this impossible path every launch. Only skip the
@@ -1462,17 +2179,9 @@ class AuthStateManager extends _$AuthStateManager {
       // Atomic compare-and-delete: only clears the exact credentials we
       // attempted, so a concurrent foreground login that saved fresh
       // credentials in the await window above isn't clobbered.
-      final clearedCreds = await storage.deleteSavedCredentialsIfMatches({
-        'serverId': serverId,
-        'username': username,
-        'password': password,
-      });
+      final clearedCreds = await storage
+          .deleteSavedCredentialsIfMatchesAndServerMissing(savedCredentials);
       if (clearedCreds) {
-        // Compare-and-clear the active server (only if it still points at the
-        // missing one) so a concurrent server switch isn't clobbered.
-        if (_canCommitAuth(canCommit)) {
-          await storage.clearActiveServerIdIfMatches(serverId);
-        }
         ref.invalidate(serverConfigsProvider);
         ref.invalidate(activeServerProvider);
       }
@@ -1500,10 +2209,15 @@ class AuthStateManager extends _$AuthStateManager {
       return false;
     }
 
+    if (!_canCommitAuth(canCommit)) {
+      DebugLogger.auth('Silent login skipped stale ownership snapshot');
+      return false;
+    }
+
     // Attempt login based on auth type
     final authType = savedCredentials['authType'] ?? 'credentials';
-    final tempApi = ApiService(
-      serverConfig: serverConfig,
+    final tempApi = ref.read(savedCredentialAuthApiFactoryProvider)(
+      serverConfig: ownership.serverConfig,
       workerManager: ref.read(workerManagerProvider),
     );
 
@@ -1517,15 +2231,21 @@ class AuthStateManager extends _$AuthStateManager {
         authType == 'sso' ||
         authType == 'ldap';
 
-    final result = usesSavedJwt
-        ? await _authenticateSavedJwt(tempApi, password)
-        : await _authenticateSavedCredentials(tempApi, username, password);
+    final ({String token, User user}) result;
+    try {
+      result = usesSavedJwt
+          ? await _authenticateSavedJwt(tempApi, password)
+          : await _authenticateSavedCredentials(tempApi, username, password);
+    } finally {
+      tempApi.dispose();
+    }
 
     return _commitSilentLoginResult(
       storage: storage,
-      serverId: serverId,
+      ownership: ownership,
       token: result.token,
       user: result.user,
+      expectedSavedCredentials: savedCredentials,
       canCommit: canCommit,
       claimCommit: claimCommit,
     );
@@ -1572,11 +2292,14 @@ class AuthStateManager extends _$AuthStateManager {
 
   Future<bool> _commitSilentLoginResult({
     required OptimizedStorageService storage,
-    required String serverId,
     required String token,
     required User user,
+    ServerSessionOwnershipSnapshot? ownership,
+    Map<String, String>? expectedSavedCredentials,
     bool Function()? canCommit,
     bool Function()? claimCommit,
+    Future<bool> Function({required FutureOr<void> Function() publish})?
+    commitPersistenceAndPublish,
   }) async {
     if (!_claimAuthCommit(
       operation: 'Silent login',
@@ -1585,107 +2308,91 @@ class AuthStateManager extends _$AuthStateManager {
       return false;
     }
 
-    final previousServerId = await storage.getActiveServerId();
-    final previousToken = await storage.getAuthToken();
+    final commitRevision = _authAttemptRevision;
     if (!_canCommitAuth(canCommit)) {
       DebugLogger.auth('Silent login skipped stale persistence commit');
       return false;
     }
 
-    var wrotePersistence = false;
-    try {
-      await storage.setActiveServerId(serverId);
-      wrotePersistence = true;
-      if (!_canCommitAuth(canCommit)) {
-        DebugLogger.auth('Silent login restoring stale server commit');
-        await _restoreStaleSilentLoginPersistence(
-          storage: storage,
-          staleServerId: serverId,
-          previousServerId: previousServerId,
-          staleToken: token,
-          previousToken: previousToken,
-        );
-        return false;
-      }
+    final currentState = _current;
+    final previousState =
+        currentState.isLoading || currentState.status == AuthStatus.loading
+        ? _lastSettledState
+        : currentState;
+    final publicationSafetyEpoch = _sessionSafetyEpoch;
+    var publicationAttempted = false;
 
-      await storage.saveAuthToken(token);
-      if (!_canCommitAuth(canCommit)) {
-        DebugLogger.auth('Silent login restoring stale persistence commit');
-        await _restoreStaleSilentLoginPersistence(
-          storage: storage,
-          staleServerId: serverId,
-          previousServerId: previousServerId,
-          staleToken: token,
-          previousToken: previousToken,
-        );
-        return false;
-      }
-    } catch (error) {
-      // Undo any PARTIAL persistence (value-matched, atomic) whenever we wrote
-      // some of it — not only when the attempt went stale — so a storage failure
-      // between setActiveServerId and saveAuthToken can't strand the app on the
-      // silent-login server/token without committing.
-      if (wrotePersistence) {
-        await _restoreStaleSilentLoginPersistence(
-          storage: storage,
-          staleServerId: serverId,
-          previousServerId: previousServerId,
-          staleToken: token,
-          previousToken: previousToken,
-        );
-      }
-      if (_canCommitAuth(canCommit)) {
-        // We already claimed this attempt (the revision bump suppresses the
-        // bootstrap fallback), so a bare rethrow would leave cold start stuck on
-        // `loading` with no token. Resolve the claimed attempt to unauthenticated
-        // before propagating the persistence error.
-        DebugLogger.auth(
-          'Silent login resolving claimed attempt after persistence failure',
-        );
-        _update(
-          (current) => current.copyWith(
-            status: AuthStatus.unauthenticated,
-            isLoading: false,
-            clearToken: true,
-          ),
-        );
-      }
-      rethrow;
-    }
-
-    // Final freshness gate immediately before publishing the in-memory session:
-    // if a logout / newer auth attempt landed during persistence, undo our
-    // writes and bail so a stale background login can't resurrect the previous
-    // session (invalidate providers + install the old token).
-    if (!_canCommitAuth(canCommit)) {
-      DebugLogger.auth('Silent login skipped stale in-memory commit');
-      await _restoreStaleSilentLoginPersistence(
-        storage: storage,
-        staleServerId: serverId,
-        previousServerId: previousServerId,
-        staleToken: token,
-        previousToken: previousToken,
+    Future<void> publishSession() {
+      publicationAttempted = true;
+      return _publishCommittedAuthenticatedSession(
+        attemptRevision: commitRevision,
+        candidateToken: token,
+        publish: () {
+          _setIncompleteLogoutFenceInMemory(false);
+          _updateApiServiceToken(token);
+          ref.invalidate(activeServerProvider);
+          ref.invalidate(apiServiceProvider);
+          if (_authAttemptSuperseded(commitRevision)) {
+            throw StateError(
+              'Authentication attempt was superseded during publication.',
+            );
+          }
+          _lastTransactionalSessionRevision = commitRevision;
+          _update(
+            (current) => current.copyWith(
+              status: AuthStatus.authenticated,
+              token: token,
+              user: user,
+              isLoading: false,
+              clearError: true,
+            ),
+            cache: true,
+          );
+        },
       );
-      return false;
     }
 
-    ref.invalidate(activeServerProvider);
-    ref.invalidate(apiServiceProvider);
-    _update(
-      (current) => current.copyWith(
-        status: AuthStatus.authenticated,
-        token: token,
-        user: user,
-        isLoading: false,
-        clearError: true,
-      ),
-      cache: true,
-    );
-    _updateApiServiceToken(token);
-    _preloadDefaultModel();
+    try {
+      if (commitPersistenceAndPublish != null) {
+        final committed = await commitPersistenceAndPublish(
+          publish: publishSession,
+        );
+        if (committed) DebugLogger.auth('Silent login successful');
+        return committed;
+      }
 
-    DebugLogger.auth('Silent login successful');
-    return true;
+      if (ownership == null) {
+        throw StateError('Existing-server session commit requires ownership');
+      }
+
+      final committed = await storage.commitExistingServerSession(
+        ownership: ownership,
+        token: token,
+        expectedSavedCredentials: expectedSavedCredentials,
+        canCommit: () => _canCommitAuth(canCommit),
+        publish: publishSession,
+        onRollbackUncertain: () {
+          if (!ref.mounted) return;
+          _poisonUncertainServerSession(failedAttemptRevision: commitRevision);
+        },
+      );
+      if (committed) DebugLogger.auth('Silent login successful');
+      return committed;
+    } catch (error, stackTrace) {
+      if (publicationAttempted &&
+          _restoreRolledBackAuthPublication(
+            attemptRevision: commitRevision,
+            capturedSessionSafetyEpoch: publicationSafetyEpoch,
+            previousState: previousState,
+          ) &&
+          error is! ServerConfigSessionRollbackException) {
+        Error.throwWithStackTrace(
+          _AuthPublicationRolledBack(error),
+          stackTrace,
+        );
+      }
+      Error.throwWithStackTrace(error, stackTrace);
+    }
   }
 
   Future<bool> _handleSilentLoginFailure(
@@ -1694,15 +2401,23 @@ class AuthStateManager extends _$AuthStateManager {
     bool Function()? canCommit,
     Map<String, String>? attemptedCredentials,
   }) async {
-    var errorMessage = error.toString();
+    var errorMessage = _safeLoginFailureMessage(error, credentialRequest: true);
+    final errorText = error.toString().toLowerCase();
+    final statusCode = error is DioException
+        ? error.response?.statusCode
+        : null;
 
     // Don't clear credentials on connection errors - only clear on actual auth failures
     // Check if this is a genuine auth failure vs network issue
     final isNetworkError =
-        error.toString().contains('SocketException') ||
-        error.toString().contains('Connection') ||
-        error.toString().contains('timeout') ||
-        error.toString().contains('NetworkImage');
+        error is SocketException ||
+        error is TimeoutException ||
+        (error is DioException &&
+            (error.type == DioExceptionType.connectionTimeout ||
+                error.type == DioExceptionType.sendTimeout ||
+                error.type == DioExceptionType.receiveTimeout ||
+                error.type == DioExceptionType.connectionError ||
+                error.type == DioExceptionType.unknown));
 
     // Local saved-token validation failures (raised by `_authenticateSavedJwt`
     // before any server request) mean the stored credential can never succeed,
@@ -1710,15 +2425,16 @@ class AuthStateManager extends _$AuthStateManager {
     // to the unknown-error path, keep the bad credential, and repeat the
     // impossible silent login on every cold start.
     final isInvalidSavedToken =
-        error.toString().contains('apiKeyNotSupported') ||
-        error.toString().contains('Invalid token format') ||
-        error.toString().contains('Token cannot be empty');
+        errorText.contains('apikeynotsupported') ||
+        errorText.contains('invalid token format') ||
+        errorText.contains('token cannot be empty');
 
     if ((!isNetworkError &&
-            (error.toString().contains('401') ||
-                error.toString().contains('403') ||
-                error.toString().contains('authentication') ||
-                error.toString().contains('unauthorized'))) ||
+            (statusCode == 400 ||
+                statusCode == 401 ||
+                statusCode == 403 ||
+                errorText.contains('401 unauthorized') ||
+                errorText.contains('authentication failed'))) ||
         isInvalidSavedToken) {
       // A confirmed auth failure means the saved secret is bad: clear it so it
       // isn't retried on every cold start (the background bootstrap path turns a
@@ -1726,9 +2442,7 @@ class AuthStateManager extends _$AuthStateManager {
       // without cleanup when a newer auth attempt has superseded this (stale)
       // background task.
       if (!_canCommitAuth(canCommit)) {
-        DebugLogger.auth(
-          'Silent login ignored stale credential auth failure',
-        );
+        DebugLogger.auth('Silent login ignored stale credential auth failure');
         return false;
       }
 
@@ -1753,12 +2467,10 @@ class AuthStateManager extends _$AuthStateManager {
               ? 'Cleared invalid credentials after auth failure'
               : 'Skipped clearing credentials that changed during the auth attempt',
         );
-      } catch (deleteError, deleteStack) {
-        DebugLogger.error(
+      } catch (deleteError) {
+        _logAuthenticationFailure(
           'silent-login-credential-clear-failed',
-          scope: 'auth/state',
-          error: deleteError,
-          stackTrace: deleteStack,
+          deleteError,
         );
         errorMessage =
             '$errorMessage. Also failed to clear saved '
@@ -1831,6 +2543,7 @@ class AuthStateManager extends _$AuthStateManager {
 
   /// Reset retry counter (called when user manually retries)
   void resetRetryCounter() {
+    _retryResetGeneration++;
     _retryCount = 0;
     _lastRetryTime = null;
     DebugLogger.auth('Retry counter reset for manual retry');
@@ -1859,6 +2572,22 @@ class AuthStateManager extends _$AuthStateManager {
     // token and never a fresh one that a concurrent foreground login may have
     // already saved through `_authStateLock`.
     final rejectedToken = _current.hasValidToken ? _current.token : null;
+    final silentLoginWasInProgress = _silentLoginFuture != null;
+    // Claim ownership before publishing tokenExpired: synchronous listeners
+    // may start a replacement login, and that newer attempt must supersede
+    // this cleanup rather than being superseded by a later revision bump.
+    final claimedAttemptRevision = silentLoginWasInProgress
+        ? null
+        : _beginAuthAttempt();
+
+    if (rejectedToken != null && rejectedToken.isNotEmpty) {
+      _publishTokenlessAuthRejection(
+        status: AuthStatus.tokenExpired,
+        error: 'Session expired - please sign in again',
+        isLoading: false,
+      );
+    }
+    if (!ref.mounted) return;
 
     // Coalesce onto an in-flight silent re-login (a prior invalidation, a manual
     // retry, or bootstrap). Bumping the attempt revision here would mark that
@@ -1877,13 +2606,8 @@ class AuthStateManager extends _$AuthStateManager {
           await ref
               .read(optimizedStorageServiceProvider)
               .deleteAuthTokenIfMatches(rejectedToken);
-        } catch (error, stack) {
-          DebugLogger.error(
-            'token-delete-failed',
-            scope: 'auth/state',
-            error: error,
-            stackTrace: stack,
-          );
+        } catch (error) {
+          _logAuthenticationFailure('token-delete-failed', error);
         }
       }
       DebugLogger.auth(
@@ -1892,7 +2616,12 @@ class AuthStateManager extends _$AuthStateManager {
       );
       return;
     }
-    _beginAuthAttempt();
+    final attemptRevision = claimedAttemptRevision!;
+    var maxRetriesReached = false;
+    // A new retry-window mutation owns its delayed reset. Timers left behind by
+    // an older burst must never clear failures accumulated after a manual retry
+    // or a later token invalidation.
+    final retryResetGeneration = ++_retryResetGeneration;
     // Prevent infinite retry loops
     final now = DateTime.now();
     if (_lastRetryTime != null &&
@@ -1902,19 +2631,19 @@ class AuthStateManager extends _$AuthStateManager {
         DebugLogger.auth(
           'Max retry attempts reached - stopping silent re-login',
         );
-        _update(
-          (current) => current.copyWith(
-            status: AuthStatus.error,
-            error: 'Connection issue - please retry manually',
-            clearError: false,
+        maxRetriesReached = true;
+        // Reset after 30 seconds to allow manual retry
+        unawaited(
+          resetAuthRetryStateWhenCurrent(
+            delay: Future<void>.delayed(const Duration(seconds: 30)),
+            scheduledGeneration: retryResetGeneration,
+            currentGeneration: () => _retryResetGeneration,
+            reset: () {
+              _retryCount = 0;
+              _lastRetryTime = null;
+            },
           ),
         );
-        // Reset after 30 seconds to allow manual retry
-        Future.delayed(const Duration(seconds: 30), () {
-          _retryCount = 0;
-          _lastRetryTime = null;
-        });
-        return;
       }
     } else {
       // Reset counter if enough time has passed
@@ -1924,7 +2653,7 @@ class AuthStateManager extends _$AuthStateManager {
 
     // Avoid spamming logs if multiple requests invalidate at once
     final reloginInProgress = _silentLoginFuture != null;
-    if (!reloginInProgress) {
+    if (!reloginInProgress && !maxRetriesReached) {
       DebugLogger.auth(
         'Auth token invalidated - attempting silent re-login (attempt ${_retryCount + 1}/$_maxRetries)',
       );
@@ -1939,18 +2668,450 @@ class AuthStateManager extends _$AuthStateManager {
       if (rejectedToken != null && rejectedToken.isNotEmpty) {
         await storage.deleteAuthTokenIfMatches(rejectedToken);
       }
+    } catch (e) {
+      _logAuthenticationFailure('token-delete-failed', e);
+    }
+    if (_authAttemptSuperseded(attemptRevision)) {
+      DebugLogger.auth('Token invalidation ignored after a newer auth attempt');
+      return;
+    }
+
+    try {
       await storage.clearUserScopedAuthData();
       DebugLogger.auth('Cleared invalidated token from secure storage');
-    } catch (e, stack) {
-      DebugLogger.error(
-        'token-delete-failed',
-        scope: 'auth/state',
-        error: e,
-        stackTrace: stack,
-      );
+    } catch (e) {
+      _logAuthenticationFailure('user-auth-cache-clear-failed', e);
+    }
+    if (_authAttemptSuperseded(attemptRevision)) {
+      DebugLogger.auth('Token invalidation cleanup lost auth ownership');
+      return;
     }
     _updateApiServiceToken(null);
+    _lastTransactionalSessionRevision = null;
 
+    _update(
+      (current) => current.copyWith(
+        status: maxRetriesReached ? AuthStatus.error : AuthStatus.tokenExpired,
+        error: maxRetriesReached
+            ? 'Connection issue - please retry manually'
+            : 'Session expired - please sign in again',
+        clearToken: true,
+        clearUser: true,
+        isLoading: false,
+      ),
+    );
+
+    if (maxRetriesReached) return;
+
+    // Attempt silent re-login if credentials are available
+    final hasCredentials = await storage.getSavedCredentials() != null;
+    if (_authAttemptSuperseded(attemptRevision)) {
+      DebugLogger.auth(
+        'Token invalidation re-login skipped after a newer auth attempt',
+      );
+      return;
+    }
+    if (hasCredentials && !reloginInProgress) {
+      DebugLogger.auth('Attempting silent re-login after token invalidation');
+      final success = await silentLogin();
+      if (success) {
+        // Reset retry counter on success
+        _retryResetGeneration++;
+        _retryCount = 0;
+        _lastRetryTime = null;
+      }
+    }
+  }
+
+  /// Publishes a tokenless state after logout cleanup.
+  void _publishTokenlessLogout({
+    required bool durableAuthDataCleared,
+    String? error,
+  }) {
+    final safeState = AuthState(
+      status: AuthStatus.unauthenticated,
+      isLoading: false,
+      error: error,
+    );
+    _lastSettledState = safeState;
+    _lastTransactionalSessionRevision = null;
+    _cacheManager.clearAuthCache();
+    _set(safeState);
+    _updateApiServiceToken(null);
+    if (durableAuthDataCleared) {
+      _clearIncompleteLogoutFenceAfterTokenlessCleanup();
+    } else {
+      _setIncompleteLogoutFenceInMemory(true);
+    }
+    ref.invalidate(serverConfigsProvider);
+    ref.invalidate(activeServerProvider);
+    ref.invalidate(apiServiceProvider);
+  }
+
+  Future<void> logout() async {
+    await _runLogout(clearAllAppData: false, keepServerDetails: true);
+  }
+
+  /// Signs out and wipes all local app data. When [keepServerDetails] is true,
+  /// sanitized Open WebUI connection settings are restored after the wipe.
+  Future<FullAppDataClearOutcome> logoutAndClearAppData({
+    required bool keepServerDetails,
+    required Future<void> Function() beforeClear,
+  }) {
+    return _runLogout(
+      clearAllAppData: true,
+      keepServerDetails: keepServerDetails,
+      beforeFullAppDataClear: beforeClear,
+    );
+  }
+
+  Future<FullAppDataClearOutcome> _runLogout({
+    required bool clearAllAppData,
+    required bool keepServerDetails,
+    Future<void> Function()? beforeFullAppDataClear,
+  }) async {
+    // While this counter is non-zero, `_acceptFreshlyIssuedServerToken` must
+    // not drop revocation markers: the remote sign-out may still revoke the
+    // captured bearer, and same-token resurrection has to stay rejected until
+    // this logout's cleanup and ownership arbitration have fully settled.
+    _activeLogoutOperations++;
+    try {
+      return await _logoutInternal(
+        clearAllAppData: clearAllAppData,
+        keepServerDetails: keepServerDetails,
+        beforeFullAppDataClear: beforeFullAppDataClear,
+      );
+    } finally {
+      _activeLogoutOperations--;
+    }
+  }
+
+  Future<FullAppDataClearOutcome> _logoutInternal({
+    required bool clearAllAppData,
+    required bool keepServerDetails,
+    Future<void> Function()? beforeFullAppDataClear,
+  }) async {
+    // Capture the exact client/session synchronously. Persisting the restart
+    // fence can yield long enough for another login to rotate the shared API
+    // token; the eventual remote sign-out must never adopt that newer token.
+    final logoutApi = ref.read(apiServiceProvider);
+    final logoutAuthSnapshot = logoutApi?.captureAuthSnapshot();
+    final logoutToken = logoutApi?.authToken;
+    final attemptRevision = _beginAuthAttempt();
+    _update(
+      (current) =>
+          current.copyWith(status: AuthStatus.loading, isLoading: true),
+    );
+    // Queue the shared WKWebView/Android WebView purge before any newer auth
+    // route can construct a WebView. Entry points serialize behind this future,
+    // and tokenless route publication below waits for it to complete.
+    final webViewDataClear = WebViewCookieHelper.clearAllWebViewData();
+
+    var durableAuthDataCleared = false;
+    var suppressionMarkerPersisted = false;
+    var remoteLogoutAttempted = false;
+    var fullAppDataClearPrepared = false;
+    var fullAppDataClearAttempted = false;
+    var completeLocalCleanup = false;
+    var finalizationYieldedOwnership = false;
+    Object? terminalFailure;
+
+    Future<bool> clearAuthDataForCurrentOwnership() async {
+      final storage = ref.read(optimizedStorageServiceProvider);
+      while (true) {
+        final revokedToken = remoteLogoutAttempted ? logoutToken : null;
+        await _waitForNewerAuthAttemptToSettle(
+          attemptRevision,
+          remotelyRevokedToken: revokedToken,
+        );
+        if (_newerCommittedSessionOwnsAuthData(
+          attemptRevision,
+          remotelyRevokedToken: revokedToken,
+        )) {
+          return false;
+        }
+
+        // A newer transaction may have cleared the original marker before the
+        // remote POST returned. Re-arm it from the current ownership decision
+        // so failed Keychain cleanup remains fail-closed across restart.
+        try {
+          suppressionMarkerPersisted = await ref
+              .read(incompleteLogoutFenceProvider.notifier)
+              .persist(true);
+        } catch (error) {
+          suppressionMarkerPersisted = false;
+          _logAuthenticationFailure('logout-fence-rearm-failed', error);
+        }
+        // The checked fence write yields. A different-token transaction may
+        // have committed while it was queued, and owns both durable auth data
+        // and the live API client. Re-evaluate before mutating either one.
+        if (_newerCommittedSessionOwnsAuthData(
+          attemptRevision,
+          remotelyRevokedToken: revokedToken,
+        )) {
+          return false;
+        }
+        _updateApiServiceToken(null);
+        _setIncompleteLogoutFenceInMemory(true);
+
+        if (clearAllAppData && !fullAppDataClearPrepared) {
+          await beforeFullAppDataClear!.call();
+          fullAppDataClearPrepared = true;
+          await _waitForNewerAuthAttemptToSettle(
+            attemptRevision,
+            remotelyRevokedToken: revokedToken,
+          );
+          if (_newerCommittedSessionOwnsAuthData(
+            attemptRevision,
+            remotelyRevokedToken: revokedToken,
+          )) {
+            return false;
+          }
+        }
+
+        final revokedCommitRevisionBeforeClear =
+            _newerCommittedSessionReusesRevokedToken(
+              attemptRevision,
+              revokedToken,
+            )
+            ? _authAttemptRevision
+            : null;
+        final bool cleared;
+        if (clearAllAppData) {
+          fullAppDataClearAttempted = true;
+          cleared = await storage.clearAllIf(
+            canClear: () => !_newerCommittedSessionOwnsAuthData(
+              attemptRevision,
+              remotelyRevokedToken: revokedToken,
+            ),
+            preserveServerDetails: keepServerDetails,
+          );
+        } else {
+          cleared = await storage.clearAuthDataIf(
+            canClear: () => !_newerCommittedSessionOwnsAuthData(
+              attemptRevision,
+              remotelyRevokedToken: revokedToken,
+            ),
+          );
+        }
+        if (!cleared) return false;
+
+        await _waitForNewerAuthAttemptToSettle(
+          attemptRevision,
+          remotelyRevokedToken: revokedToken,
+        );
+        if (!_newerCommittedSessionReusesRevokedToken(
+          attemptRevision,
+          revokedToken,
+        )) {
+          return true;
+        }
+        final resurrectedRevision = _authAttemptRevision;
+        _sanitizeRevokedCommittedSession(revokedToken);
+        if (revokedCommitRevisionBeforeClear == resurrectedRevision) {
+          // This exact transaction was already present when the locked clear
+          // ran, so its durable token was covered by that clear.
+          return true;
+        }
+        // A same-token transaction queued behind the clear and resurrected the
+        // jti that the server just revoked. Re-arm and clear that transaction
+        // as another locked iteration before publishing any local result.
+        DebugLogger.auth('Logout clearing a resurrected revoked session');
+      }
+    }
+
+    try {
+      // Fence restoration durably before the remote request. The live client
+      // keeps its credentials long enough to call the server logout endpoint,
+      // but a process death from this point onward restarts signed out.
+      try {
+        suppressionMarkerPersisted = await ref
+            .read(incompleteLogoutFenceProvider.notifier)
+            .persist(true, publishState: false);
+        if (!suppressionMarkerPersisted) {
+          throw StateError('Incomplete logout fence could not be persisted.');
+        }
+      } catch (error, stackTrace) {
+        _logAuthenticationFailure('logout-fence-persist-failed', error);
+        Error.throwWithStackTrace(error, stackTrace);
+      }
+
+      // Call server logout if possible
+      if (logoutApi != null) {
+        try {
+          // Once dispatched, the server may revoke the session even if the
+          // client times out, is disposed, or never receives the response.
+          // Treat this exact bearer as possibly revoked from this point on.
+          remoteLogoutAttempted = true;
+          if (logoutToken != null && logoutToken.isNotEmpty) {
+            _recentlyRevokedTokens.remove(logoutToken);
+            _recentlyRevokedTokens.add(logoutToken);
+            if (_recentlyRevokedTokens.length > 8) {
+              _recentlyRevokedTokens.removeAt(0);
+            }
+          }
+          await logoutApi.logout(authSnapshot: logoutAuthSnapshot);
+        } catch (e) {
+          _logAuthenticationFailure('server-logout-failed', e);
+        }
+      }
+
+      durableAuthDataCleared = await clearAuthDataForCurrentOwnership();
+      if (!durableAuthDataCleared) {
+        DebugLogger.auth('Logout cleanup yielded to a committed newer session');
+        return FullAppDataClearOutcome.ownershipYielded;
+      }
+
+      DebugLogger.auth(
+        clearAllAppData
+            ? keepServerDetails
+                  ? 'Logout complete - all app data cleared, server details preserved'
+                  : 'Logout complete - all app data cleared'
+            : 'Logout complete - auth data cleared, server settings preserved',
+      );
+    } catch (e) {
+      _logAuthenticationFailure('logout-failed', e);
+      if (clearAllAppData && keepServerDetails && fullAppDataClearAttempted) {
+        // The broad wipe continues past individual storage failures. Repeating
+        // it after a preservation failure would snapshot the already-cleared
+        // server store and could falsely report that requested details survived.
+        terminalFailure = e;
+      } else {
+        // Even if logout fails, clear local state where possible.
+        try {
+          durableAuthDataCleared = await clearAuthDataForCurrentOwnership();
+          if (!durableAuthDataCleared) {
+            DebugLogger.auth(
+              'Logout retry yielded to a committed newer session',
+            );
+            return FullAppDataClearOutcome.ownershipYielded;
+          }
+        } catch (clearError) {
+          _logAuthenticationFailure('logout-clear-failed', clearError);
+          terminalFailure = clearError;
+        }
+      }
+    } finally {
+      var webViewDataCleared = !isWebViewSupported;
+      try {
+        final clearResult = await webViewDataClear;
+        webViewDataCleared = !isWebViewSupported || clearResult;
+        if (!webViewDataCleared) {
+          terminalFailure ??= StateError(
+            'The shared WebView session could not be cleared.',
+          );
+        }
+      } catch (e) {
+        terminalFailure ??= e;
+        DebugLogger.warning(
+          'webview-data-clear-failed',
+          scope: 'auth/state',
+          data: {'errorType': e.runtimeType.toString()},
+        );
+      }
+
+      // A changed safety epoch alone does not supersede this logout. Logout is
+      // the operation that can resolve an uncertain older session by clearing
+      // auth data under the storage lock and retaining the restart fence when
+      // that cleanup fails. Only a genuinely newer revision owns final state.
+      final superseded =
+          !ref.mounted || _authAttemptRevision != attemptRevision;
+      final newerCommitted = _newerCommittedSessionOwnsAuthData(
+        attemptRevision,
+        remotelyRevokedToken: remoteLogoutAttempted ? logoutToken : null,
+      );
+      if (newerCommitted) {
+        finalizationYieldedOwnership = true;
+        DebugLogger.auth('Logout finalization yielded to a newer auth attempt');
+      } else if (superseded) {
+        // A newer attempt failed after the old logout was durably fenced. Do
+        // not overwrite its error state, but finish revoking the old live
+        // transport identity and independent WebView cookie store.
+        _lastTransactionalSessionRevision = null;
+        _cacheManager.clearAuthCache();
+        _update((current) {
+          if (current.isAuthenticated) {
+            return current.copyWith(
+              status: AuthStatus.tokenExpired,
+              error: 'Session expired - please sign in again',
+              clearToken: true,
+              clearUser: true,
+              isLoading: false,
+            );
+          }
+          return current.copyWith(
+            status:
+                current.status == AuthStatus.loading ||
+                    current.status == AuthStatus.initial
+                ? AuthStatus.unauthenticated
+                : current.status,
+            clearToken: true,
+            clearUser: true,
+            isLoading: false,
+          );
+        });
+        _updateApiServiceToken(null);
+        _setIncompleteLogoutFenceInMemory(true);
+        ref.invalidate(serverConfigsProvider);
+        ref.invalidate(activeServerProvider);
+        ref.invalidate(apiServiceProvider);
+      } else {
+        completeLocalCleanup = durableAuthDataCleared && webViewDataCleared;
+        final fullyFenced = completeLocalCleanup || suppressionMarkerPersisted;
+        _publishTokenlessLogout(
+          durableAuthDataCleared: completeLocalCleanup,
+          error: terminalFailure == null && fullyFenced
+              ? null
+              : 'Sign out did not finish. Please try again.',
+        );
+      }
+    }
+    if (finalizationYieldedOwnership) {
+      return FullAppDataClearOutcome.ownershipYielded;
+    }
+    return completeLocalCleanup
+        ? FullAppDataClearOutcome.cleared
+        : FullAppDataClearOutcome.incomplete;
+  }
+
+  bool _newerCommittedSessionOwnsAuthData(
+    int logoutRevision, {
+    String? remotelyRevokedToken,
+  }) {
+    final currentRevision = _authAttemptRevision;
+    final current = _current;
+    return currentRevision != logoutRevision &&
+        _currentRevisionOwnsCommittedSession() &&
+        (remotelyRevokedToken == null || current.token != remotelyRevokedToken);
+  }
+
+  bool _newerCommittedSessionReusesRevokedToken(
+    int logoutRevision,
+    String? remotelyRevokedToken,
+  ) {
+    if (remotelyRevokedToken == null) return false;
+    final currentRevision = _authAttemptRevision;
+    final current = _current;
+    return currentRevision != logoutRevision &&
+        _currentRevisionOwnsCommittedSession() &&
+        current.token == remotelyRevokedToken;
+  }
+
+  /// Durable auth ownership is transactional metadata, not presentation
+  /// state. A committed session remains the owner while the UI temporarily
+  /// shows loading or a recoverable connection error, provided its revision,
+  /// bearer, and user identity are still intact.
+  bool _currentRevisionOwnsCommittedSession() {
+    final current = _current;
+    return _lastTransactionalSessionRevision == _authAttemptRevision &&
+        current.hasValidToken &&
+        current.user != null;
+  }
+
+  void _sanitizeRevokedCommittedSession(String? revokedToken) {
+    if (revokedToken == null || _current.token != revokedToken) return;
+    _lastTransactionalSessionRevision = null;
+    _cacheManager.clearAuthCache();
     _update(
       (current) => current.copyWith(
         status: AuthStatus.tokenExpired,
@@ -1960,142 +3121,244 @@ class AuthStateManager extends _$AuthStateManager {
         isLoading: false,
       ),
     );
-
-    // Attempt silent re-login if credentials are available
-    final hasCredentials = await storage.getSavedCredentials() != null;
-    if (hasCredentials && !reloginInProgress) {
-      DebugLogger.auth('Attempting silent re-login after token invalidation');
-      final success = await silentLogin();
-      if (success) {
-        // Reset retry counter on success
-        _retryCount = 0;
-        _lastRetryTime = null;
-      }
-    }
+    _updateApiServiceToken(null);
   }
 
-  /// Logout user and clear auth data while preserving server configuration.
-  /// Server settings (URL, custom headers, self-signed cert) are kept so users
-  /// can quickly re-login. Users can navigate to server connection page to
-  /// change server settings if needed.
-  Future<void> logout() async {
-    _beginAuthAttempt();
-    _update(
-      (current) =>
-          current.copyWith(status: AuthStatus.loading, isLoading: true),
-    );
-
-    try {
-      // Call server logout if possible
-      final api = ref.read(apiServiceProvider);
-      if (api != null) {
-        try {
-          await api.logout();
-        } catch (e) {
-          DebugLogger.warning(
-            'server-logout-failed',
-            scope: 'auth/state',
-            data: {'error': e.toString()},
-          );
-        }
+  Future<void> _waitForNewerAuthAttemptToSettle(
+    int logoutRevision, {
+    String? remotelyRevokedToken,
+  }) async {
+    final settleTimer = Stopwatch()..start();
+    while (ref.mounted && _authAttemptRevision != logoutRevision) {
+      if (_newerCommittedSessionOwnsAuthData(
+        logoutRevision,
+        remotelyRevokedToken: remotelyRevokedToken,
+      )) {
+        return;
       }
-
-      // Clear auth data but preserve server configs (URL, headers, cert settings)
-      final storage = ref.read(optimizedStorageServiceProvider);
-      await storage.clearAuthData();
-      _updateApiServiceToken(null);
-
-      // Clear all WebView data (cookies, localStorage, cache) to ensure
-      // fresh SSO sessions on next login
-      try {
-        await WebViewCookieHelper.clearAllWebViewData();
-      } catch (e) {
+      final current = _current;
+      if (!current.isLoading &&
+          current.status != AuthStatus.loading &&
+          current.status != AuthStatus.initial) {
+        return;
+      }
+      if (settleTimer.elapsed >= _newerAuthAttemptSettleGrace) {
         DebugLogger.warning(
-          'webview-data-clear-failed',
+          'newer-auth-attempt-settle-deadline-reached',
           scope: 'auth/state',
-          data: {'error': e.toString()},
+          data: {'graceMs': _newerAuthAttemptSettleGrace.inMilliseconds},
         );
+        return;
       }
-
-      // Keep active server ID so router redirects to sign-in page, not server
-      // connection page. Users can navigate to server settings if they need to
-      // change server configuration.
-
-      // Clear auth cache manager
-      _cacheManager.clearAuthCache();
-
-      // Update state
-      _update(
-        (current) => current.copyWith(
-          status: AuthStatus.unauthenticated,
-          isLoading: false,
-          clearToken: true,
-          clearUser: true,
-          clearError: true,
-        ),
-      );
-
-      DebugLogger.auth(
-        'Logout complete - auth data cleared, server config preserved for quick re-login',
-      );
-    } catch (e, stack) {
-      DebugLogger.error(
-        'logout-failed',
-        scope: 'auth/state',
-        error: e,
-        stackTrace: stack,
-      );
-      // Even if logout fails, clear local state where possible
-      final storage = ref.read(optimizedStorageServiceProvider);
-      try {
-        await storage.clearAuthData();
-      } catch (clearError) {
-        DebugLogger.error(
-          'logout-clear-failed',
-          scope: 'auth/state',
-          error: clearError,
-        );
-      }
-      // Keep active server ID for redirect to sign-in page
-      _cacheManager.clearAuthCache();
-
-      _update(
-        (current) => current.copyWith(
-          status: AuthStatus.unauthenticated,
-          isLoading: false,
-          clearToken: true,
-          clearUser: true,
-          error:
-              'Logout error: $e. Some data may remain stored; '
-              'please clear app data from your device settings if needed.',
-        ),
-      );
-      _updateApiServiceToken(null);
+      await Future<void>.delayed(const Duration(milliseconds: 10));
     }
   }
 
   /// Preload the default model as soon as authentication succeeds.
-  void _preloadDefaultModel() {
-    Future.microtask(() async {
-      if (!ref.mounted) return;
-      try {
-        await ref.read(defaultModelProvider.future);
-        DebugLogger.auth('Default model preload requested');
-      } catch (e) {
-        if (!ref.mounted) return;
-        DebugLogger.warning(
-          'default-model-preload-failed',
-          scope: 'auth/state',
-          data: {'error': e.toString()},
-        );
-      }
-    });
-  }
-
   /// Update API service with current token
   void _updateApiServiceToken(String? token) {
+    ref.read(apiAuthTokenMirrorProvider.notifier).set(token);
     final api = ref.read(apiServiceProvider);
     api?.updateAuthToken(token);
+  }
+
+  void _setIncompleteLogoutFenceInMemory(bool suppressed) {
+    final api = ref.read(apiServiceProvider);
+    api?.setCookieCustomHeaderSuppressed(suppressed);
+    ref.read(incompleteLogoutFenceProvider.notifier).setSuppressed(suppressed);
+  }
+
+  void _clearIncompleteLogoutFenceAfterTokenlessCleanup() {
+    final fence = ref.read(incompleteLogoutFenceProvider.notifier);
+
+    Future<void> restoreFailedClear(
+      Object error,
+      StackTrace stack,
+      int failedGeneration,
+    ) async {
+      _logAuthenticationFailure(
+        'logout-fence-clear-failed',
+        error,
+        stackTrace: stack,
+      );
+      if (!ref.mounted ||
+          !fence.desiredSuppressed ||
+          !fence.ownsRequest(failedGeneration)) {
+        return;
+      }
+      fence.setSuppressed(true);
+      try {
+        await fence.persist(true);
+      } catch (restoreError, restoreStack) {
+        _logAuthenticationFailure(
+          'logout-fence-clear-restore-failed',
+          restoreError,
+          stackTrace: restoreStack,
+        );
+      }
+    }
+
+    final clearOperation = fence.persist(false, publishState: false);
+    final clearGeneration = fence.requestGeneration;
+    unawaited(
+      clearOperation.then<void>(
+        (cleared) async {
+          if (cleared && ref.mounted && !fence.desiredSuppressed) {
+            _setIncompleteLogoutFenceInMemory(false);
+            return;
+          }
+          if (!cleared && fence.ownsRequest(clearGeneration)) {
+            await restoreFailedClear(
+              StateError('Incomplete logout fence could not be cleared.'),
+              StackTrace.current,
+              clearGeneration,
+            );
+          }
+        },
+        onError: (error, stack) {
+          return restoreFailedClear(error, stack, clearGeneration);
+        },
+      ),
+    );
+  }
+
+  /// Removes a durable incomplete-logout fence before exposing a newly
+  /// authenticated session. This callback is awaited by the storage
+  /// transaction while its auth/config locks remain held, so a failed checked
+  /// preference write rolls the new token and ownership changes back.
+  Future<void> _publishCommittedAuthenticatedSession({
+    required int attemptRevision,
+    required String candidateToken,
+    required void Function() publish,
+  }) async {
+    if (_authAttemptSuperseded(attemptRevision)) {
+      throw StateError('Authentication attempt was superseded before publish.');
+    }
+    final fence = ref.read(incompleteLogoutFenceProvider.notifier);
+    final fenceWasSet =
+        fence.desiredSuppressed ||
+        ref.read(incompleteLogoutFenceProvider) ||
+        PreferencesStore.getBool(PreferenceKeys.incompleteLogoutFence) == true;
+    int? fenceClearGeneration;
+    if (fenceWasSet) {
+      try {
+        if (_authAttemptSuperseded(attemptRevision)) {
+          throw StateError(
+            'Authentication attempt was superseded before fence clear.',
+          );
+        }
+        final clearOperation = fence.persist(false, publishState: false);
+        fenceClearGeneration = fence.requestGeneration;
+        final cleared = await clearOperation;
+        if (!cleared || fence.desiredSuppressed) {
+          throw StateError('Incomplete logout fence could not be cleared.');
+        }
+        if (_authAttemptSuperseded(attemptRevision)) {
+          throw StateError(
+            'Authentication attempt was superseded during fence clear.',
+          );
+        }
+      } catch (commitError, commitStackTrace) {
+        final newerFenceRequest =
+            fenceClearGeneration != null &&
+            !fence.ownsRequest(fenceClearGeneration);
+        final newerAuthAttempt =
+            ref.mounted && _authAttemptRevision != attemptRevision;
+        if (!newerFenceRequest && !newerAuthAttempt) {
+          try {
+            final restored = await fence.persist(true);
+            if (!restored) {
+              throw StateError(
+                'Incomplete logout fence could not be restored.',
+              );
+            }
+          } catch (rollbackError, rollbackStackTrace) {
+            _poisonUncertainServerSession(
+              failedAttemptRevision: attemptRevision,
+            );
+            Error.throwWithStackTrace(
+              ServerConfigSessionRollbackException(
+                commitError: commitError,
+                rollbackError: rollbackError,
+              ),
+              rollbackStackTrace,
+            );
+          }
+        }
+        Error.throwWithStackTrace(commitError, commitStackTrace);
+      }
+    }
+
+    // No await occurs between this ownership check and the synchronous state
+    // publication below, so another auth attempt cannot interleave on the
+    // isolate after this point.
+    if (_authAttemptSuperseded(attemptRevision)) {
+      throw StateError('Authentication attempt was superseded before publish.');
+    }
+    try {
+      if (_recentlyRevokedTokens.contains(candidateToken)) {
+        throw StateError(
+          'Authentication token was revoked before session publication.',
+        );
+      }
+      publish();
+      if (_authAttemptSuperseded(attemptRevision)) {
+        throw StateError(
+          'Authentication attempt was superseded by a publication listener.',
+        );
+      }
+    } catch (commitError, commitStackTrace) {
+      // The callback may have partially updated Riverpod state. If publication
+      // itself started a newer auth operation through a synchronous listener,
+      // that operation now owns memory/API recovery and may need the captured
+      // bearer to finish a remote logout. The storage transaction will roll
+      // this failed commit back; only an actually uncertain rollback invokes
+      // its onRollbackUncertain poison callback. With no newer revision, scrub
+      // the partial publication immediately.
+      if (ref.mounted && _authAttemptRevision != attemptRevision) {
+        if (_lastTransactionalSessionRevision == attemptRevision) {
+          _lastTransactionalSessionRevision = null;
+        }
+      } else {
+        // Durable rollback still runs in the storage transaction after this
+        // callback throws. Revoke the candidate bearer immediately, but do not
+        // advance the uncertainty epoch: a successful rollback restores the
+        // captured prior in-memory session at the transaction call boundary.
+        try {
+          _lastTransactionalSessionRevision = null;
+          _set(const AuthState(status: AuthStatus.loading, isLoading: true));
+          _updateApiServiceToken(null);
+          ref.invalidate(apiServiceProvider);
+        } catch (recoveryError, recoveryStackTrace) {
+          _logAuthenticationFailure(
+            'partial-auth-publication-scrub-failed',
+            recoveryError,
+            stackTrace: recoveryStackTrace,
+          );
+        }
+      }
+      if (fenceWasSet &&
+          (!ref.mounted || _authAttemptRevision == attemptRevision)) {
+        try {
+          final restored = await fence.persist(true);
+          if (!restored) {
+            throw StateError('Incomplete logout fence could not be restored.');
+          }
+          if (ref.mounted && _authAttemptRevision == attemptRevision) {
+            _setIncompleteLogoutFenceInMemory(true);
+          }
+        } catch (rollbackError, rollbackStackTrace) {
+          Error.throwWithStackTrace(
+            ServerConfigSessionRollbackException(
+              commitError: commitError,
+              rollbackError: rollbackError,
+            ),
+            rollbackStackTrace,
+          );
+        }
+      }
+      Error.throwWithStackTrace(commitError, commitStackTrace);
+    }
   }
 
   /// Validate token format using advanced validation
@@ -2127,11 +3390,34 @@ class AuthStateManager extends _$AuthStateManager {
 
   /// Refresh current auth state
   Future<void> refresh() async {
+    final inheritedRevision = _authAttemptRevision;
+    final inheritedToken = _currentRevisionOwnsCommittedSession()
+        ? _current.token
+        : null;
+    final attemptRevision = _beginAuthAttempt();
+    // Refresh does not create a new durable session; it temporarily advances
+    // the attempt revision while retaining the exact already-committed owner.
+    // Carry that ownership synchronously so incidental error/loading UI updates
+    // cannot open a window where an older logout clears the retained session.
+    // `_initialize` revokes this carry as soon as strict storage proves the
+    // token missing, changed, fenced, or invalid.
+    if (inheritedToken != null &&
+        _lastTransactionalSessionRevision == inheritedRevision &&
+        _current.token == inheritedToken &&
+        _current.user != null) {
+      _lastTransactionalSessionRevision = attemptRevision;
+    }
     // Clear cache before refresh to ensure fresh data
     _cacheManager.clearAuthCache();
     TokenValidationCache.clearCache();
 
-    await _initialize();
+    await _initialize(
+      attemptRevision: attemptRevision,
+      inheritedTransactionalRevision: inheritedToken == null
+          ? null
+          : attemptRevision,
+      inheritedTransactionalToken: inheritedToken,
+    );
   }
 
   /// Clean up expired caches (called periodically)

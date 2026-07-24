@@ -6,14 +6,13 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'dart:io' show Platform;
 
 import '../../../shared/theme/theme_extensions.dart';
-import '../../../shared/widgets/sheet_handle.dart';
 import '../../../shared/widgets/conduit_components.dart';
-import '../../../shared/widgets/modal_safe_area.dart';
 import '../../../shared/widgets/model_avatar.dart';
 import '../../../core/models/toggle_filter.dart';
 import '../../../core/providers/app_providers.dart';
 import '../../tools/providers/tools_providers.dart';
 import '../../terminal/providers/terminal_providers.dart';
+import '../../direct_connections/direct_connections.dart';
 import '../providers/chat_providers.dart';
 import 'composer_overflow_items.dart';
 import 'package:conduit/l10n/app_localizations.dart';
@@ -125,10 +124,17 @@ List<Widget> withHorizontalSpacing(List<Widget> children, double gap) {
   return spaced;
 }
 
-/// Bottom sheet for attachment and overflow options in the chat composer.
-class ComposerOverflowSheet extends ConsumerStatefulWidget {
-  const ComposerOverflowSheet({
+/// Keyboard-height attachment and overflow panel for the chat composer.
+///
+/// The panel intentionally follows the compact interaction used by messaging
+/// apps: attachment actions stay in a horizontally scrolling strip while
+/// secondary toggles and tools scroll vertically below it.
+class ComposerAttachmentKeyboard extends ConsumerStatefulWidget {
+  const ComposerAttachmentKeyboard({
     super.key,
+    this.localAttachmentsOnly = false,
+    this.height = 300,
+    this.onDismiss,
     this.onFileAttachment,
     this.onServerFileAttachment,
     this.onImageAttachment,
@@ -136,6 +142,12 @@ class ComposerOverflowSheet extends ConsumerStatefulWidget {
     this.onWebAttachment,
   });
 
+  /// Restricts the sheet to device-local attachment actions supplied by the
+  /// caller. Used by backends such as Hermes that cannot resolve OpenWebUI
+  /// server files, web pages, feature toggles, tools, integrations, or filters.
+  final bool localAttachmentsOnly;
+  final double height;
+  final VoidCallback? onDismiss;
   final VoidCallback? onFileAttachment;
   final VoidCallback? onServerFileAttachment;
   final VoidCallback? onImageAttachment;
@@ -143,18 +155,13 @@ class ComposerOverflowSheet extends ConsumerStatefulWidget {
   final VoidCallback? onWebAttachment;
 
   @override
-  ConsumerState<ComposerOverflowSheet> createState() =>
-      _ComposerOverflowSheetState();
+  ConsumerState<ComposerAttachmentKeyboard> createState() =>
+      _ComposerAttachmentKeyboardState();
 }
 
-class _ComposerOverflowSheetState extends ConsumerState<ComposerOverflowSheet> {
+class _ComposerAttachmentKeyboardState
+    extends ConsumerState<ComposerAttachmentKeyboard> {
   Future<Map<String, dynamic>?>? _userSettingsFuture;
-
-  @override
-  void initState() {
-    super.initState();
-    _userSettingsFuture = _loadUserSettings();
-  }
 
   Future<Map<String, dynamic>?> _loadUserSettings() async {
     final api = ref.read(apiServiceProvider);
@@ -173,16 +180,43 @@ class _ComposerOverflowSheetState extends ConsumerState<ComposerOverflowSheet> {
   Widget build(BuildContext context) {
     final l10n = AppLocalizations.of(context)!;
     final theme = context.conduitTheme;
-    final attachmentItems = buildComposerOverflowAttachmentItems(
-      l10n: l10n,
-      attachmentAvailability: ComposerOverflowAttachmentAvailability(
-        file: widget.onFileAttachment != null,
-        serverFile: widget.onServerFileAttachment != null,
-        photo: widget.onImageAttachment != null,
-        camera: widget.onCameraCapture != null,
-        web: widget.onWebAttachment != null,
-      ),
-    );
+    final selectedModel = ref.watch(selectedModelProvider);
+    final directMode =
+        selectedModel != null &&
+        ref.watch(directModelRegistryProvider).resolve(selectedModel) != null;
+    final restrictedMode = directMode || widget.localAttachmentsOnly;
+    // Direct and local-only backends have no OpenWebUI integrations to
+    // discover. Resolve the request lazily because direct provenance is only
+    // available once providers can be read during build.
+    final userSettingsFuture = restrictedMode
+        ? null
+        : (_userSettingsFuture ??= _loadUserSettings());
+    final attachmentItems =
+        buildComposerOverflowAttachmentItems(
+          l10n: l10n,
+          attachmentAvailability: ComposerOverflowAttachmentAvailability(
+            file: widget.onFileAttachment != null,
+            serverFile:
+                !restrictedMode && widget.onServerFileAttachment != null,
+            photo: widget.onImageAttachment != null,
+            camera: widget.onCameraCapture != null,
+            web: !restrictedMode && widget.onWebAttachment != null,
+          ),
+        ).where((item) {
+          if (widget.localAttachmentsOnly) {
+            return item.enabled &&
+                (item.id == ComposerOverflowActionIds.file ||
+                    item.id == ComposerOverflowActionIds.photo ||
+                    item.id == ComposerOverflowActionIds.camera);
+          }
+          if (!directMode) {
+            return true;
+          }
+          return item.enabled &&
+              (item.id == ComposerOverflowActionIds.file ||
+                  item.id == ComposerOverflowActionIds.photo ||
+                  item.id == ComposerOverflowActionIds.camera);
+        });
 
     final attachments = attachmentItems
         .map(
@@ -191,6 +225,7 @@ class _ComposerOverflowSheetState extends ConsumerState<ComposerOverflowSheet> {
         )
         .toList();
 
+<<<<<<< HEAD
     final webSearchAvailable = ref.watch(webSearchAvailableProvider);
     final webSearchEnabled = ref.watch(webSearchEnabledProvider);
     final imageGenAvailable = ref.watch(imageGenerationAvailableProvider);
@@ -199,6 +234,18 @@ class _ComposerOverflowSheetState extends ConsumerState<ComposerOverflowSheet> {
       codeInterpreterAvailableProvider,
     );
     final codeInterpreterEnabled = ref.watch(codeInterpreterEnabledProvider);
+=======
+    // Ollama Cloud exposes a permission-aware native web-search tool even
+    // though direct connections cannot use OpenWebUI-managed tools.
+    final webSearchAvailable =
+        !widget.localAttachmentsOnly && ref.watch(webSearchAvailableProvider);
+    final webSearchEnabled =
+        !widget.localAttachmentsOnly && ref.watch(webSearchEnabledProvider);
+    final imageGenAvailable =
+        !restrictedMode && ref.watch(imageGenerationAvailableProvider);
+    final imageGenEnabled =
+        !restrictedMode && ref.watch(imageGenerationEnabledProvider);
+>>>>>>> origin/pr-13-head
     final featureTiles =
         buildComposerOverflowFeatureItems(
           l10n: l10n,
@@ -221,167 +268,182 @@ class _ComposerOverflowSheetState extends ConsumerState<ComposerOverflowSheet> {
           );
         }).toList();
 
-    final selectedToolIds = ref.watch(selectedToolIdsProvider);
-    final selectedTerminalId = ref.watch(selectedTerminalIdProvider);
-    final availableTerminalServersAsync = ref.watch(
-      terminalAvailableServersProvider,
-    );
-    final toolsAsync = ref.watch(toolsListProvider);
-    final toolsSection = toolsAsync.when(
-      data: (tools) {
-        final toolItems = buildComposerOverflowToolItems(
-          availableTools: tools,
-          selectedToolIds: selectedToolIds,
-        );
-        if (toolItems.isEmpty) return _buildInfoCard(l10n.noToolsAvailable);
-        final tiles = toolItems.map((item) {
-          return _buildOverflowItemTile(
-            item: item,
-            onChanged: (selected) {
-              setComposerOverflowSelection(
-                ref,
-                actionId: item.id,
-                selected: selected,
+    final selectedToolIds = restrictedMode
+        ? const <String>[]
+        : ref.watch(selectedToolIdsProvider);
+    final selectedTerminalId = restrictedMode
+        ? null
+        : ref.watch(selectedTerminalIdProvider);
+    final availableTerminalServersAsync = restrictedMode
+        ? null
+        : ref.watch(terminalAvailableServersProvider);
+    final toolsAsync = restrictedMode ? null : ref.watch(toolsListProvider);
+    final toolsSection = restrictedMode
+        ? const SizedBox.shrink()
+        : toolsAsync!.when(
+            data: (tools) {
+              final toolItems = buildComposerOverflowToolItems(
+                availableTools: tools,
+                selectedToolIds: selectedToolIds,
               );
+              if (toolItems.isEmpty) {
+                return _buildInfoCard(l10n.noToolsAvailable);
+              }
+              final tiles = toolItems.map((item) {
+                return _buildOverflowItemTile(
+                  item: item,
+                  onChanged: (selected) {
+                    setComposerOverflowSelection(
+                      ref,
+                      actionId: item.id,
+                      selected: selected,
+                    );
+                  },
+                );
+              }).toList();
+              return Column(children: withVerticalSpacing(tiles, Spacing.xxs));
+            },
+            loading: () => Center(
+              child: SizedBox(
+                width: 24,
+                height: 24,
+                child: CircularProgressIndicator(strokeWidth: BorderWidth.thin),
+              ),
+            ),
+            error: (_, _) => _buildInfoCard(l10n.failedToLoadTools),
+          );
+    final integrationsSection = restrictedMode
+        ? const SizedBox.shrink()
+        : FutureBuilder<Map<String, dynamic>?>(
+            future: userSettingsFuture,
+            builder: (context, snapshot) {
+              final settings = snapshot.data;
+              final directToolServers = _extractConfiguredServers(
+                settings,
+                'toolServers',
+              );
+              final directToolTiles = <Widget>[];
+              for (var index = 0; index < directToolServers.length; index++) {
+                final server = directToolServers[index];
+                if (!_isServerEnabled(server)) {
+                  continue;
+                }
+
+                final selectionId = _directServerSelectionId(server, index);
+                final isSelected = selectedToolIds.contains(selectionId);
+                directToolTiles.add(
+                  _buildToggleTile(
+                    icon: Platform.isIOS
+                        ? CupertinoIcons.square_stack_3d_down_right
+                        : Icons.hub_outlined,
+                    title: _serverTitle(
+                      server,
+                      fallbackPrefix: l10n.toolServer,
+                    ),
+                    subtitle: _serverSubtitle(server),
+                    value: isSelected,
+                    onChanged: (_) {
+                      final current = List<String>.from(
+                        ref.read(selectedToolIdsProvider),
+                      );
+                      if (isSelected) {
+                        current.remove(selectionId);
+                      } else {
+                        current.add(selectionId);
+                      }
+                      ref.read(selectedToolIdsProvider.notifier).set(current);
+                    },
+                  ),
+                );
+              }
+
+              final terminalTiles = availableTerminalServersAsync!.maybeWhen(
+                data: (servers) {
+                  return servers
+                      .map((server) {
+                        final isSelected =
+                            selectedTerminalId == server.selectionId;
+                        return _buildToggleTile(
+                          icon: Platform.isIOS
+                              ? CupertinoIcons.chevron_left_slash_chevron_right
+                              : Icons.terminal_rounded,
+                          title: server.displayName,
+                          subtitle: server.subtitle,
+                          value: isSelected,
+                          onChanged: (_) async {
+                            await ref
+                                .read(terminalSelectionControllerProvider)
+                                .toggle(server);
+                          },
+                        );
+                      })
+                      .toList(growable: false);
+                },
+                orElse: () => const <Widget>[],
+              );
+
+              if (directToolTiles.isEmpty && terminalTiles.isEmpty) {
+                return const SizedBox.shrink();
+              }
+
+              final children = <Widget>[];
+              if (directToolTiles.isNotEmpty) {
+                children
+                  ..add(_buildSectionLabel(l10n.toolServers))
+                  ..add(
+                    Column(
+                      children: withVerticalSpacing(
+                        directToolTiles,
+                        Spacing.xxs,
+                      ),
+                    ),
+                  );
+              }
+              if (terminalTiles.isNotEmpty) {
+                if (children.isNotEmpty) {
+                  children.add(const SizedBox(height: Spacing.sm));
+                }
+                children
+                  ..add(_buildSectionLabel(l10n.terminal))
+                  ..add(
+                    Column(
+                      children: withVerticalSpacing(terminalTiles, Spacing.xxs),
+                    ),
+                  );
+              }
+
+              return Column(children: children);
             },
           );
-        }).toList();
-        return Column(children: withVerticalSpacing(tiles, Spacing.xxs));
-      },
-      loading: () => Center(
-        child: SizedBox(
-          width: 24,
-          height: 24,
-          child: CircularProgressIndicator(strokeWidth: BorderWidth.thin),
-        ),
-      ),
-      error: (_, _) => _buildInfoCard(l10n.failedToLoadTools),
-    );
-    final integrationsSection = FutureBuilder<Map<String, dynamic>?>(
-      future: _userSettingsFuture,
-      builder: (context, snapshot) {
-        final settings = snapshot.data;
-        final directToolServers = _extractConfiguredServers(
-          settings,
-          'toolServers',
-        );
-        final directToolTiles = <Widget>[];
-        for (var index = 0; index < directToolServers.length; index++) {
-          final server = directToolServers[index];
-          if (!_isServerEnabled(server)) {
-            continue;
-          }
-
-          final selectionId = _directServerSelectionId(server, index);
-          final isSelected = selectedToolIds.contains(selectionId);
-          directToolTiles.add(
-            _buildToggleTile(
-              icon: Platform.isIOS
-                  ? CupertinoIcons.square_stack_3d_down_right
-                  : Icons.hub_outlined,
-              title: _serverTitle(server, fallbackPrefix: l10n.toolServer),
-              subtitle: _serverSubtitle(server),
-              value: isSelected,
-              onChanged: (_) {
-                final current = List<String>.from(
-                  ref.read(selectedToolIdsProvider),
-                );
-                if (isSelected) {
-                  current.remove(selectionId);
-                } else {
-                  current.add(selectionId);
-                }
-                ref.read(selectedToolIdsProvider.notifier).set(current);
-              },
-            ),
-          );
-        }
-
-        final terminalTiles = availableTerminalServersAsync.maybeWhen(
-          data: (servers) {
-            return servers
-                .map((server) {
-                  final isSelected = selectedTerminalId == server.selectionId;
-                  return _buildToggleTile(
-                    icon: Platform.isIOS
-                        ? CupertinoIcons.chevron_left_slash_chevron_right
-                        : Icons.terminal_rounded,
-                    title: server.displayName,
-                    subtitle: server.subtitle,
-                    value: isSelected,
-                    onChanged: (_) async {
-                      await ref
-                          .read(terminalSelectionControllerProvider)
-                          .toggle(server);
-                    },
-                  );
-                })
-                .toList(growable: false);
-          },
-          orElse: () => const <Widget>[],
-        );
-
-        if (directToolTiles.isEmpty && terminalTiles.isEmpty) {
-          return const SizedBox.shrink();
-        }
-
-        final children = <Widget>[];
-        if (directToolTiles.isNotEmpty) {
-          children
-            ..add(_buildSectionLabel(l10n.toolServers))
-            ..add(
-              Column(
-                children: withVerticalSpacing(directToolTiles, Spacing.xxs),
-              ),
-            );
-        }
-        if (terminalTiles.isNotEmpty) {
-          if (children.isNotEmpty) {
-            children.add(const SizedBox(height: Spacing.sm));
-          }
-          children
-            ..add(_buildSectionLabel(l10n.terminal))
-            ..add(
-              Column(children: withVerticalSpacing(terminalTiles, Spacing.xxs)),
-            );
-        }
-
-        return Column(children: children);
-      },
-    );
 
     final listItems = <Widget>[
-      const SheetHandle(),
-      const SizedBox(height: Spacing.sm),
-      Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: withHorizontalSpacing(
-                attachments
-                    .map((attachment) => Expanded(child: attachment))
-                    .toList(),
-                Spacing.sm,
-              ),
-            ),
-          ),
-        ],
+      SizedBox(
+        height: 94,
+        child: ListView.separated(
+          key: const ValueKey('composer-attachment-action-strip'),
+          scrollDirection: Axis.horizontal,
+          physics: const BouncingScrollPhysics(),
+          padding: const EdgeInsets.symmetric(horizontal: Spacing.md),
+          itemCount: attachments.length,
+          separatorBuilder: (_, _) => const SizedBox(width: Spacing.sm),
+          itemBuilder: (_, index) =>
+              SizedBox(width: 76, child: attachments[index]),
+        ),
       ),
       if (featureTiles.isNotEmpty) ...[
-        const SizedBox(height: Spacing.sm),
+        const SizedBox(height: Spacing.xs),
         ...withVerticalSpacing(featureTiles, Spacing.xxs),
       ],
-      const SizedBox(height: Spacing.sm),
-      _buildSectionLabel(l10n.tools),
-      toolsSection,
-      integrationsSection,
+      if (!restrictedMode) ...[
+        const SizedBox(height: Spacing.sm),
+        _buildSectionLabel(l10n.tools),
+        toolsSection,
+        integrationsSection,
+      ],
     ];
 
-    final selectedModel = ref.watch(selectedModelProvider);
     final toggleFilters = selectedModel?.filters ?? const <ToggleFilter>[];
-    if (toggleFilters.isNotEmpty) {
+    if (!restrictedMode && toggleFilters.isNotEmpty) {
       final selectedFilterIds = ref.watch(selectedFilterIdsProvider);
       final filterTiles = toggleFilters.map((filter) {
         final isSelected = selectedFilterIds.contains(filter.id);
@@ -398,52 +460,45 @@ class _ComposerOverflowSheetState extends ConsumerState<ComposerOverflowSheet> {
         ..add(Column(children: withVerticalSpacing(filterTiles, Spacing.xxs)));
     }
 
-    listItems.add(const SizedBox(height: Spacing.sm));
+    listItems.add(const SizedBox(height: Spacing.md));
 
-    return Stack(
-      children: [
-        Positioned.fill(
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () => Navigator.of(context).maybePop(),
-            child: const SizedBox.shrink(),
+    return Material(
+      key: const ValueKey('composer-attachment-keyboard'),
+      color: theme.surfaceBackground,
+      child: Container(
+        height: widget.height,
+        decoration: BoxDecoration(
+          border: Border(
+            top: BorderSide(color: theme.dividerColor, width: BorderWidth.thin),
           ),
-        ),
-        DraggableScrollableSheet(
-          expand: false,
-          initialChildSize: 0.28,
-          minChildSize: 0.28,
-          maxChildSize: 0.92,
-          snap: true,
-          snapSizes: const [0.28, 0.92],
-          builder: (_, scrollController) => Container(
-            decoration: BoxDecoration(
-              color: theme.surfaceBackground,
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(AppBorderRadius.bottomSheet),
+          boxShadow: [
+            BoxShadow(
+              color: theme.cardShadow.withValues(
+                alpha: Theme.of(context).brightness == Brightness.dark
+                    ? 0.22
+                    : 0.10,
               ),
-              border: Border.all(
-                color: theme.dividerColor,
-                width: BorderWidth.thin,
-              ),
-              boxShadow: ConduitShadows.modal(context),
+              blurRadius: 18,
+              spreadRadius: -10,
+              offset: const Offset(0, -8),
             ),
-            child: ModalSheetSafeArea(
-              padding: const EdgeInsets.fromLTRB(
-                Spacing.md,
-                Spacing.xs,
-                Spacing.md,
-                0,
-              ),
-              child: ListView.builder(
-                controller: scrollController,
-                itemCount: listItems.length,
-                itemBuilder: (_, i) => listItems[i],
-              ),
+          ],
+        ),
+        child: SafeArea(
+          top: false,
+          child: ListView.builder(
+            key: const ValueKey('composer-attachment-panel-scroll'),
+            padding: const EdgeInsets.only(top: Spacing.md),
+            itemCount: listItems.length,
+            itemBuilder: (_, i) => Padding(
+              padding: i == 0
+                  ? EdgeInsets.zero
+                  : const EdgeInsets.symmetric(horizontal: Spacing.md),
+              child: listItems[i],
             ),
           ),
         ),
-      ],
+      ),
     );
   }
 
@@ -587,52 +642,65 @@ class _ComposerOverflowSheetState extends ConsumerState<ComposerOverflowSheet> {
         ? theme.sidebarForeground
         : theme.sidebarForeground.withValues(alpha: Alpha.disabled);
 
-    return Opacity(
-      opacity: enabled ? 1.0 : Alpha.disabled,
-      child: ConduitCard(
-        padding: const EdgeInsets.symmetric(
-          horizontal: Spacing.xs,
-          vertical: Spacing.sm,
-        ),
-        onTap: onTap == null
-            ? null
-            : () {
-                ConduitHaptics.lightImpact();
-                Navigator.of(context).pop();
-                Future.microtask(onTap);
-              },
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 40,
-              height: 40,
-              decoration: BoxDecoration(
-                color: enabled
-                    ? iconColor.withValues(alpha: 0.1)
-                    : theme.surfaceContainer.withValues(alpha: 0.60),
-                borderRadius: BorderRadius.circular(AppBorderRadius.small),
-                border: Border.all(
-                  color: enabled
-                      ? iconColor.withValues(alpha: 0.2)
-                      : Colors.transparent,
-                  width: BorderWidth.thin,
+    return Semantics(
+      button: true,
+      enabled: enabled,
+      label: item.label,
+      excludeSemantics: true,
+      child: Opacity(
+        opacity: enabled ? 1.0 : Alpha.disabled,
+        child: Material(
+          color: Colors.transparent,
+          borderRadius: BorderRadius.circular(AppBorderRadius.small),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: onTap == null
+                ? null
+                : () {
+                    ConduitHaptics.lightImpact();
+                    widget.onDismiss?.call();
+                    Future.microtask(onTap);
+                  },
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 76,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: enabled
+                        ? iconColor.withValues(alpha: 0.10)
+                        : theme.surfaceContainer.withValues(alpha: 0.60),
+                    borderRadius: BorderRadius.circular(AppBorderRadius.round),
+                    border: Border.all(
+                      color: enabled
+                          ? iconColor.withValues(alpha: 0.18)
+                          : Colors.transparent,
+                      width: BorderWidth.thin,
+                    ),
+                  ),
+                  alignment: Alignment.center,
+                  child: Icon(
+                    item.iconFor(useCupertino: Platform.isIOS),
+                    color: iconColor,
+                    size: IconSize.medium,
+                  ),
                 ),
-              ),
-              alignment: Alignment.center,
-              child: Icon(
-                item.iconFor(useCupertino: Platform.isIOS),
-                color: iconColor,
-                size: IconSize.medium,
-              ),
+                const SizedBox(height: Spacing.xs),
+                Text(
+                  item.label,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: AppTypography.labelMediumStyle.copyWith(
+                    color: textColor,
+                    height: 1.1,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: Spacing.xs),
-            Text(
-              item.label,
-              textAlign: TextAlign.center,
-              style: AppTypography.labelMediumStyle.copyWith(color: textColor),
-            ),
-          ],
+          ),
         ),
       ),
     );

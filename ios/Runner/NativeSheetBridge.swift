@@ -1,6 +1,57 @@
+import CryptoKit
 import Flutter
+import ImageIO
 import PhotosUI
 import UIKit
+import UniformTypeIdentifiers
+
+func loadFlutterAssetImage(_ asset: String, bundle: Bundle = .main) -> UIImage? {
+    let assetKey = FlutterDartProject.lookupKey(forAsset: asset)
+    guard let assetPath = bundle.path(forResource: assetKey, ofType: nil) else {
+        return nil
+    }
+    return UIImage(contentsOfFile: assetPath)
+}
+
+func nativeDownsampleImageFile(
+    at url: URL,
+    maxPixelSize: Int
+) -> UIImage? {
+    guard maxPixelSize > 0,
+          let source = CGImageSourceCreateWithURL(
+              url as CFURL,
+              [kCGImageSourceShouldCache: false] as CFDictionary
+          ) else { return nil }
+    let options: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+    ]
+    guard let image = CGImageSourceCreateThumbnailAtIndex(
+        source,
+        0,
+        options as CFDictionary
+    ) else { return nil }
+    return UIImage(cgImage: image)
+}
+
+func nativeAvatarImage(_ image: UIImage, isTemplate: Bool) -> UIImage {
+    isTemplate ? image.withRenderingMode(.alwaysTemplate) : image
+}
+
+func applyNativeAvatarImage(
+    _ image: UIImage,
+    isTemplate: Bool,
+    to imageView: UIImageView,
+    initialsLabel: UILabel
+) {
+    imageView.image = nativeAvatarImage(image, isTemplate: isTemplate)
+    imageView.tintColor = isTemplate ? .label : nil
+    imageView.contentMode = isTemplate ? .scaleAspectFit : .scaleAspectFill
+    imageView.isHidden = false
+    initialsLabel.isHidden = true
+}
 
 private func nativeLocalized(_ key: String, _ fallback: String) -> String {
     NSLocalizedString(key, tableName: nil, bundle: .main, value: fallback, comment: "")
@@ -12,6 +63,7 @@ private struct NativeSheetProfile {
     let initials: String
     let avatarUrl: String?
     let avatarData: Data?
+    let avatarIsTemplate: Bool
     let avatarHeaders: [String: String]
     let bio: String
     let gender: String
@@ -111,7 +163,11 @@ private struct NativeSheetItem {
     let title: String
     let subtitle: String?
     let sfSymbol: String
+    let iconAsset: String?
     let destructive: Bool
+    let dismissOnSelect: Bool
+    let actionId: String?
+    let actionValue: Any?
     let url: URL?
     let kind: String
     let value: Any?
@@ -143,7 +199,11 @@ private struct NativeSheetItem {
         self.title = title
         subtitle = payload["subtitle"] as? String
         sfSymbol = (payload["sfSymbol"] as? String) ?? "circle"
+        iconAsset = payload["iconAsset"] as? String
         destructive = payload["destructive"] as? Bool ?? false
+        dismissOnSelect = payload["dismissOnSelect"] as? Bool ?? false
+        actionId = payload["actionId"] as? String
+        actionValue = payload["actionValue"]
         if let urlString = payload["url"] as? String {
             url = URL(string: urlString)
         } else {
@@ -336,18 +396,37 @@ private struct NativeModelSelectorOption {
 }
 
 private struct NativeModelSelectorConfiguration {
+    let presentationId: String
     let title: String
     let selectedModelId: String?
     let models: [NativeModelSelectorOption]
     let pinnedModelIds: [String]
+    let featuredModelIds: [String]
     let allowsPinning: Bool
     let pinTitle: String
     let unpinTitle: String
+    let moreModelsTitle: String
+    let searchModelsTitle: String
+    let reasoningEffortTitle: String
+    let reasoningEffortValue: String
+    let reasoningEffortOptions: [String]
+    let reasoningEffortLabels: [String: String]
+    let allowsCustomReasoningEffort: Bool
+    let customReasoningEffortTitle: String
+    let customReasoningEffortHint: String
 
     init?(_ arguments: Any?) {
         guard let payload = arguments as? [String: Any] else {
             return nil
         }
+
+        guard let rawPresentationId = payload["presentationId"] as? String else {
+            return nil
+        }
+        presentationId = rawPresentationId.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !presentationId.isEmpty else { return nil }
 
         title = (payload["title"] as? String) ?? nativeLocalized("native.chooseModel", "Choose Model")
         selectedModelId = payload["selectedModelId"] as? String
@@ -361,9 +440,22 @@ private struct NativeModelSelectorConfiguration {
             }
             return trimmed
         }
+        featuredModelIds = payload["featuredModelIds"] as? [String] ?? []
         allowsPinning = payload["allowsPinning"] as? Bool ?? false
         pinTitle = (payload["pinTitle"] as? String) ?? nativeLocalized("native.pin", "Pin")
         unpinTitle = (payload["unpinTitle"] as? String) ?? nativeLocalized("native.unpin", "Unpin")
+        moreModelsTitle = (payload["moreModelsTitle"] as? String) ?? "More models"
+        searchModelsTitle = (payload["searchModelsTitle"] as? String) ?? "Search models"
+        reasoningEffortTitle = (payload["reasoningEffortTitle"] as? String) ?? "Effort"
+        reasoningEffortValue = (payload["reasoningEffortValue"] as? String) ?? "medium"
+        reasoningEffortOptions = payload["reasoningEffortOptions"] as? [String]
+            ?? ["low", "medium", "high"]
+        reasoningEffortLabels = payload["reasoningEffortLabels"] as? [String: String] ?? [:]
+        allowsCustomReasoningEffort = payload["allowsCustomReasoningEffort"] as? Bool ?? true
+        customReasoningEffortTitle = (payload["customReasoningEffortTitle"] as? String)
+            ?? "Custom effort"
+        customReasoningEffortHint = (payload["customReasoningEffortHint"] as? String)
+            ?? "Enter effort"
         if models.isEmpty {
             return nil
         }
@@ -671,6 +763,7 @@ private struct NativeSheetConfiguration {
             initials: initials,
             avatarUrl: profilePayload["avatarUrl"] as? String,
             avatarData: (profilePayload["avatarBytes"] as? FlutterStandardTypedData)?.data,
+            avatarIsTemplate: (profilePayload["avatarIsTemplate"] as? Bool) ?? false,
             avatarHeaders: (profilePayload["avatarHeaders"] as? [String: String]) ?? [:],
             bio: bio,
             gender: gender,
@@ -725,6 +818,7 @@ private extension PlatformNativeProfileSheetUser {
             "displayName": displayName,
             "email": email,
             "initials": initials,
+            "avatarIsTemplate": avatarIsTemplate,
             "avatarHeaders": avatarHeaders,
         ]
         payload["avatarUrl"] = avatarUrl
@@ -802,6 +896,7 @@ private extension PlatformNativeSheetItem {
             "title": title,
             "sfSymbol": sfSymbol,
             "destructive": destructive,
+            "dismissOnSelect": dismissOnSelect,
             "kind": kind.payloadName,
             "options": options.map { $0.asPayload() },
             "queries": queries,
@@ -809,6 +904,9 @@ private extension PlatformNativeSheetItem {
             "pending": pending,
         ]
         payload["subtitle"] = subtitle
+        payload["iconAsset"] = iconAsset
+        payload["actionId"] = actionId
+        payload["actionValue"] = actionValue
         payload["url"] = url
         payload["value"] = value
         payload["placeholder"] = placeholder
@@ -889,10 +987,21 @@ private extension PlatformNativeSheetModelOption {
 private extension PlatformNativeSheetModelSelectorRequest {
     func asPayload() -> [String: Any] {
         var payload: [String: Any] = [
+            "presentationId": presentationId,
             "title": title,
             "models": models.map { $0.asPayload() },
             "pinnedModelIds": pinnedModelIds,
+            "featuredModelIds": featuredModelIds,
             "allowsPinning": allowsPinning,
+            "moreModelsTitle": moreModelsTitle,
+            "searchModelsTitle": searchModelsTitle,
+            "reasoningEffortTitle": reasoningEffortTitle,
+            "reasoningEffortValue": reasoningEffortValue,
+            "reasoningEffortOptions": reasoningEffortOptions,
+            "reasoningEffortLabels": reasoningEffortLabels,
+            "allowsCustomReasoningEffort": allowsCustomReasoningEffort,
+            "customReasoningEffortTitle": customReasoningEffortTitle,
+            "customReasoningEffortHint": customReasoningEffortHint,
         ]
         payload["selectedModelId"] = selectedModelId
         payload["pinTitle"] = pinTitle
@@ -980,6 +1089,24 @@ private final class NativeSheetPresentationDelegate:
     }
 }
 
+/// Applies a model-selector hydration update before its synchronous Pigeon
+/// call returns while keeping all UIKit and presentation-state access on main.
+func applyNativeSheetModelUpdateSynchronouslyOnMain(
+    presentationId: String,
+    activePresentationId: @escaping () -> String?,
+    update: @escaping () -> Void
+) {
+    let applyUpdate = {
+        guard activePresentationId() == presentationId else { return }
+        update()
+    }
+    if Thread.isMainThread {
+        applyUpdate()
+    } else {
+        DispatchQueue.main.sync(execute: applyUpdate)
+    }
+}
+
 final class NativeSheetBridge: NativeSheetHostApi {
     static let shared = NativeSheetBridge()
 
@@ -1004,6 +1131,8 @@ final class NativeSheetBridge: NativeSheetHostApi {
     private var pendingResultSheetResult: PendingActionResult?
     private var resultSheetValues: [String: Any] = [:]
     private weak var activeTextEditorController: NativeTextEditorViewController?
+    private weak var activeModelSelectorController: NativeModelSelectorTableViewController?
+    private var activeModelSelectorPresentationId: String?
 
     private init() {}
 
@@ -1063,6 +1192,27 @@ final class NativeSheetBridge: NativeSheetHostApi {
             }
             self.presentModelSelector(configuration, result: completion)
         }
+    }
+
+    func updateModelSelectorModels(
+        presentationId: String,
+        models: [PlatformNativeSheetModelOption]
+    ) throws {
+        let normalizedPresentationId = presentationId.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !normalizedPresentationId.isEmpty else { return }
+        let hydratedModels = models.compactMap {
+            NativeModelSelectorOption($0.asPayload())
+        }
+        guard !hydratedModels.isEmpty else { return }
+        applyNativeSheetModelUpdateSynchronouslyOnMain(
+            presentationId: normalizedPresentationId,
+            activePresentationId: { self.activeModelSelectorPresentationId },
+            update: {
+                self.activeModelSelectorController?.updateModels(hydratedModels)
+            }
+        )
     }
 
     func presentOptionsSelector(
@@ -1538,6 +1688,8 @@ final class NativeSheetBridge: NativeSheetHostApi {
                 self?.presentationDelegate = nil
                 self?.activeTextEditorController = nil
                 self?.activeDetailTableController = nil
+                self?.activeModelSelectorController = nil
+                self?.activeModelSelectorPresentationId = nil
                 self?.detailPayloads = [:]
                 self?.resultSheetValues = [:]
                 let shouldNotifyDismiss = self?.activeSheetMode == .profileMenu
@@ -1586,15 +1738,24 @@ final class NativeSheetBridge: NativeSheetHostApi {
                     event: PlatformNativeSheetModelPinToggledEvent(modelId: modelId)
                 ) { _ in }
             },
+            onEffortChanged: { [weak self] value in
+                self?.flutterApi?.onReasoningEffortChanged(
+                    event: PlatformNativeSheetReasoningEffortChangedEvent(value: value)
+                ) { _ in }
+            },
             onClose: { [weak self] in
                 guard let self else { return }
                 self.completeModelSelector(with: nil)
             }
         )
+        activeModelSelectorController = controller
+        activeModelSelectorPresentationId = configuration.presentationId
         let navigation = NativeSheetNavigationController(rootViewController: controller)
 
         if !present(navigation, initialDetent: .large) {
             pendingModelSelectorResult = nil
+            activeModelSelectorController = nil
+            activeModelSelectorPresentationId = nil
             activeSheetMode = .profileMenu
             result(.failure(PigeonError(
                 code: "PRESENTATION_FAILED",
@@ -1612,6 +1773,8 @@ final class NativeSheetBridge: NativeSheetHostApi {
         activeController = nil
         presentationDelegate = nil
         activeDetailTableController = nil
+        activeModelSelectorController = nil
+        activeModelSelectorPresentationId = nil
         detailPayloads = [:]
         resultSheetValues = [:]
         activeSheetMode = .profileMenu
@@ -1805,7 +1968,16 @@ final class NativeSheetBridge: NativeSheetHostApi {
         }
 
         if item.id == "sign-out" {
-            presentDestructiveConfirm(for: item)
+            presentSignOutOptions(for: item)
+            return
+        }
+
+        if item.dismissOnSelect {
+            let actionId = (item.actionId?.isEmpty == false ? item.actionId : nil) ?? item.id
+            let actionValue = item.actionValue ?? item.value ?? true
+            dismissActive { [weak self] in
+                self?.sendControlChanged(id: actionId, value: actionValue)
+            }
             return
         }
 
@@ -1845,15 +2017,45 @@ final class NativeSheetBridge: NativeSheetHostApi {
         sendControlChanged(id: item.id, value: item.value ?? true)
     }
 
+    private func presentSignOutOptions(for item: NativeSheetItem) {
+        guard let presenter = activeNavigationController?.visibleViewController else {
+            return
+        }
+        let option = item.options.first
+        let controller = NativeSignOutOptionsViewController(
+            title: item.title,
+            message: item.placeholder ?? item.subtitle,
+            optionTitle: option?.label
+                ?? nativeLocalized("native.keepServerDetails", "Keep server details"),
+            optionSubtitle: option?.subtitle,
+            cancelTitle: configuration?.editProfileSheet.cancelLabel
+                ?? nativeLocalized("native.cancel", "Cancel"),
+            confirmTitle: item.title,
+            onConfirm: { [weak self] keepServerDetails in
+                self?.dismissActive { [weak self] in
+                    self?.sendControlChanged(
+                        id: item.id,
+                        value: keepServerDetails
+                    )
+                }
+            }
+        )
+        let navigation = NativeSheetNavigationController(
+            rootViewController: controller
+        )
+        navigation.modalPresentationStyle = .pageSheet
+        if let sheet = navigation.sheetPresentationController {
+            sheet.detents = [.medium()]
+            sheet.prefersGrabberVisible = true
+            sheet.prefersScrollingExpandsWhenScrolledToEdge = false
+        }
+        presenter.present(navigation, animated: true)
+    }
+
     private func presentDestructiveConfirm(for item: NativeSheetItem) {
         guard let presenter = activeNavigationController?.visibleViewController else {
             switch activeSheetMode {
             case .profileMenu:
-                if item.id == "sign-out" {
-                    dismissActive()
-                    flutterApi?.onLogoutRequested { _ in }
-                    return
-                }
                 sendControlChanged(id: item.id, value: true)
             case .resultSheet:
                 resolvePendingResultSheetAfterDismiss(
@@ -1874,11 +2076,6 @@ final class NativeSheetBridge: NativeSheetHostApi {
             guard let self else { return }
             switch self.activeSheetMode {
             case .profileMenu:
-                if item.id == "sign-out" {
-                    self.dismissActive()
-                    self.flutterApi?.onLogoutRequested { _ in }
-                    return
-                }
                 self.sendControlChanged(id: item.id, value: true)
             case .resultSheet:
                 self.resolvePendingResultSheetAfterDismiss(
@@ -1897,12 +2094,18 @@ final class NativeSheetBridge: NativeSheetHostApi {
         activeNavigationController?.view.endEditing(true)
     }
 
-    private func dismissActive() {
+    private func dismissActive(completion: (() -> Void)? = nil) {
         flushActiveSheetEditing()
-        activeController?.dismiss(animated: true)
+        let controller = activeController
+        controller?.dismiss(animated: true, completion: completion)
+        if controller == nil {
+            completion?()
+        }
         activeController = nil
         presentationDelegate = nil
         activeDetailTableController = nil
+        activeModelSelectorController = nil
+        activeModelSelectorPresentationId = nil
         detailPayloads = [:]
         resultSheetValues = [:]
         if let pending = pendingModelSelectorResult {
@@ -2075,6 +2278,32 @@ private func nativeProfileCommitPayload(
     ]
 }
 
+final class NativeAvatarSelectionGeneration {
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+
+    func begin() -> UInt64 {
+        lock.lock()
+        generation &+= 1
+        let value = generation
+        lock.unlock()
+        return value
+    }
+
+    func invalidate() {
+        lock.lock()
+        generation &+= 1
+        lock.unlock()
+    }
+
+    func isCurrent(_ value: UInt64) -> Bool {
+        lock.lock()
+        let current = generation == value
+        lock.unlock()
+        return current
+    }
+}
+
 private final class NativeProfilePhotoEditorViewController: UIViewController, PHPickerViewControllerDelegate {
     private enum AvatarIntent {
         case unchanged
@@ -2088,6 +2317,8 @@ private final class NativeProfilePhotoEditorViewController: UIViewController, PH
     private let onCommit: ([String: Any]) -> Void
     private let avatarView: NativeAvatarView
     private let clearButton = UIButton(type: .system)
+    private let avatarSelectionGeneration = NativeAvatarSelectionGeneration()
+    private var pendingPhotoGeneration: UInt64?
     private var avatarIntent: AvatarIntent = .unchanged {
         didSet { updateSetButton() }
     }
@@ -2198,10 +2429,12 @@ private final class NativeProfilePhotoEditorViewController: UIViewController, PH
     }
 
     @objc private func cancelTapped() {
+        invalidatePendingPhotoSelection()
         dismiss(animated: true)
     }
 
     @objc private func saveTapped() {
+        invalidatePendingPhotoSelection()
         let imageUrl: String
         switch avatarIntent {
         case .unchanged:
@@ -2218,6 +2451,7 @@ private final class NativeProfilePhotoEditorViewController: UIViewController, PH
     }
 
     private func presentPhotoPicker() {
+        pendingPhotoGeneration = avatarSelectionGeneration.begin()
         var configuration = PHPickerConfiguration()
         configuration.filter = .images
         configuration.selectionLimit = 1
@@ -2228,22 +2462,46 @@ private final class NativeProfilePhotoEditorViewController: UIViewController, PH
 
     func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
         picker.dismiss(animated: true)
-        guard let provider = results.first?.itemProvider,
-              provider.canLoadObject(ofClass: UIImage.self) else {
+        guard let selectionGeneration = pendingPhotoGeneration else {
             return
         }
-        provider.loadObject(ofClass: UIImage.self) { [weak self] object, _ in
-            DispatchQueue.main.async {
-                guard let self, let image = object as? UIImage else { return }
-                let toCompress = image.preparingThumbnailSide(1024) ?? image
-                guard let data = toCompress.jpegData(compressionQuality: 0.85) else { return }
-                self.avatarIntent = .pickedJPEG(data)
-                self.avatarView.setPickedPreview(toCompress)
+        pendingPhotoGeneration = nil
+        guard let provider = results.first?.itemProvider,
+              provider.hasItemConformingToTypeIdentifier(
+                  UTType.image.identifier
+              ) else {
+            return
+        }
+        provider.loadFileRepresentation(
+            forTypeIdentifier: UTType.image.identifier
+        ) { [weak self] url, _ in
+            guard let self,
+                  self.avatarSelectionGeneration.isCurrent(
+                      selectionGeneration
+                  ),
+                  let url else { return }
+            autoreleasepool {
+                guard let thumbnail = nativeDownsampleImageFile(
+                    at: url,
+                    maxPixelSize: 1024
+                ),
+                let data = thumbnail.jpegData(
+                    compressionQuality: 0.85
+                ) else { return }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          self.avatarSelectionGeneration.isCurrent(
+                              selectionGeneration
+                          ) else { return }
+                    self.avatarIntent = .pickedJPEG(data)
+                    self.avatarView.setPickedPreview(thumbnail)
+                }
             }
         }
     }
 
     private func useInitialsTapped() {
+        invalidatePendingPhotoSelection()
         avatarIntent = .initialsGenerated
         if let image = nativeInitialsAvatarUIImage(name: profile.displayName) {
             avatarView.setPickedPreview(image)
@@ -2251,8 +2509,14 @@ private final class NativeProfilePhotoEditorViewController: UIViewController, PH
     }
 
     private func removeAvatarTapped() {
+        invalidatePendingPhotoSelection()
         avatarIntent = .removed
         avatarView.showRemovedPlaceholder()
+    }
+
+    private func invalidatePendingPhotoSelection() {
+        pendingPhotoGeneration = nil
+        avatarSelectionGeneration.invalidate()
     }
 }
 
@@ -2659,6 +2923,157 @@ private final class NativeSheetNavigationController: UINavigationController {
     }
 }
 
+private final class NativeSignOutOptionsViewController: UITableViewController {
+    private let message: String?
+    private let optionTitle: String
+    private let optionSubtitle: String?
+    private let cancelTitle: String
+    private let confirmTitle: String
+    private let onConfirm: (Bool) -> Void
+    private var keepServerDetails = false
+
+    init(
+        title: String,
+        message: String?,
+        optionTitle: String,
+        optionSubtitle: String?,
+        cancelTitle: String,
+        confirmTitle: String,
+        onConfirm: @escaping (Bool) -> Void
+    ) {
+        self.message = message
+        self.optionTitle = optionTitle
+        self.optionSubtitle = optionSubtitle
+        self.cancelTitle = cancelTitle
+        self.confirmTitle = confirmTitle
+        self.onConfirm = onConfirm
+        super.init(style: .insetGrouped)
+        self.title = title
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemGroupedBackground
+        tableView.rowHeight = UITableView.automaticDimension
+        tableView.estimatedRowHeight = 72
+        navigationItem.leftBarButtonItem = UIBarButtonItem(
+            title: cancelTitle,
+            primaryAction: UIAction { [weak self] _ in
+                self?.dismiss(animated: true)
+            }
+        )
+        let confirmButton = UIBarButtonItem(
+            title: confirmTitle,
+            primaryAction: UIAction { [weak self] _ in
+                self?.confirm()
+            }
+        )
+        confirmButton.tintColor = .systemRed
+        confirmButton.accessibilityIdentifier = "sign-out-confirm"
+        navigationItem.rightBarButtonItem = confirmButton
+        configureHeader()
+    }
+
+    private func configureHeader() {
+        guard let message, !message.isEmpty else { return }
+        let label = UILabel()
+        label.font = .preferredFont(forTextStyle: .body)
+        label.adjustsFontForContentSizeCategory = true
+        label.textColor = .secondaryLabel
+        label.numberOfLines = 0
+        label.text = message
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = UIView()
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(
+                equalTo: container.layoutMarginsGuide.leadingAnchor
+            ),
+            label.trailingAnchor.constraint(
+                equalTo: container.layoutMarginsGuide.trailingAnchor
+            ),
+            label.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
+            label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8),
+        ])
+        tableView.tableHeaderView = container
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        guard let header = tableView.tableHeaderView else { return }
+        let target = CGSize(
+            width: tableView.bounds.width,
+            height: UIView.layoutFittingCompressedSize.height
+        )
+        let height = header.systemLayoutSizeFitting(
+            target,
+            withHorizontalFittingPriority: .required,
+            verticalFittingPriority: .fittingSizeLevel
+        ).height
+        if abs(header.frame.height - height) > 0.5 {
+            header.frame.size.height = height
+            tableView.tableHeaderView = header
+        }
+    }
+
+    override func numberOfSections(in tableView: UITableView) -> Int {
+        1
+    }
+
+    override func tableView(
+        _ tableView: UITableView,
+        numberOfRowsInSection section: Int
+    ) -> Int {
+        1
+    }
+
+    override func tableView(
+        _ tableView: UITableView,
+        cellForRowAt indexPath: IndexPath
+    ) -> UITableViewCell {
+        let cell = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
+        var content = cell.defaultContentConfiguration()
+        content.text = optionTitle
+        content.secondaryText = optionSubtitle
+        content.secondaryTextProperties.numberOfLines = 0
+        content.image = UIImage(
+            systemName: keepServerDetails
+                ? "checkmark.square.fill"
+                : "square"
+        )
+        content.imageProperties.tintColor = keepServerDetails
+            ? view.tintColor
+            : .secondaryLabel
+        cell.contentConfiguration = content
+        cell.selectionStyle = .default
+        cell.accessibilityIdentifier = "sign-out-keep-server-details"
+        cell.accessibilityTraits = keepServerDetails
+            ? [.button, .selected]
+            : [.button]
+        return cell
+    }
+
+    override func tableView(
+        _ tableView: UITableView,
+        didSelectRowAt indexPath: IndexPath
+    ) {
+        keepServerDetails.toggle()
+        tableView.reloadRows(at: [indexPath], with: .none)
+    }
+
+    private func confirm() {
+        let selection = keepServerDetails
+        dismiss(animated: true) { [onConfirm] in
+            onConfirm(selection)
+        }
+    }
+}
+
 private final class NativeProfileMenuTableViewController: UITableViewController {
     private let configuration: NativeSheetConfiguration
     private let onSelect: (NativeSheetItem) -> Void
@@ -2715,12 +3130,7 @@ private final class NativeProfileMenuTableViewController: UITableViewController 
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "profileCell")
         NativeSheetSettingsStyle.apply(to: tableView)
-        tableView.tableHeaderView = configuration.sections.isEmpty ? profileHeader() : nil
-    }
-
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        updateHeaderSize()
+        tableView.tableHeaderView = nil
     }
 
     override func numberOfSections(in tableView: UITableView) -> Int {
@@ -2766,7 +3176,7 @@ private final class NativeProfileMenuTableViewController: UITableViewController 
         cellForRowAt indexPath: IndexPath
     ) -> UITableViewCell {
         let item = item(at: indexPath)
-        if item.id == "profile" && !configuration.sections.isEmpty {
+        if item.id == "profile" {
             let cell = tableView.dequeueReusableCell(withIdentifier: "profileCell", for: indexPath)
             configureProfileSummaryCell(cell)
             return cell
@@ -2791,7 +3201,7 @@ private final class NativeProfileMenuTableViewController: UITableViewController 
     }
 
     private func shouldShowDisclosure(for item: NativeSheetItem) -> Bool {
-        item.url != nil || configuration.details[item.id] != nil
+        item.url != nil || item.dismissOnSelect || configuration.details[item.id] != nil
     }
 
     private func configureProfileSummaryCell(_ cell: UITableViewCell) {
@@ -2834,65 +3244,6 @@ private final class NativeProfileMenuTableViewController: UITableViewController 
             row.topAnchor.constraint(equalTo: cell.contentView.topAnchor, constant: 11),
             row.bottomAnchor.constraint(equalTo: cell.contentView.bottomAnchor, constant: -11),
         ])
-    }
-
-    private func profileHeader() -> UIView {
-        let container = UIView()
-        let stack = UIStackView()
-        stack.axis = .vertical
-        stack.alignment = .center
-        stack.spacing = 6
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(stack)
-
-        let avatar = NativeAvatarView(profile: configuration.profile, diameter: 72)
-        stack.addArrangedSubview(avatar)
-
-        let nameLabel = UILabel()
-        nameLabel.text = configuration.profile.displayName
-        nameLabel.font = .preferredFont(forTextStyle: .title3)
-        nameLabel.adjustsFontForContentSizeCategory = true
-        nameLabel.textAlignment = .center
-        nameLabel.textColor = .label
-        nameLabel.numberOfLines = 2
-        stack.addArrangedSubview(nameLabel)
-
-        let emailLabel = UILabel()
-        emailLabel.text = configuration.profile.email
-        emailLabel.font = .preferredFont(forTextStyle: .footnote)
-        emailLabel.adjustsFontForContentSizeCategory = true
-        emailLabel.textAlignment = .center
-        emailLabel.textColor = .secondaryLabel
-        emailLabel.numberOfLines = 2
-        stack.addArrangedSubview(emailLabel)
-
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -20),
-            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
-            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8),
-        ])
-
-        container.frame.size = CGSize(width: tableView.bounds.width, height: 154)
-        return container
-    }
-
-    private func updateHeaderSize() {
-        guard let header = tableView.tableHeaderView else { return }
-        let targetSize = CGSize(
-            width: tableView.bounds.width,
-            height: UIView.layoutFittingCompressedSize.height
-        )
-        let size = header.systemLayoutSizeFitting(
-            targetSize,
-            withHorizontalFittingPriority: .required,
-            verticalFittingPriority: .fittingSizeLevel
-        )
-        guard header.frame.width != targetSize.width || header.frame.height != size.height
-        else { return }
-
-        header.frame.size = CGSize(width: targetSize.width, height: size.height)
-        tableView.tableHeaderView = header
     }
 
     private func closeButton() -> UIBarButtonItem {
@@ -3496,6 +3847,7 @@ private final class NativeSheetFaviconView: UIView {
     private let fallbackView = UIView()
     private let fallbackIconView = UIImageView()
     private var expectedImageUrl: String?
+    private var imageLoadToken: NativeSheetImageLoadToken?
 
     init(side: CGFloat) {
         super.init(frame: .zero)
@@ -3543,7 +3895,13 @@ private final class NativeSheetFaviconView: UIView {
         nil
     }
 
+    deinit {
+        imageLoadToken?.cancel()
+    }
+
     func configure(rawUrl: String?, faviconUrl: String?, fallbackSystemName: String) {
+        imageLoadToken?.cancel()
+        imageLoadToken = nil
         expectedImageUrl = faviconUrl ?? NativeSheetURLFormatting.googleFaviconUrl(rawUrl: rawUrl, size: 32)
         imageView.image = nil
         imageView.isHidden = true
@@ -3551,7 +3909,10 @@ private final class NativeSheetFaviconView: UIView {
         fallbackIconView.image = UIImage(systemName: fallbackSystemName)
 
         guard let imageUrl = expectedImageUrl else { return }
-        NativeSheetImageLoader.load(rawUrl: imageUrl) { [weak self] image in
+        imageLoadToken = NativeSheetImageLoader.load(
+            rawUrl: imageUrl,
+            targetPixelSize: 96
+        ) { [weak self] image in
             guard let self, self.expectedImageUrl == imageUrl else { return }
             self.imageView.image = image
             self.imageView.isHidden = false
@@ -3564,6 +3925,7 @@ private final class NativeSheetLinkChipButton: UIButton {
     private var actionUrl: URL?
     private var onOpen: ((URL) -> Void)?
     private var expectedImageUrl: String?
+    private var imageLoadToken: NativeSheetImageLoadToken?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -3585,13 +3947,19 @@ private final class NativeSheetLinkChipButton: UIButton {
         nil
     }
 
+    deinit {
+        imageLoadToken?.cancel()
+    }
+
     func configure(link: NativeSheetLink, onOpen: @escaping (URL) -> Void) {
+        imageLoadToken?.cancel()
+        imageLoadToken = nil
         self.onOpen = onOpen
         actionUrl = link.url
         expectedImageUrl = link.faviconUrl
             ?? NativeSheetURLFormatting.googleFaviconUrl(rawUrl: link.rawUrl, size: 16)
 
-        var buttonConfiguration = nativeChipConfiguration(
+        let buttonConfiguration = nativeChipConfiguration(
             title: link.title ?? NativeSheetURLFormatting.displayLabel(for: link.rawUrl),
             image: UIImage(systemName: "globe"),
             foregroundColor: .label
@@ -3601,7 +3969,10 @@ private final class NativeSheetLinkChipButton: UIButton {
         alpha = link.url == nil ? 0.75 : 1
 
         guard let imageUrl = expectedImageUrl else { return }
-        NativeSheetImageLoader.load(rawUrl: imageUrl) { [weak self] image in
+        imageLoadToken = NativeSheetImageLoader.load(
+            rawUrl: imageUrl,
+            targetPixelSize: 48
+        ) { [weak self] image in
             guard let self, self.expectedImageUrl == imageUrl else { return }
             var updated = self.configuration ?? buttonConfiguration
             updated.image = image.withRenderingMode(.alwaysOriginal)
@@ -4249,29 +4620,34 @@ private final class NativeModelSelectorTableViewController: UITableViewControlle
     private let configuration: NativeModelSelectorConfiguration
     private let onSelect: (String) -> Void
     private let onTogglePin: (String) -> Void
+    private let onEffortChanged: (String) -> Void
     private let onClose: () -> Void
-    private var filteredModels: [NativeModelSelectorOption]
     private var pinnedModelIds: [String]
     private var pinnedModelIdSet: Set<String>
-    private var currentSearchQuery = ""
+    private var models: [NativeModelSelectorOption]
+    private var featuredModels: [NativeModelSelectorOption] = []
+    private var moreModels: [NativeModelSelectorOption] = []
+    private var reasoningEffortValue: String
+    private weak var moreModelsController: NativeMoreModelsTableViewController?
 
     init(
         configuration: NativeModelSelectorConfiguration,
         onSelect: @escaping (String) -> Void,
         onTogglePin: @escaping (String) -> Void,
+        onEffortChanged: @escaping (String) -> Void,
         onClose: @escaping () -> Void
     ) {
         self.configuration = configuration
         self.onSelect = onSelect
         self.onTogglePin = onTogglePin
+        self.onEffortChanged = onEffortChanged
         self.onClose = onClose
         pinnedModelIds = configuration.pinnedModelIds
         pinnedModelIdSet = Set(configuration.pinnedModelIds)
-        filteredModels = Self.sortedModels(
-            configuration.models,
-            pinnedModelIds: configuration.pinnedModelIds
-        )
+        models = configuration.models
+        reasoningEffortValue = configuration.reasoningEffortValue
         super.init(style: .insetGrouped)
+        refreshModelPartitions()
     }
 
     required init?(coder: NSCoder) {
@@ -4287,38 +4663,90 @@ private final class NativeModelSelectorTableViewController: UITableViewControlle
             forCellReuseIdentifier: "modelCell"
         )
         NativeSheetSettingsStyle.apply(to: tableView)
-
-        let searchController = UISearchController(searchResultsController: nil)
-        searchController.searchResultsUpdater = self
-        searchController.obscuresBackgroundDuringPresentation = false
-        navigationItem.searchController = searchController
-        navigationItem.hidesSearchBarWhenScrolling = false
     }
 
+    override func numberOfSections(in tableView: UITableView) -> Int { 3 }
+
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        filteredModels.count
+        switch section {
+        case 0: featuredModels.count
+        case 1: 1
+        case 2: moreModels.isEmpty ? 0 : 1
+        default: 0
+        }
     }
 
     override func tableView(
         _ tableView: UITableView,
         cellForRowAt indexPath: IndexPath
     ) -> UITableViewCell {
-        let model = filteredModels[indexPath.row]
-        let cell = tableView.dequeueReusableCell(
-            withIdentifier: "modelCell",
-            for: indexPath
-        ) as! NativeModelSelectorTableViewCell
-        cell.configure(
-            model: model,
-            isSelected: model.id == configuration.selectedModelId,
-            isPinned: pinnedModelIdSet.contains(model.id)
-        )
+        if indexPath.section == 0 {
+            let model = featuredModels[indexPath.row]
+            let cell = tableView.dequeueReusableCell(
+                withIdentifier: "modelCell",
+                for: indexPath
+            ) as! NativeModelSelectorTableViewCell
+            cell.configure(
+                model: model,
+                isSelected: model.id == configuration.selectedModelId,
+                isPinned: pinnedModelIdSet.contains(model.id),
+                avatarCacheIdentifier: "\(configuration.presentationId):\(model.id)"
+            )
+            return cell
+        }
+
+        let cell = UITableViewCell(style: .subtitle, reuseIdentifier: nil)
+        var content = cell.defaultContentConfiguration()
+        if indexPath.section == 1 {
+            content.image = UIImage(systemName: "clock")
+            content.text = configuration.reasoningEffortTitle
+            content.secondaryText = effortLabel(reasoningEffortValue)
+            cell.isUserInteractionEnabled = effortSelectionEnabled
+            cell.accessoryType = effortSelectionEnabled ? .disclosureIndicator : .none
+            if !effortSelectionEnabled {
+                content.textProperties.color = .secondaryLabel
+                content.secondaryTextProperties.color = .tertiaryLabel
+            }
+        } else {
+            content.image = UIImage(systemName: "ellipsis")
+            content.text = configuration.moreModelsTitle
+            cell.accessoryType = .disclosureIndicator
+        }
+        content.imageProperties.tintColor = .label
+        cell.contentConfiguration = content
         return cell
     }
 
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
-        onSelect(filteredModels[indexPath.row].id)
+        switch indexPath.section {
+        case 0:
+            onSelect(featuredModels[indexPath.row].id)
+        case 1:
+            guard effortSelectionEnabled else { return }
+            presentEffortSelector(sourceView: tableView.cellForRow(at: indexPath))
+        case 2:
+            let controller = NativeMoreModelsTableViewController(
+                title: configuration.moreModelsTitle,
+                searchPlaceholder: configuration.searchModelsTitle,
+                presentationId: configuration.presentationId,
+                models: moreModels,
+                selectedModelId: configuration.selectedModelId,
+                pinnedModelIds: pinnedModelIdSet,
+                allowsPinning: configuration.allowsPinning,
+                pinTitle: configuration.pinTitle,
+                unpinTitle: configuration.unpinTitle,
+                onSelect: onSelect,
+                onTogglePin: { [weak self] modelId in
+                    self?.togglePinnedModel(modelId)
+                    self?.onTogglePin(modelId)
+                }
+            )
+            moreModelsController = controller
+            navigationController?.pushViewController(controller, animated: true)
+        default:
+            break
+        }
     }
 
     override func tableView(
@@ -4327,7 +4755,8 @@ private final class NativeModelSelectorTableViewController: UITableViewControlle
         point: CGPoint
     ) -> UIContextMenuConfiguration? {
         guard configuration.allowsPinning else { return nil }
-        let model = filteredModels[indexPath.row]
+        guard indexPath.section == 0 else { return nil }
+        let model = featuredModels[indexPath.row]
         let isPinned = pinnedModelIdSet.contains(model.id)
         let title = isPinned ? configuration.unpinTitle : configuration.pinTitle
         let image = UIImage(systemName: isPinned ? "pin.slash" : "pin")
@@ -4358,57 +4787,246 @@ private final class NativeModelSelectorTableViewController: UITableViewControlle
             pinnedModelIdSet.insert(modelId)
             pinnedModelIds.append(modelId)
         }
-        applyFilterAndSort(query: currentSearchQuery)
-    }
-
-    private func applyFilterAndSort(query: String) {
-        currentSearchQuery = query
-        let searchedModels = query.isEmpty
-            ? configuration.models
-            : configuration.models.filter { model in
-                model.name.lowercased().contains(query)
-                    || model.id.lowercased().contains(query)
-                    || model.tags.contains { $0.lowercased().contains(query) }
-            }
-        filteredModels = Self.sortedModels(searchedModels, pinnedModelIds: pinnedModelIds)
+        refreshModelPartitions()
+        moreModelsController?.updateModels(moreModels)
         tableView.reloadData()
     }
 
-    private static func sortedModels(
-        _ models: [NativeModelSelectorOption],
-        pinnedModelIds: [String]
-    ) -> [NativeModelSelectorOption] {
-        guard !models.isEmpty, !pinnedModelIds.isEmpty else {
-            return models
-        }
-        let pinnedOrder = Dictionary(
-            uniqueKeysWithValues: pinnedModelIds.enumerated().map { index, modelId in
-                (modelId, index)
-            }
+    func updateModels(_ updatedModels: [NativeModelSelectorOption]) {
+        guard !updatedModels.isEmpty else { return }
+        var updatesById: [String: NativeModelSelectorOption] = [:]
+        updatedModels.forEach { updatesById[$0.id] = $0 }
+        models = models.map { updatesById[$0.id] ?? $0 }
+        refreshModelPartitions()
+        moreModelsController?.updateModels(moreModels)
+        if isViewLoaded { tableView.reloadData() }
+    }
+
+    private func refreshModelPartitions() {
+        let ids = pinnedModelIds.isEmpty
+            ? configuration.featuredModelIds
+            : pinnedModelIds
+        let byId = Dictionary(
+            models.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
         )
-        return models.enumerated().sorted { lhs, rhs in
-            let leftOrder = pinnedOrder[lhs.element.id]
-            let rightOrder = pinnedOrder[rhs.element.id]
-            switch (leftOrder, rightOrder) {
-            case let (left?, right?):
-                return left == right ? lhs.offset < rhs.offset : left < right
-            case (_?, nil):
-                return true
-            case (nil, _?):
-                return false
-            case (nil, nil):
-                return lhs.offset < rhs.offset
+        featuredModels = ids.compactMap { byId[$0] }
+        let featuredIds = Set(featuredModels.map(\.id))
+        moreModels = models.filter { !featuredIds.contains($0.id) }
+    }
+
+    private func effortLabel(_ value: String) -> String {
+        configuration.reasoningEffortLabels[value] ?? value.capitalized
+    }
+
+    private var effortSelectionEnabled: Bool {
+        !configuration.reasoningEffortOptions.isEmpty ||
+            configuration.allowsCustomReasoningEffort
+    }
+
+    private func presentEffortSelector(sourceView: UIView?) {
+        let alert = UIAlertController(
+            title: configuration.reasoningEffortTitle,
+            message: nil,
+            preferredStyle: .actionSheet
+        )
+        for option in configuration.reasoningEffortOptions {
+            let label = option == reasoningEffortValue
+                ? "✓ \(effortLabel(option))"
+                : effortLabel(option)
+            let action = UIAlertAction(title: label, style: .default) {
+                [weak self] _ in self?.commitEffort(option)
             }
-        }.map(\.element)
+            alert.addAction(action)
+        }
+        if configuration.allowsCustomReasoningEffort {
+            alert.addAction(UIAlertAction(
+                title: configuration.customReasoningEffortTitle,
+                style: .default
+            ) { [weak self] _ in self?.presentCustomEffort() })
+        }
+        alert.addAction(UIAlertAction(title: nativeLocalized("native.cancel", "Cancel"), style: .cancel))
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = sourceView ?? view
+            popover.sourceRect = sourceView?.bounds ?? view.bounds
+        }
+        present(alert, animated: true)
+    }
+
+    private func presentCustomEffort() {
+        let alert = UIAlertController(
+            title: configuration.customReasoningEffortTitle,
+            message: nil,
+            preferredStyle: .alert
+        )
+        alert.addTextField { [weak self] field in
+            guard let self else { return }
+            field.placeholder = configuration.customReasoningEffortHint
+            if !configuration.reasoningEffortOptions.contains(reasoningEffortValue) {
+                field.text = reasoningEffortValue
+            }
+            field.autocapitalizationType = .none
+            field.autocorrectionType = .no
+        }
+        alert.addAction(UIAlertAction(title: nativeLocalized("native.cancel", "Cancel"), style: .cancel))
+        alert.addAction(UIAlertAction(title: nativeLocalized("native.save", "Save"), style: .default) {
+            [weak self, weak alert] _ in
+            guard let self else { return }
+            guard let value = alert?.textFields?.first?.text?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty else { return }
+            guard let normalized = self.normalizedEffort(value) else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.presentCustomEffort()
+                }
+                return
+            }
+            self.commitEffort(normalized)
+        })
+        present(alert, animated: true)
+    }
+
+    private func commitEffort(_ value: String) {
+        guard let normalized = normalizedEffort(value) else { return }
+        reasoningEffortValue = normalized
+        tableView.reloadSections(IndexSet(integer: 1), with: .none)
+        onEffortChanged(normalized)
+    }
+
+    private func normalizedEffort(_ value: String) -> String? {
+        let normalized = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard normalized.count <= 64,
+              normalized.range(
+                of: #"^[a-z0-9][a-z0-9_-]{0,63}$"#,
+                options: .regularExpression
+              ) != nil else {
+            return nil
+        }
+        return normalized
     }
 }
 
-extension NativeModelSelectorTableViewController: UISearchResultsUpdating {
+private final class NativeMoreModelsTableViewController: UITableViewController, UISearchResultsUpdating {
+    private let searchPlaceholder: String
+    private let presentationId: String
+    private let selectedModelId: String?
+    private var pinnedModelIds: Set<String>
+    private let allowsPinning: Bool
+    private let pinTitle: String
+    private let unpinTitle: String
+    private let onSelect: (String) -> Void
+    private let onTogglePin: (String) -> Void
+    private var models: [NativeModelSelectorOption]
+    private var filteredModels: [NativeModelSelectorOption]
+    private var query = ""
+
+    init(
+        title: String,
+        searchPlaceholder: String,
+        presentationId: String,
+        models: [NativeModelSelectorOption],
+        selectedModelId: String?,
+        pinnedModelIds: Set<String>,
+        allowsPinning: Bool,
+        pinTitle: String,
+        unpinTitle: String,
+        onSelect: @escaping (String) -> Void,
+        onTogglePin: @escaping (String) -> Void
+    ) {
+        self.searchPlaceholder = searchPlaceholder
+        self.presentationId = presentationId
+        self.models = models
+        filteredModels = models
+        self.selectedModelId = selectedModelId
+        self.pinnedModelIds = pinnedModelIds
+        self.allowsPinning = allowsPinning
+        self.pinTitle = pinTitle
+        self.unpinTitle = unpinTitle
+        self.onSelect = onSelect
+        self.onTogglePin = onTogglePin
+        super.init(style: .insetGrouped)
+        self.title = title
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        tableView.register(NativeModelSelectorTableViewCell.self, forCellReuseIdentifier: "modelCell")
+        NativeSheetSettingsStyle.apply(to: tableView)
+        let search = UISearchController(searchResultsController: nil)
+        search.searchResultsUpdater = self
+        search.searchBar.placeholder = searchPlaceholder
+        search.obscuresBackgroundDuringPresentation = false
+        navigationItem.searchController = search
+        navigationItem.hidesSearchBarWhenScrolling = false
+    }
+
+    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        filteredModels.count
+    }
+
+    override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let model = filteredModels[indexPath.row]
+        let cell = tableView.dequeueReusableCell(withIdentifier: "modelCell", for: indexPath)
+            as! NativeModelSelectorTableViewCell
+        cell.configure(
+            model: model,
+            isSelected: model.id == selectedModelId,
+            isPinned: pinnedModelIds.contains(model.id),
+            avatarCacheIdentifier: "\(presentationId):\(model.id)"
+        )
+        return cell
+    }
+
+    override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        onSelect(filteredModels[indexPath.row].id)
+    }
+
+    override func tableView(
+        _ tableView: UITableView,
+        contextMenuConfigurationForRowAt indexPath: IndexPath,
+        point: CGPoint
+    ) -> UIContextMenuConfiguration? {
+        guard allowsPinning else { return nil }
+        let model = filteredModels[indexPath.row]
+        let pinned = pinnedModelIds.contains(model.id)
+        return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
+            let action = UIAction(
+                title: pinned ? self?.unpinTitle ?? "Unpin" : self?.pinTitle ?? "Pin",
+                image: UIImage(systemName: pinned ? "pin.slash" : "pin")
+            ) { [weak self] _ in
+                if pinned { self?.pinnedModelIds.remove(model.id) }
+                else { self?.pinnedModelIds.insert(model.id) }
+                self?.tableView.reloadRows(at: [indexPath], with: .none)
+                self?.onTogglePin(model.id)
+            }
+            return UIMenu(children: [action])
+        }
+    }
+
+    func updateModels(_ updated: [NativeModelSelectorOption]) {
+        models = updated
+        applyFilter()
+    }
+
     func updateSearchResults(for searchController: UISearchController) {
-        let query = searchController.searchBar.text?
+        query = searchController.searchBar.text?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? ""
-        applyFilterAndSort(query: query)
+        applyFilter()
+    }
+
+    private func applyFilter() {
+        filteredModels = query.isEmpty ? models : models.filter { model in
+            model.name.lowercased().contains(query)
+                || model.id.lowercased().contains(query)
+                || model.tags.contains { $0.lowercased().contains(query) }
+        }
+        if isViewLoaded { tableView.reloadData() }
     }
 }
 
@@ -4431,7 +5049,7 @@ private final class NativeModelTagButton: UIButton {
         configuration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
             incoming in
             var outgoing = incoming
-            outgoing.font = .preferredFont(forTextStyle: .caption2)
+            outgoing.font = .preferredFont(forTextStyle: .caption1)
             return outgoing
         }
         self.configuration = configuration
@@ -4576,7 +5194,17 @@ private final class NativeModelSelectorTableViewCell: UITableViewCell {
         nil
     }
 
-    func configure(model: NativeModelSelectorOption, isSelected: Bool, isPinned: Bool) {
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        avatarView.cancelImageLoad()
+    }
+
+    func configure(
+        model: NativeModelSelectorOption,
+        isSelected: Bool,
+        isPinned: Bool,
+        avatarCacheIdentifier: String
+    ) {
         titleLabel.text = model.name
         titleLabel.font = .preferredFont(forTextStyle: .body)
         titleLabel.textColor = .label
@@ -4585,7 +5213,7 @@ private final class NativeModelSelectorTableViewCell: UITableViewCell {
 
         let subtitle = model.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         subtitleLabel.text = subtitle
-        subtitleLabel.font = .preferredFont(forTextStyle: .footnote)
+        subtitleLabel.font = .preferredFont(forTextStyle: .subheadline)
         subtitleLabel.textColor = .secondaryLabel
         subtitleLabel.adjustsFontForContentSizeCategory = true
         subtitleLabel.numberOfLines = 2
@@ -4598,7 +5226,8 @@ private final class NativeModelSelectorTableViewCell: UITableViewCell {
             avatarUrl: model.avatarUrl,
             avatarData: model.avatarData,
             avatarHeaders: model.avatarHeaders,
-            sfSymbol: model.sfSymbol
+            sfSymbol: model.sfSymbol,
+            avatarCacheIdentifier: avatarCacheIdentifier
         )
 
         accessoryType = isSelected ? .checkmark : .none
@@ -4875,54 +5504,743 @@ private final class NativeFolderHierarchyGuideView: UIView {
     }
 }
 
-private enum NativeSheetImageLoader {
-    private static let cache = NSCache<NSString, UIImage>()
+func nativeSheetImageCacheKey(
+    rawUrl: String,
+    headers: [String: String]
+) -> NSString {
+    guard !headers.isEmpty else {
+        return NSString(string: rawUrl)
+    }
 
+    let canonicalHeaders = headers
+        .map { ($0.key.lowercased(), $0.value) }
+        .sorted {
+            if $0.0 == $1.0 { return $0.1 < $1.1 }
+            return $0.0 < $1.0
+        }
+    var digestInput = Data()
+
+    func appendComponent(_ value: String) {
+        var byteCount = UInt64(value.utf8.count).bigEndian
+        withUnsafeBytes(of: &byteCount) { digestInput.append(contentsOf: $0) }
+        digestInput.append(contentsOf: value.utf8)
+    }
+
+    appendComponent(rawUrl)
+    for (key, value) in canonicalHeaders {
+        appendComponent(key)
+        appendComponent(value)
+    }
+
+    let fingerprint = SHA256.hash(data: digestInput)
+        .map { String(format: "%02x", $0) }
+        .joined()
+    return NSString(string: "\(rawUrl)#headers=\(fingerprint)")
+}
+
+func nativeSheetAvatarDataCacheKey(
+    cacheIdentifier: String,
+    data: Data,
+    targetPixelSize: Int
+) -> NSString {
+    let fingerprint = SHA256.hash(data: data)
+        .map { String(format: "%02x", $0) }
+        .joined()
+    return NSString(
+        string: "data:\(cacheIdentifier)#sha256=\(fingerprint)#px=\(targetPixelSize)"
+    )
+}
+
+func nativeSheetImageSessionConfiguration() -> URLSessionConfiguration {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForRequest = 10
+    configuration.timeoutIntervalForResource = 15
+    configuration.httpMaximumConnectionsPerHost = 4
+    configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+    configuration.urlCache = nil
+    configuration.httpCookieStorage = nil
+    configuration.httpShouldSetCookies = false
+    configuration.urlCredentialStorage = nil
+    return configuration
+}
+
+final class NativeSheetImageLoadToken {
+    private let lock = NSLock()
+    private var cancellationHandler: (() -> Void)?
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        let value = cancelled
+        lock.unlock()
+        return value
+    }
+
+    func installCancellationHandler(_ handler: @escaping () -> Void) {
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            handler()
+            return
+        }
+        cancellationHandler = handler
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        guard !cancelled else {
+            lock.unlock()
+            return
+        }
+        cancelled = true
+        let handler = cancellationHandler
+        cancellationHandler = nil
+        lock.unlock()
+        handler?()
+    }
+}
+
+private struct NativeSheetHTTPOrigin: Equatable {
+    let scheme: String
+    let host: String
+    let port: Int
+
+    init?(_ url: URL) {
+        guard let components = URLComponents(
+            url: url,
+            resolvingAgainstBaseURL: false
+        ),
+        let rawScheme = components.scheme?.lowercased(),
+        rawScheme == "http" || rawScheme == "https",
+        let rawHost = components.host?.lowercased(),
+        !rawHost.isEmpty,
+        components.user == nil,
+        components.password == nil else {
+            return nil
+        }
+        scheme = rawScheme
+        host = rawHost
+        port = components.port ?? (rawScheme == "https" ? 443 : 80)
+    }
+}
+
+func nativeSheetRedirectStaysWithinOrigin(
+    originalURL: URL,
+    redirectURL: URL
+) -> Bool {
+    guard let original = NativeSheetHTTPOrigin(originalURL),
+          let redirected = NativeSheetHTTPOrigin(redirectURL) else {
+        return false
+    }
+    return original == redirected
+}
+
+/// Builds an image request without allowing caller-supplied credentials to
+/// choose their own destination. Headerless HTTP(S) URLs remain valid, while
+/// nonempty headers are forwarded only for the explicitly trusted origin.
+func nativeSheetImageRequest(
+    rawUrl: String,
+    headers: [String: String],
+    trustedServerOriginURL: URL?
+) -> URLRequest? {
+    guard let url = URL(string: rawUrl),
+          let targetOrigin = NativeSheetHTTPOrigin(url) else {
+        return nil
+    }
+    var request = URLRequest(url: url)
+    guard !headers.isEmpty,
+          let trustedServerOriginURL,
+          let trustedOrigin = NativeSheetHTTPOrigin(trustedServerOriginURL),
+          targetOrigin == trustedOrigin else {
+        return request
+    }
+    for (key, value) in headers {
+        request.setValue(value, forHTTPHeaderField: key)
+    }
+    return request
+}
+
+final class NativeSheetRequestAdmission {
+    private let lock = NSLock()
+    private let limit: Int
+    private var outstanding = 0
+
+    init(limit: Int) {
+        self.limit = max(1, limit)
+    }
+
+    func acquire() -> Bool {
+        lock.lock()
+        guard outstanding < limit else {
+            lock.unlock()
+            return false
+        }
+        outstanding += 1
+        lock.unlock()
+        return true
+    }
+
+    func release() {
+        lock.lock()
+        outstanding = max(0, outstanding - 1)
+        lock.unlock()
+    }
+
+    var count: Int {
+        lock.lock()
+        let value = outstanding
+        lock.unlock()
+        return value
+    }
+}
+
+private final class NativeSheetBoundedImageClient: NSObject, URLSessionDataDelegate {
+    static let shared = NativeSheetBoundedImageClient()
+    private static let maximumOutstandingRequests = 24
+
+    private final class RequestState {
+        let maxBytes: Int
+        let originalURL: URL
+        let completion: (Data?) -> Void
+        var receivedData = Data()
+
+        init(
+            maxBytes: Int,
+            originalURL: URL,
+            completion: @escaping (Data?) -> Void
+        ) {
+            self.maxBytes = maxBytes
+            self.originalURL = originalURL
+            self.completion = completion
+        }
+    }
+
+    private let delegateQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "app.cogwheel.conduit.native-sheet-image-network"
+        queue.qualityOfService = .userInitiated
+        queue.maxConcurrentOperationCount = 1
+        return queue
+    }()
+    private let stateLock = NSLock()
+    private let admission = NativeSheetRequestAdmission(
+        limit: NativeSheetBoundedImageClient.maximumOutstandingRequests
+    )
+    private var requests: [Int: RequestState] = [:]
+    private lazy var session = URLSession(
+        configuration: nativeSheetImageSessionConfiguration(),
+        delegate: self,
+        delegateQueue: delegateQueue
+    )
+
+    private override init() {
+        super.init()
+    }
+
+    func load(
+        _ request: URLRequest,
+        maxBytes: Int,
+        completion: @escaping (Data?) -> Void
+    ) -> NativeSheetImageLoadToken {
+        let token = NativeSheetImageLoadToken()
+        guard maxBytes > 0,
+              let originalURL = request.url,
+              NativeSheetHTTPOrigin(originalURL) != nil,
+              admission.acquire() else {
+            completion(nil)
+            token.cancel()
+            return token
+        }
+
+        let task = session.dataTask(with: request)
+        let state = RequestState(
+            maxBytes: maxBytes,
+            originalURL: originalURL,
+            completion: completion
+        )
+        stateLock.lock()
+        requests[task.taskIdentifier] = state
+        stateLock.unlock()
+        token.installCancellationHandler { [weak self, weak task] in
+            task?.cancel()
+            self?.finish(taskIdentifier: task?.taskIdentifier, data: nil)
+        }
+        task.resume()
+        return token
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let state = requestState(for: task.taskIdentifier),
+              let redirectURL = request.url,
+              nativeSheetRedirectStaysWithinOrigin(
+                originalURL: state.originalURL,
+                redirectURL: redirectURL
+              ) else {
+            completionHandler(nil)
+            task.cancel()
+            finish(taskIdentifier: task.taskIdentifier, data: nil)
+            return
+        }
+        completionHandler(request)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let state = requestState(for: dataTask.taskIdentifier) else {
+            completionHandler(.cancel)
+            return
+        }
+        if let http = response as? HTTPURLResponse,
+           !(200..<300).contains(http.statusCode) {
+            completionHandler(.cancel)
+            finish(taskIdentifier: dataTask.taskIdentifier, data: nil)
+            return
+        }
+        if let mimeType = response.mimeType,
+           !mimeType.lowercased().hasPrefix("image/") {
+            completionHandler(.cancel)
+            finish(taskIdentifier: dataTask.taskIdentifier, data: nil)
+            return
+        }
+        if response.expectedContentLength > Int64(state.maxBytes) {
+            completionHandler(.cancel)
+            finish(taskIdentifier: dataTask.taskIdentifier, data: nil)
+            return
+        }
+        if response.expectedContentLength > 0 {
+            stateLock.lock()
+            state.receivedData.reserveCapacity(
+                min(Int(response.expectedContentLength), state.maxBytes)
+            )
+            stateLock.unlock()
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive data: Data
+    ) {
+        stateLock.lock()
+        guard let state = requests[dataTask.taskIdentifier] else {
+            stateLock.unlock()
+            dataTask.cancel()
+            return
+        }
+        guard data.count <= state.maxBytes - state.receivedData.count else {
+            stateLock.unlock()
+            dataTask.cancel()
+            finish(taskIdentifier: dataTask.taskIdentifier, data: nil)
+            return
+        }
+        state.receivedData.append(data)
+        stateLock.unlock()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        stateLock.lock()
+        let state = requests[task.taskIdentifier]
+        let data = error == nil && state?.receivedData.isEmpty == false
+            ? state?.receivedData
+            : nil
+        stateLock.unlock()
+        guard state != nil else { return }
+        finish(taskIdentifier: task.taskIdentifier, data: data)
+    }
+
+    private func requestState(for taskIdentifier: Int) -> RequestState? {
+        stateLock.lock()
+        let state = requests[taskIdentifier]
+        stateLock.unlock()
+        return state
+    }
+
+    private func finish(taskIdentifier: Int?, data: Data?) {
+        guard let taskIdentifier else { return }
+        stateLock.lock()
+        let state = requests.removeValue(forKey: taskIdentifier)
+        stateLock.unlock()
+        guard let state else { return }
+        admission.release()
+        state.completion(data)
+    }
+}
+
+enum NativeSheetImageLoader {
+    private final class InFlightRequest {
+        let requestId: UUID
+        var callbacks: [UUID: (NativeSheetImageLoadToken, (UIImage) -> Void)]
+        var networkToken: NativeSheetImageLoadToken?
+
+        init(
+            requestId: UUID,
+            callbackId: UUID,
+            token: NativeSheetImageLoadToken,
+            completion: @escaping (UIImage) -> Void
+        ) {
+            self.requestId = requestId
+            callbacks = [callbackId: (token, completion)]
+        }
+    }
+
+    private static let maxEncodedBytes = 2 * 1024 * 1024
+    private static let cache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = 128
+        cache.totalCostLimit = 8 * 1024 * 1024
+        return cache
+    }()
+    private static let stateLock = NSLock()
+    private static var inFlight: [NSString: InFlightRequest] = [:]
+    private static var avatarHashExecutionObserver: ((Bool) -> Void)?
+    private static let processingQueue = DispatchQueue(
+        label: "app.cogwheel.conduit.native-sheet-images",
+        qos: .userInitiated
+    )
+
+    static func setAvatarHashExecutionObserverForTesting(
+        _ observer: ((Bool) -> Void)?
+    ) {
+        stateLock.lock()
+        avatarHashExecutionObserver = observer
+        stateLock.unlock()
+    }
+
+    @discardableResult
     static func load(
         rawUrl: String,
         headers: [String: String] = [:],
+        trustedServerOriginURL: URL? = nil,
+        targetPixelSize: Int = 96,
         completion: @escaping (UIImage) -> Void
-    ) {
-        if rawUrl.hasPrefix("data:image"),
-           let image = decodeDataImage(rawUrl) {
-            completion(image)
-            return
-        }
-
-        guard rawUrl.hasPrefix("http"),
-              let url = URL(string: rawUrl) else {
-            return
-        }
-
-        let cacheKey = NSString(string: rawUrl)
-        if let cached = cache.object(forKey: cacheKey) {
-            completion(cached)
-            return
-        }
-
-        var request = URLRequest(url: url)
-        for (key, value) in headers {
-            request.setValue(value, forHTTPHeaderField: key)
-        }
-
-        URLSession.shared.dataTask(with: request) { data, _, _ in
-            guard let data, let image = UIImage(data: data) else { return }
-            cache.setObject(image, forKey: cacheKey)
-            DispatchQueue.main.async {
-                completion(image)
+    ) -> NativeSheetImageLoadToken {
+        let token = NativeSheetImageLoadToken()
+        if rawUrl.hasPrefix("data:image") {
+            processingQueue.async {
+                guard !token.isCancelled else { return }
+                guard let image = decodeDataImage(
+                    rawUrl,
+                    targetPixelSize: targetPixelSize
+                ) else { return }
+                deliver(image, token: token, completion: completion)
             }
-        }.resume()
+            return token
+        }
+
+        guard let request = nativeSheetImageRequest(
+            rawUrl: rawUrl,
+            headers: headers,
+            trustedServerOriginURL: trustedServerOriginURL
+        ) else {
+            return token
+        }
+
+        let forwardedHeaders = request.allHTTPHeaderFields ?? [:]
+        let baseKey = nativeSheetImageCacheKey(
+            rawUrl: rawUrl,
+            headers: forwardedHeaders
+        )
+        let cacheKey = NSString(string: "\(baseKey)#px=\(targetPixelSize)")
+        if let cached = cache.object(forKey: cacheKey) {
+            deliver(cached, token: token, completion: completion)
+            return token
+        }
+
+        let callbackId = UUID()
+        let requestId = register(
+            cacheKey: cacheKey,
+            callbackId: callbackId,
+            token: token,
+            completion: completion
+        )
+        guard let requestId else { return token }
+
+        let networkToken = NativeSheetBoundedImageClient.shared.load(
+            request,
+            maxBytes: maxEncodedBytes
+        ) { data in
+            processingQueue.async {
+                let image = data.flatMap {
+                    downsample(data: $0, targetPixelSize: targetPixelSize)
+                }
+                finish(
+                    cacheKey: cacheKey,
+                    requestId: requestId,
+                    image: image
+                )
+            }
+        }
+        installNetworkToken(
+            networkToken,
+            cacheKey: cacheKey,
+            requestId: requestId
+        )
+        return token
     }
 
-    static func decodeDataImage(_ dataUrl: String) -> UIImage? {
+    @discardableResult
+    static func load(
+        data: Data,
+        cacheIdentifier: String? = nil,
+        targetPixelSize: Int,
+        completion: @escaping (UIImage) -> Void
+    ) -> NativeSheetImageLoadToken {
+        let token = NativeSheetImageLoadToken()
+        guard !data.isEmpty, data.count <= maxEncodedBytes else { return token }
+        processingQueue.async {
+            guard !token.isCancelled else { return }
+            stateLock.lock()
+            let observer = avatarHashExecutionObserver
+            stateLock.unlock()
+            observer?(Thread.isMainThread)
+            let cacheKey = cacheIdentifier.map {
+                nativeSheetAvatarDataCacheKey(
+                    cacheIdentifier: $0,
+                    data: data,
+                    targetPixelSize: targetPixelSize
+                )
+            }
+            guard !token.isCancelled else { return }
+            if let cacheKey, let cached = cache.object(forKey: cacheKey) {
+                deliver(cached, token: token, completion: completion)
+                return
+            }
+            if let cacheKey {
+                let callbackId = UUID()
+                let requestId = register(
+                    cacheKey: cacheKey,
+                    callbackId: callbackId,
+                    token: token,
+                    completion: completion
+                )
+                guard let requestId else { return }
+                let image = downsample(
+                    data: data,
+                    targetPixelSize: targetPixelSize
+                )
+                finish(
+                    cacheKey: cacheKey,
+                    requestId: requestId,
+                    image: image
+                )
+                return
+            }
+            let image = downsample(
+                data: data,
+                targetPixelSize: targetPixelSize
+            )
+            if let image {
+                deliver(image, token: token, completion: completion)
+            }
+        }
+        return token
+    }
+
+    private static func register(
+        cacheKey: NSString,
+        callbackId: UUID,
+        token: NativeSheetImageLoadToken,
+        completion: @escaping (UIImage) -> Void
+    ) -> UUID? {
+        stateLock.lock()
+        let requestId: UUID?
+        if let request = inFlight[cacheKey] {
+            request.callbacks[callbackId] = (token, completion)
+            requestId = nil
+        } else {
+            let newRequestId = UUID()
+            inFlight[cacheKey] = InFlightRequest(
+                requestId: newRequestId,
+                callbackId: callbackId,
+                token: token,
+                completion: completion
+            )
+            requestId = newRequestId
+        }
+        stateLock.unlock()
+        token.installCancellationHandler {
+            cancelSubscriber(cacheKey: cacheKey, callbackId: callbackId)
+        }
+        return requestId
+    }
+
+    private static func cancelSubscriber(
+        cacheKey: NSString,
+        callbackId: UUID
+    ) {
+        var networkToken: NativeSheetImageLoadToken?
+        stateLock.lock()
+        if let request = inFlight[cacheKey] {
+            request.callbacks.removeValue(forKey: callbackId)
+            if request.callbacks.isEmpty {
+                inFlight.removeValue(forKey: cacheKey)
+                networkToken = request.networkToken
+            }
+        }
+        stateLock.unlock()
+        networkToken?.cancel()
+    }
+
+    private static func installNetworkToken(
+        _ token: NativeSheetImageLoadToken,
+        cacheKey: NSString,
+        requestId: UUID
+    ) {
+        stateLock.lock()
+        if let request = inFlight[cacheKey],
+           request.requestId == requestId,
+           !request.callbacks.isEmpty {
+            request.networkToken = token
+            stateLock.unlock()
+        } else {
+            stateLock.unlock()
+            token.cancel()
+        }
+    }
+
+    private static func finish(
+        cacheKey: NSString,
+        requestId: UUID,
+        image: UIImage?
+    ) {
+        stateLock.lock()
+        let request: InFlightRequest?
+        if inFlight[cacheKey]?.requestId == requestId {
+            request = inFlight.removeValue(forKey: cacheKey)
+        } else {
+            request = nil
+        }
+        stateLock.unlock()
+        guard let request else { return }
+        if let image {
+            let pixelWidth = Int(image.size.width * image.scale)
+            let pixelHeight = Int(image.size.height * image.scale)
+            cache.setObject(
+                image,
+                forKey: cacheKey,
+                cost: max(1, pixelWidth * pixelHeight * 4)
+            )
+        }
+        guard let image else { return }
+        DispatchQueue.main.async {
+            request.callbacks.values.forEach { token, callback in
+                guard !token.isCancelled else { return }
+                callback(image)
+            }
+        }
+    }
+
+    /// Narrow test seam for reproducing stale completion and token-install
+    /// races without issuing a real network request.
+    static func beginInFlightRequestForTesting(
+        cacheKey: NSString,
+        completion: @escaping (UIImage) -> Void
+    ) -> (token: NativeSheetImageLoadToken, requestId: UUID?) {
+        let token = NativeSheetImageLoadToken()
+        let requestId = register(
+            cacheKey: cacheKey,
+            callbackId: UUID(),
+            token: token,
+            completion: completion
+        )
+        return (token, requestId)
+    }
+
+    static func installNetworkTokenForTesting(
+        _ token: NativeSheetImageLoadToken,
+        cacheKey: NSString,
+        requestId: UUID
+    ) {
+        installNetworkToken(
+            token,
+            cacheKey: cacheKey,
+            requestId: requestId
+        )
+    }
+
+    static func finishInFlightRequestForTesting(
+        cacheKey: NSString,
+        requestId: UUID,
+        image: UIImage?
+    ) {
+        finish(cacheKey: cacheKey, requestId: requestId, image: image)
+    }
+
+    private static func deliver(
+        _ image: UIImage,
+        token: NativeSheetImageLoadToken,
+        completion: @escaping (UIImage) -> Void
+    ) {
+        let callback = {
+            guard !token.isCancelled else { return }
+            completion(image)
+        }
+        if Thread.isMainThread {
+            callback()
+        } else {
+            DispatchQueue.main.async(execute: callback)
+        }
+    }
+
+    private static func decodeDataImage(
+        _ dataUrl: String,
+        targetPixelSize: Int
+    ) -> UIImage? {
         guard let commaIndex = dataUrl.firstIndex(of: ",") else {
             return nil
         }
-        let base64Payload = String(dataUrl[dataUrl.index(after: commaIndex)...])
-        guard let data = Data(base64Encoded: base64Payload) else {
+        let payload = dataUrl[dataUrl.index(after: commaIndex)...]
+        // A base64 payload is roughly 4/3 the decoded size. Reject it before
+        // allocating a potentially huge intermediary String/Data pair.
+        guard payload.utf8.count <= (maxEncodedBytes * 4 / 3) + 8 else {
             return nil
         }
-        return UIImage(data: data)
+        guard let data = Data(base64Encoded: String(payload)),
+              data.count <= maxEncodedBytes else {
+            return nil
+        }
+        return downsample(data: data, targetPixelSize: targetPixelSize)
+    }
+
+    private static func downsample(
+        data: Data,
+        targetPixelSize: Int
+    ) -> UIImage? {
+        autoreleasepool {
+            guard targetPixelSize > 0,
+                  let source = CGImageSourceCreateWithData(
+                      data as CFData,
+                      [kCGImageSourceShouldCache: false] as CFDictionary
+                  ) else { return nil }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: targetPixelSize,
+            ]
+            guard let cgImage = CGImageSourceCreateThumbnailAtIndex(
+                source,
+                0,
+                options as CFDictionary
+            ) else { return nil }
+            return UIImage(cgImage: cgImage)
+        }
     }
 }
 
@@ -4931,6 +6249,8 @@ private final class NativeModelAvatarView: UIView {
     private let initialsLabel = UILabel()
     private let symbolView = UIImageView()
     private var expectedImageUrl: String?
+    private var imageGeneration = UUID()
+    private var imageLoadToken: NativeSheetImageLoadToken?
 
     init(side: CGFloat = 32) {
         super.init(frame: .zero)
@@ -4984,13 +6304,29 @@ private final class NativeModelAvatarView: UIView {
         nil
     }
 
+    deinit {
+        imageLoadToken?.cancel()
+    }
+
+    func cancelImageLoad() {
+        imageLoadToken?.cancel()
+        imageLoadToken = nil
+        imageGeneration = UUID()
+        expectedImageUrl = nil
+    }
+
     func configure(
         name: String,
         avatarUrl: String?,
         avatarData: Data?,
         avatarHeaders: [String: String],
-        sfSymbol: String?
+        sfSymbol: String?,
+        avatarCacheIdentifier: String? = nil
     ) {
+        imageLoadToken?.cancel()
+        imageLoadToken = nil
+        imageGeneration = UUID()
+        let generation = imageGeneration
         expectedImageUrl = avatarUrl
         imageView.image = nil
         imageView.isHidden = true
@@ -5014,11 +6350,18 @@ private final class NativeModelAvatarView: UIView {
             initialsLabel.isHidden = false
         }
 
-        if let avatarData, let image = UIImage(data: avatarData) {
-            imageView.image = image
-            imageView.isHidden = false
-            initialsLabel.isHidden = true
-            symbolView.isHidden = true
+        if let avatarData {
+            imageLoadToken = NativeSheetImageLoader.load(
+                data: avatarData,
+                cacheIdentifier: avatarCacheIdentifier,
+                targetPixelSize: 96
+            ) { [weak self] image in
+                guard let self, self.imageGeneration == generation else { return }
+                self.imageView.image = image
+                self.imageView.isHidden = false
+                self.initialsLabel.isHidden = true
+                self.symbolView.isHidden = true
+            }
             return
         }
 
@@ -5026,8 +6369,19 @@ private final class NativeModelAvatarView: UIView {
             return
         }
 
-        NativeSheetImageLoader.load(rawUrl: avatarUrl, headers: avatarHeaders) { [weak self] image in
-            guard let self, self.expectedImageUrl == avatarUrl else { return }
+        // Dart builds nonempty avatar headers only for URLs on the active
+        // server origin (see imageUrlIsServerOrigin), so the avatar URL itself
+        // is the origin these credentials were issued for. Cross-origin
+        // redirects still drop the request entirely.
+        imageLoadToken = NativeSheetImageLoader.load(
+            rawUrl: avatarUrl,
+            headers: avatarHeaders,
+            trustedServerOriginURL: URL(string: avatarUrl),
+            targetPixelSize: 96
+        ) { [weak self] image in
+            guard let self,
+                  self.imageGeneration == generation,
+                  self.expectedImageUrl == avatarUrl else { return }
             self.imageView.image = image
             self.imageView.isHidden = false
             self.initialsLabel.isHidden = true
@@ -5229,8 +6583,20 @@ private func configureNavigationCell(
     content.secondaryText = item.kind == "searchablePicker"
         ? (item.selectedOptionLabel ?? item.subtitle)
         : item.subtitle
-    content.image = UIImage(systemName: item.sfSymbol)
+    if let iconAsset = item.iconAsset {
+        content.image = loadFlutterAssetImage(iconAsset)?
+            .withRenderingMode(.alwaysTemplate)
+            ?? UIImage(systemName: item.sfSymbol)
+    } else {
+        content.image = UIImage(systemName: item.sfSymbol)
+    }
     NativeSheetSettingsStyle.applyContentStyle(&content)
+    if item.iconAsset != nil {
+        content.imageProperties.maximumSize = CGSize(
+            width: NativeSheetSettingsStyle.iconSize,
+            height: NativeSheetSettingsStyle.iconSize
+        )
+    }
     if item.destructive {
         content.textProperties.color = .systemRed
         content.imageProperties.tintColor = .systemRed
@@ -5314,6 +6680,8 @@ private enum NativeSheetSettingsStyle {
 private final class NativeAvatarView: UIView {
     private let imageView = UIImageView()
     private let initialsLabel = UILabel()
+    private let imageGeneration = NativeAvatarSelectionGeneration()
+    private var imageLoadToken: NativeSheetImageLoadToken?
 
     init(profile: NativeSheetProfile, diameter: CGFloat = 88) {
         super.init(frame: .zero)
@@ -5356,17 +6724,28 @@ private final class NativeAvatarView: UIView {
         nil
     }
 
+    deinit {
+        imageLoadToken?.cancel()
+    }
+
     func setPickedPreview(_ image: UIImage?) {
+        imageLoadToken?.cancel()
+        imageLoadToken = nil
+        imageGeneration.invalidate()
         if let image {
-            imageView.image = image
-            imageView.tintColor = nil
-            imageView.contentMode = .scaleAspectFill
-            imageView.isHidden = false
-            initialsLabel.isHidden = true
+            applyNativeAvatarImage(
+                image,
+                isTemplate: false,
+                to: imageView,
+                initialsLabel: initialsLabel
+            )
         }
     }
 
     func showRemovedPlaceholder() {
+        imageLoadToken?.cancel()
+        imageLoadToken = nil
+        imageGeneration.invalidate()
         let img = UIImage(systemName: "person.crop.circle.fill")?
             .withRenderingMode(.alwaysTemplate)
         imageView.image = img
@@ -5377,10 +6756,23 @@ private final class NativeAvatarView: UIView {
     }
 
     private func loadImage(profile: NativeSheetProfile) {
-        if let avatarData = profile.avatarData,
-           let image = UIImage(data: avatarData) {
-            imageView.image = image
-            imageView.isHidden = false
+        imageLoadToken?.cancel()
+        imageLoadToken = nil
+        let generation = imageGeneration.begin()
+        if let avatarData = profile.avatarData {
+            imageLoadToken = NativeSheetImageLoader.load(
+                data: avatarData,
+                targetPixelSize: 408
+            ) { [weak self] image in
+                guard let self,
+                      self.imageGeneration.isCurrent(generation) else { return }
+                applyNativeAvatarImage(
+                    image,
+                    isTemplate: profile.avatarIsTemplate,
+                    to: self.imageView,
+                    initialsLabel: self.initialsLabel
+                )
+            }
             return
         }
 
@@ -5388,9 +6780,24 @@ private final class NativeAvatarView: UIView {
               !avatarUrl.isEmpty else {
             return
         }
-        NativeSheetImageLoader.load(rawUrl: avatarUrl, headers: profile.avatarHeaders) { [weak self] image in
-            self?.imageView.image = image
-            self?.imageView.isHidden = false
+        // Dart builds nonempty avatar headers only for URLs on the active
+        // server origin (see imageUrlIsServerOrigin), so the avatar URL itself
+        // is the origin these credentials were issued for. Cross-origin
+        // redirects still drop the request entirely.
+        imageLoadToken = NativeSheetImageLoader.load(
+            rawUrl: avatarUrl,
+            headers: profile.avatarHeaders,
+            trustedServerOriginURL: URL(string: avatarUrl),
+            targetPixelSize: 408
+        ) { [weak self] image in
+            guard let self,
+                  self.imageGeneration.isCurrent(generation) else { return }
+            applyNativeAvatarImage(
+                image,
+                isTemplate: profile.avatarIsTemplate,
+                to: self.imageView,
+                initialsLabel: self.initialsLabel
+            )
         }
     }
 }

@@ -1,6 +1,9 @@
 import 'package:checks/checks.dart';
 import 'package:conduit/core/database/app_database.dart';
 import 'package:conduit/core/database/mappers/chat_blob_mapper.dart';
+import 'package:conduit/core/database/mappers/conversation_assembler.dart'
+    show kLocalConversationWorkerThreshold;
+import 'package:conduit/core/services/worker_manager.dart';
 import 'package:conduit/core/sync/chat_locks.dart';
 import 'package:conduit/core/sync/id_remapper.dart';
 import 'package:conduit/core/sync/pull_sync.dart';
@@ -103,6 +106,54 @@ void main() {
   }
 
   group('PullSync.run', () {
+    test('large chat normalization uses the worker-offload seam', () async {
+      var offloadCalls = 0;
+      final workerManager = WorkerManager(debugIsWebOverride: false);
+      addTearDown(workerManager.dispose);
+      pull = PullSync(
+        client: client,
+        db: db,
+        locks: locks,
+        rowsParseOffload: (response) {
+          offloadCalls++;
+          return workerManager.schedule(
+            parseChatRowsWorker,
+            response,
+            debugLabel: 'test.pull.normalizeChatRows',
+          );
+        },
+      );
+      server.seedChat(
+        id: 'threshold',
+        blob: blobFor(
+          'threshold',
+          messageCount: kLocalConversationWorkerThreshold,
+        ),
+        createdAt: 50,
+        updatedAt: 100,
+      );
+      server.seedChat(
+        id: 'large',
+        blob: blobFor(
+          'large',
+          messageCount: kLocalConversationWorkerThreshold + 1,
+        ),
+        createdAt: 100,
+        updatedAt: 200,
+      );
+
+      final result = await pull.run();
+
+      check(result.success).isTrue();
+      check(offloadCalls).equals(1);
+      check(
+        (await db.messagesDao.getForChat('large')).length,
+      ).equals(kLocalConversationWorkerThreshold + 1);
+      check(
+        (await db.messagesDao.getForChat('threshold')).length,
+      ).equals(kLocalConversationWorkerThreshold);
+    });
+
     test('first-run full pull (watermark 0) lands every chat', () async {
       server.seedChat(
         id: 'plain',
@@ -952,6 +1003,47 @@ void main() {
       check(await db.chatsDao.getChat(localId)).isNotNull();
       check(await db.chatsDao.getChat('srv-unrelated')).isNotNull();
       check(await db.outboxDao.pendingForChat(localId)).length.equals(1);
+    });
+
+    test('an orphaned matching create does not synthesize a remap', () async {
+      final remapper = IdRemapper(db);
+      addTearDown(remapper.dispose);
+      final healingPull = PullSync(
+        client: client,
+        db: db,
+        locks: locks,
+        remapper: remapper,
+      );
+      const localId = 'local:orphaned-create';
+      final blob = blobFor('orphaned', messageCount: 2);
+      final rows = ChatBlobMapper.blobToRows(
+        chatId: localId,
+        blob: blob,
+        title: 'Title orphaned',
+        createdAt: 100,
+        updatedAt: 200,
+      );
+      await db.chatsDao.insertLocalChatWithCreateOp(
+        chat: rows.chat,
+        messages: rows.messages,
+        blobRows: rows,
+        contentHash: createChatContentHash(rows),
+      );
+      // Simulate legacy/non-atomic loss of the source while its create op
+      // remains. A raw delete intentionally leaves the outbox record behind.
+      await (db.delete(db.chats)..where((t) => t.id.equals(localId))).go();
+      final serverResponse = server.createChat({...blob, 'id': ''});
+      final serverId = serverResponse['id'] as String;
+
+      final result = await healingPull.run();
+
+      check(result.success).isTrue();
+      check(await db.chatsDao.getChat(serverId)).isNotNull();
+      check(await db.syncMetaDao.getChatRemapTarget(localId)).isNull();
+      check(await db.outboxDao.pendingForChat(localId)).isEmpty();
+      check(
+        (await db.select(db.chats).get()).map((chat) => chat.id),
+      ).deepEquals([serverId]);
     });
   });
 }

@@ -12,10 +12,13 @@ import '../../../shared/widgets/conduit_loading.dart';
 import '../../../shared/widgets/adaptive_route_shell.dart';
 
 import '../../../shared/utils/ui_utils.dart';
-import '../../../shared/widgets/themed_dialogs.dart';
+import '../../../shared/widgets/sign_out_options_dialog.dart';
 import '../../../core/providers/app_providers.dart';
+import '../../../core/providers/backend_mode_providers.dart';
 import '../../../core/services/navigation_service.dart';
+import '../../hermes/providers/hermes_providers.dart';
 import '../../auth/providers/unified_auth_providers.dart';
+import '../../workspace/providers/workspace_capabilities_provider.dart';
 import '../../../core/services/api_service.dart';
 import '../../../core/models/user.dart' as models;
 import '../../../core/utils/user_display_name.dart';
@@ -89,7 +92,19 @@ class ProfilePage extends ConsumerWidget {
   ) {
     final mediaQuery = MediaQuery.of(context);
     final topPadding = _topContentPadding(context);
-
+    final hermesOnly = ref.watch(hermesOnlyModeProvider);
+    final directPrimary =
+        ref.watch(preferredBackendProvider) == PreferredBackend.direct;
+    final hasOpenWebUiAccount = userData != null && api != null;
+    final items = _buildSettingsItems(
+      context,
+      ref,
+      userData: userData,
+      api: api,
+      hermesOnly: hermesOnly,
+      directPrimary: directPrimary,
+      hasOpenWebUiAccount: hasOpenWebUiAccount,
+    );
     return ListView(
       physics: const BouncingScrollPhysics(
         parent: AlwaysScrollableScrollPhysics(),
@@ -101,11 +116,14 @@ class ProfilePage extends ConsumerWidget {
         Spacing.pagePadding + mediaQuery.padding.bottom,
       ),
       children: [
-        _buildProfileHeader(context, userData, api),
+        for (var i = 0; i < items.length; i++) ...[
+          items[i],
+          if (i != items.length - 1) const SizedBox(height: Spacing.md),
+        ],
         const SizedBox(height: Spacing.xl),
-        _buildAccountSection(context, ref),
-        const SizedBox(height: Spacing.xl),
-        _buildSupportSection(context),
+        _buildDonationSection(context),
+        if (hasOpenWebUiAccount) const SizedBox(height: Spacing.xl),
+        if (hasOpenWebUiAccount) _buildSignOutOption(context, ref),
       ],
     );
   }
@@ -118,21 +136,18 @@ class ProfilePage extends ConsumerWidget {
     return Spacing.lg;
   }
 
-  Widget _buildSupportSection(BuildContext context) {
+  Widget _buildDonationSection(BuildContext context) {
     final theme = context.conduitTheme;
-    final textTheme = theme.bodySmall?.copyWith(
-      color: theme.sidebarForeground.withValues(alpha: 0.75),
-    );
-
-    final supportTiles = [
+    final l10n = AppLocalizations.of(context)!;
+    final donationOptions = [
       _buildSupportOption(
         context,
         icon: UiUtils.platformIcon(
           ios: CupertinoIcons.gift,
           android: Icons.coffee,
         ),
-        title: AppLocalizations.of(context)!.buyMeACoffeeTitle,
-        subtitle: AppLocalizations.of(context)!.buyMeACoffeeSubtitle,
+        title: l10n.buyMeACoffeeTitle,
+        subtitle: l10n.buyMeACoffeeSubtitle,
         url: _buyMeACoffeeUrl,
         color: theme.warning,
       ),
@@ -142,29 +157,33 @@ class ProfilePage extends ConsumerWidget {
           ios: CupertinoIcons.heart,
           android: Icons.favorite_border,
         ),
-        title: AppLocalizations.of(context)!.githubSponsorsTitle,
-        subtitle: AppLocalizations.of(context)!.githubSponsorsSubtitle,
+        title: l10n.githubSponsorsTitle,
+        subtitle: l10n.githubSponsorsSubtitle,
         url: _githubSponsorsUrl,
         color: theme.success,
       ),
     ];
 
     return Column(
+      key: const Key('settings-donations'),
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          AppLocalizations.of(context)!.supportConduit,
+          l10n.supportConduit,
           style: theme.headingSmall?.copyWith(color: theme.sidebarForeground),
         ),
         const SizedBox(height: Spacing.xs),
         Text(
-          AppLocalizations.of(context)!.supportConduitSubtitle,
-          style: textTheme,
+          l10n.supportConduitSubtitle,
+          style: theme.bodySmall?.copyWith(
+            color: theme.sidebarForeground.withValues(alpha: 0.75),
+          ),
         ),
         const SizedBox(height: Spacing.sm),
-        for (var i = 0; i < supportTiles.length; i++) ...[
-          supportTiles[i],
-          if (i != supportTiles.length - 1) const SizedBox(height: Spacing.md),
+        for (var i = 0; i < donationOptions.length; i++) ...[
+          donationOptions[i],
+          if (i != donationOptions.length - 1)
+            const SizedBox(height: Spacing.md),
         ],
       ],
     );
@@ -325,19 +344,39 @@ class ProfilePage extends ConsumerWidget {
     );
   }
 
-  Widget _buildAccountSection(BuildContext context, WidgetRef ref) {
-    final items = [
+  List<Widget> _buildSettingsItems(
+    BuildContext context,
+    WidgetRef ref, {
+    required dynamic userData,
+    required ApiService? api,
+    required bool hermesOnly,
+    required bool directPrimary,
+    required bool hasOpenWebUiAccount,
+  }) {
+    final l10n = AppLocalizations.of(context)!;
+    final canManageWorkspace = canManageAnyWorkspaceSection(ref);
+
+    return [
+      if (hasOpenWebUiAccount) _buildProfileHeader(context, userData, api),
       _buildAccountOption(
         context,
         icon: UiUtils.platformIcon(
-          ios: CupertinoIcons.person_crop_circle_badge_checkmark,
-          android: Icons.auto_awesome,
+          ios: CupertinoIcons.paintbrush,
+          android: Icons.palette_outlined,
         ),
-        title: AppLocalizations.of(context)!.personalization,
-        subtitle: AppLocalizations.of(context)!.personalizationSubtitle,
-        onTap: () {
-          context.pushNamed(RouteNames.personalization);
-        },
+        title: l10n.settingsAppearance,
+        subtitle: l10n.settingsAppearanceSubtitle,
+        onTap: () => context.pushNamed(RouteNames.appearanceSettings),
+      ),
+      _buildAccountOption(
+        context,
+        icon: UiUtils.platformIcon(
+          ios: CupertinoIcons.bubble_left_bubble_right,
+          android: Icons.chat_bubble_outline,
+        ),
+        title: l10n.chatSettings,
+        subtitle: l10n.settingsChatSubtitle,
+        onTap: () => context.pushNamed(RouteNames.chatSettings),
       ),
       _buildAccountOption(
         context,
@@ -345,74 +384,126 @@ class ProfilePage extends ConsumerWidget {
           ios: CupertinoIcons.waveform,
           android: Icons.graphic_eq,
         ),
-        title: AppLocalizations.of(context)!.audioSettingsTitle,
-        subtitle: AppLocalizations.of(context)!.audioSettingsSubtitle,
-        onTap: () {
-          context.pushNamed(RouteNames.audioSettings);
-        },
+        title: l10n.audioSettingsTitle,
+        subtitle: l10n.audioSettingsSubtitle,
+        onTap: () => context.pushNamed(RouteNames.audioSettings),
       ),
+      if (hasOpenWebUiAccount)
+        _buildAccountOption(
+          context,
+          icon: UiUtils.platformIcon(
+            ios: CupertinoIcons.bell,
+            android: Icons.notifications_outlined,
+          ),
+          title: l10n.notificationsTitle,
+          subtitle: l10n.notificationsSubtitle,
+          onTap: () => context.pushNamed(RouteNames.notificationSettings),
+        ),
+      if (hasOpenWebUiAccount || directPrimary)
+        _buildAccountOption(
+          context,
+          icon: UiUtils.platformIcon(
+            ios: CupertinoIcons.person_crop_circle_badge_checkmark,
+            android: Icons.auto_awesome,
+          ),
+          title: l10n.personalization,
+          subtitle: l10n.personalizationSubtitle,
+          onTap: () => context.pushNamed(RouteNames.personalization),
+        ),
+      _buildAccountOption(
+        context,
+        iconAsset: 'assets/icons/hermes_agent.png',
+        title: l10n.hermesAgentSettingsTitle,
+        subtitle: l10n.hermesAgentSettingsSubtitle,
+        onTap: () => context.pushNamed(RouteNames.hermesSettings),
+      ),
+      if (canManageWorkspace)
+        _buildAccountOption(
+          context,
+          key: const Key('workspace-entry'),
+          icon: UiUtils.platformIcon(
+            ios: CupertinoIcons.square_grid_2x2,
+            android: Icons.dashboard_customize_outlined,
+          ),
+          title: l10n.workspaceTitle,
+          subtitle: l10n.workspaceSubtitle,
+          onTap: () => context.pushNamed(RouteNames.workspace),
+        ),
+      if (hasOpenWebUiAccount)
+        _buildAccountOption(
+          context,
+          key: const Key('data-connection-entry'),
+          icon: UiUtils.platformIcon(
+            ios: CupertinoIcons.antenna_radiowaves_left_right,
+            android: Icons.hub_outlined,
+          ),
+          title: l10n.settingsDataAndConnection,
+          subtitle: l10n.connectionHealth,
+          onTap: () => context.pushNamed(RouteNames.dataConnectionSettings),
+        ),
       _buildAccountOption(
         context,
         icon: UiUtils.platformIcon(
-          ios: CupertinoIcons.slider_horizontal_3,
-          android: Icons.tune,
+          ios: CupertinoIcons.link,
+          android: Icons.hub_outlined,
         ),
-        title: AppLocalizations.of(context)!.appAndChat,
-        subtitle: AppLocalizations.of(context)!.appAndChatSubtitle,
-        onTap: () {
-          context.pushNamed(RouteNames.appCustomization);
-        },
+        title: l10n.directConnectionsTitle,
+        subtitle: l10n.directConnectionsSubtitle,
+        onTap: () => context.pushNamed(RouteNames.directConnections),
       ),
-      _buildAccountOption(
-        context,
-        icon: UiUtils.platformIcon(
-          ios: CupertinoIcons.bell,
-          android: Icons.notifications_outlined,
+      if (!hasOpenWebUiAccount)
+        _buildAccountOption(
+          context,
+          icon: UiUtils.platformIcon(
+            ios: CupertinoIcons.add_circled,
+            android: Icons.add_circle_outline,
+          ),
+          title: l10n.connectOpenWebUITitle,
+          subtitle: l10n.connectOpenWebUISubtitle,
+          onTap: () => context.goNamed(RouteNames.serverConnection),
         ),
-        title: AppLocalizations.of(context)!.notificationsTitle,
-        subtitle: AppLocalizations.of(context)!.notificationsSubtitle,
-        onTap: () {
-          context.pushNamed(RouteNames.notificationSettings);
-        },
-      ),
       _buildAboutTile(context),
-      _buildAccountOption(
-        context,
-        icon: UiUtils.platformIcon(
-          ios: CupertinoIcons.square_arrow_left,
-          android: Icons.logout,
-        ),
-        title: AppLocalizations.of(context)!.signOut,
-        subtitle: AppLocalizations.of(context)!.endYourSession,
-        onTap: () => _signOut(context, ref),
-        showChevron: false,
-      ),
     ];
+  }
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        for (var i = 0; i < items.length; i++) ...[
-          items[i],
-          if (i != items.length - 1) const SizedBox(height: Spacing.md),
-        ],
-      ],
+  Widget _buildSignOutOption(BuildContext context, WidgetRef ref) {
+    final l10n = AppLocalizations.of(context)!;
+    return _buildAccountOption(
+      context,
+      key: const Key('settings-sign-out'),
+      icon: UiUtils.platformIcon(
+        ios: CupertinoIcons.square_arrow_left,
+        android: Icons.logout,
+      ),
+      title: l10n.signOut,
+      subtitle: l10n.endYourSession,
+      onTap: () => _signOut(context, ref),
+      showChevron: false,
     );
   }
 
   Widget _buildAccountOption(
     BuildContext context, {
-    required IconData icon,
+    Key? key,
+    IconData? icon,
+    String? iconAsset,
     required String title,
     required String subtitle,
     required VoidCallback onTap,
     bool showChevron = true,
   }) {
+    assert(
+      (icon == null) != (iconAsset == null),
+      'Provide exactly one of icon or iconAsset.',
+    );
     final theme = context.conduitTheme;
     final color = theme.buttonPrimary;
     return ProfileSettingTile(
+      key: key,
       onTap: onTap,
-      leading: _buildIconBadge(context, icon, color: color),
+      leading: iconAsset != null
+          ? _buildAssetIconBadge(context, iconAsset, color: color)
+          : _buildIconBadge(context, icon!, color: color),
       title: title,
       subtitle: subtitle,
       trailing: showChevron
@@ -449,6 +540,35 @@ class ProfilePage extends ConsumerWidget {
     );
   }
 
+  Widget _buildAssetIconBadge(
+    BuildContext context,
+    String asset, {
+    required Color color,
+  }) {
+    return Container(
+      width: 40,
+      height: 40,
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(AppBorderRadius.small),
+        border: Border.all(
+          color: color.withValues(alpha: 0.2),
+          width: BorderWidth.thin,
+        ),
+      ),
+      alignment: Alignment.center,
+      child: Image.asset(
+        asset,
+        key: const Key('hermes-settings-logo'),
+        width: IconSize.medium,
+        height: IconSize.medium,
+        color: color,
+        colorBlendMode: BlendMode.srcIn,
+        filterQuality: FilterQuality.high,
+      ),
+    );
+  }
+
   // Theme and language controls moved to AppCustomizationPage.
 
   Widget _buildAboutTile(BuildContext context) {
@@ -465,16 +585,16 @@ class ProfilePage extends ConsumerWidget {
   }
 
   void _signOut(BuildContext context, WidgetRef ref) async {
-    final confirm = await ThemedDialogs.confirm(
-      context,
-      title: AppLocalizations.of(context)!.signOut,
-      message: AppLocalizations.of(context)!.endYourSession,
-      confirmText: AppLocalizations.of(context)!.signOut,
-      isDestructive: true,
-    );
+    final keepServerDetails = await showSignOutOptionsDialog(context);
 
-    if (confirm) {
-      await ref.read(authActionsProvider).logout();
+    if (!context.mounted || keepServerDetails == null) return;
+    try {
+      await ref
+          .read(signOutCoordinatorProvider)
+          .signOut(keepServerDetails: keepServerDetails);
+    } catch (_) {
+      if (!context.mounted) return;
+      UiUtils.showMessage(context, AppLocalizations.of(context)!.errorMessage);
     }
   }
 }

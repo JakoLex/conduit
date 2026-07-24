@@ -5,13 +5,20 @@ import 'package:adaptive_platform_ui/adaptive_platform_ui.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:dio/dio.dart' show CancelToken;
 import '../../../shared/theme/theme_extensions.dart';
 import '../../../shared/widgets/markdown/streaming_markdown_widget.dart';
 import '../../../shared/widgets/markdown/renderer/markdown_style.dart';
 import '../../../core/models/chat_message.dart';
+import '../../../core/providers/app_providers.dart'
+    show activeConversationProvider;
 import '../../../shared/widgets/markdown/markdown_preprocessor.dart';
 import '../providers/text_to_speech_provider.dart';
 import '../providers/queued_completion_provider.dart';
+import '../providers/streaming_haptic_memory.dart';
+import '../../hermes/providers/hermes_providers.dart';
+import '../../hermes/services/hermes_run_transport.dart';
+import '../../hermes/widgets/hermes_approval_card.dart';
 import 'enhanced_image_attachment.dart';
 import 'package:conduit/l10n/app_localizations.dart';
 import 'enhanced_attachment.dart';
@@ -23,6 +30,9 @@ import '../../../shared/widgets/web_content_embed.dart';
 import '../providers/chat_providers.dart'
     show
         chatComposerTextInsertionTargetId,
+        captureHermesApprovalProjectionStateUpdater,
+        chatMessagesProvider,
+        hermesRunKeyForConversation,
         isChatStreamingProvider,
         sendMessageWithContainer,
         streamingContentProvider;
@@ -33,13 +43,13 @@ import '../../../core/services/settings_service.dart';
 import '../../../core/utils/embed_utils.dart';
 import 'sources/openwebui_sources.dart';
 import '../providers/assistant_response_builder_provider.dart';
+import '../views/chat_turn_render_state.dart';
 import '../../../core/services/worker_manager.dart';
 import 'streaming_status_widget.dart';
 import '../utils/file_utils.dart';
 import 'code_execution_display.dart';
 import 'follow_up_suggestions.dart';
 import 'usage_stats_modal.dart';
-import 'five_rotating_dots.dart';
 
 // Wrap only standalone base64 image lines so <details> attributes stay intact.
 final _standaloneBase64ImagePattern = RegExp(
@@ -52,6 +62,15 @@ final _ttsDetailsPattern = RegExp(
 );
 // Handle both URL formats: /api/v1/files/{id} and /api/v1/files/{id}/content
 final _fileIdPattern = RegExp(r'/api/v1/files/([^/]+)(?:/content)?$');
+
+typedef _HermesApprovalBinding = ({
+  HermesRunKey runKey,
+  Object generationToken,
+  CancelToken cancelToken,
+  String messageId,
+  String runId,
+  String approvalId,
+});
 
 class AssistantMessageWidget extends ConsumerStatefulWidget {
   final dynamic message;
@@ -68,6 +87,7 @@ class AssistantMessageWidget extends ConsumerStatefulWidget {
   final VoidCallback onDelete;
   final VoidCallback? onLike;
   final VoidCallback? onDislike;
+  final FutureOr<void> Function(String suggestion)? onFollowUpSelected;
 
   const AssistantMessageWidget({
     super.key,
@@ -85,6 +105,7 @@ class AssistantMessageWidget extends ConsumerStatefulWidget {
     required this.onDelete,
     this.onLike,
     this.onDislike,
+    this.onFollowUpSelected,
   });
 
   @override
@@ -101,14 +122,11 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
   Widget? _cachedAvatar;
   String? _cachedAvatarModelName;
   String? _cachedAvatarIconUrl;
-  bool _allowTypingIndicator = false;
-  Timer? _typingGateTimer;
   // Hysteresis for the action row: a message that has streamed in this widget's
-  // lifetime must reach a settled completion before the action row replaces the
-  // typing indicator, so a transient in-progress state can never flash the row
-  // mid-stream. Settled on `responseDone` or on the streaming-end transition.
-  // History messages never set `_hasStreamedThisMessage` and show their action
-  // row immediately.
+  // lifetime must reach a settled completion before the action row appears, so
+  // a transient in-progress state can never flash the row mid-stream. Settled
+  // on `responseDone` or on the streaming-end transition. History messages
+  // never set `_hasStreamedThisMessage` and show their action row immediately.
   bool _hasStreamedThisMessage = false;
   bool _actionRowSettled = false;
   String _ttsPlainText = '';
@@ -126,25 +144,39 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
   bool _isRouteVisible = true;
   String? _visibleFollowUpScopeId;
   List<String> _visibleFollowUps = const <String>[];
+  late final void Function(String url, String title) _markdownLinkTapCallback;
+  late final Widget Function(Uri uri, String? title, String? alt)
+  _markdownImageBuilder;
 
-  /// Guards the triple-haptic so it fires only once per streaming session.
-  bool _hasTriggeredContentHaptic = false;
   ProviderSubscription<String?>? _streamingContentSub;
+
+  /// Remount-proof per-message guards for the streaming haptics; a recreated
+  /// State must never replay the content-arrival or completion pulses.
+  StreamingHapticMemory get _hapticMemory =>
+      ref.read(streamingHapticMemoryProvider);
 
   bool get _shouldAnimateOnMount =>
       widget.animateOnMount && !_disableAnimations;
 
+  ChatMessage? get _chatMessage =>
+      widget.message is ChatMessage ? widget.message as ChatMessage : null;
+
+  ChatTurnPhase get _turnPhase =>
+      chatTurnPhaseForMessage(_chatMessage, isStreaming: widget.isStreaming);
+
+  // Phase derivation routes through chatTurnPhaseForMessage, which returns
+  // ChatTurnPhase.none for a null/non-ChatMessage. Every production call site
+  // and test supplies a ChatMessage, so the helper path is the only reachable
+  // one; deriving from the shared phase rule keeps a single source of truth.
   bool get _responseCompleted {
     if (_activeVersionIndex >= 0) {
       return true;
     }
-    if (!widget.isStreaming) {
-      return true;
-    }
-    return widget.message.metadata?['responseDone'] == true;
+    return chatTurnPhaseShowsCompletedFooter(_turnPhase);
   }
 
-  bool get _uiTreatsAsStreaming => widget.isStreaming && !_responseCompleted;
+  bool get _uiTreatsAsStreaming =>
+      _activeVersionIndex < 0 && _turnPhase == ChatTurnPhase.running;
 
   // press state handled by shared ChatActionButton
 
@@ -154,6 +186,11 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
       return;
     }
     try {
+      final onFollowUpSelected = widget.onFollowUpSelected;
+      if (onFollowUpSelected != null) {
+        await onFollowUpSelected(trimmed);
+        return;
+      }
       final container = ProviderScope.containerOf(context, listen: false);
       await sendMessageWithContainer(container, trimmed, null);
     } catch (err, stack) {
@@ -168,6 +205,8 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
   @override
   void initState() {
     super.initState();
+    _markdownLinkTapCallback = _handleMarkdownLinkTap;
+    _markdownImageBuilder = _buildMarkdownImage;
     WidgetsBinding.instance.addObserver(this);
     _isAppForeground = _isLifecycleForeground(
       WidgetsBinding.instance.lifecycleState,
@@ -195,7 +234,6 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
     _hasAnimated = !shouldAnimateOnMount;
     _displayedContent = _resolvedMessageContent();
     _primeInitialStreamingContentFade();
-    _updateTypingIndicatorGate();
     _updateActionRowSettle();
     _syncStreamingContentSubscription();
   }
@@ -203,8 +241,7 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _disableAnimations =
-        MediaQuery.maybeDisableAnimationsOf(context) ?? _disableAnimations;
+    _disableAnimations = context.reduceMotion;
     _updateRouteVisibility();
     if (!_shouldAnimateOnMount && !_hasAnimated) {
       _fadeController.value = 1.0;
@@ -233,7 +270,6 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
       _clearVisibleFollowUps();
       _resetTtsPlainTextState();
       _hasAnimated = !_shouldAnimateOnMount;
-      _hasTriggeredContentHaptic = false;
       _fadeController.value = _shouldAnimateOnMount ? 0.0 : 1.0;
       _streamingContentFadeController.value = 1.0;
     }
@@ -247,14 +283,25 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
       _syncStreamingContentSubscription();
     }
 
-    // Reset fade controller when streaming ends for the same message
+    // A transport flag can flap while ownership moves between optimistic,
+    // durable, and server-echo rows. Completion haptics therefore follow the
+    // durable responseDone transition, not raw isStreaming changes.
+    final responseCompleted =
+        oldWidget.message.metadata?['responseDone'] != true &&
+        widget.message.metadata?['responseDone'] == true;
+    if (responseCompleted &&
+        oldWidget.message.id == widget.message.id &&
+        _hapticMemory.markFired(
+          widget.message.id,
+          StreamingHapticEvent.turnCompleted,
+        )) {
+      _streamingHaptic(HapticType.medium);
+    }
+
+    // Genuine streaming end: allow the action row to replace the indicator.
     if (oldWidget.isStreaming &&
         !widget.isStreaming &&
         oldWidget.message.id == widget.message.id) {
-      _hasTriggeredContentHaptic = false;
-      // Haptic: streaming finished
-      _streamingHaptic(HapticType.medium);
-      // Genuine streaming end: allow the action row to replace the indicator.
       _hasStreamedThisMessage = true;
       _actionRowSettled = true;
     }
@@ -264,11 +311,13 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
       _queueDisplayedContentRefresh();
     }
 
-    // Update typing indicator gate when message properties that affect emptiness change
-    if (_didTypingIndicatorInputsChange(oldWidget) ||
+    if (oldWidget.isStreaming != widget.isStreaming ||
         oldWidget.message.metadata?['responseDone'] !=
-            widget.message.metadata?['responseDone']) {
-      _updateTypingIndicatorGate();
+            widget.message.metadata?['responseDone'] ||
+        // An error can appear in place (failing the turn) while isStreaming
+        // stays true, flipping the phase to failed without an isStreaming or
+        // responseDone change; re-settle so the action row surfaces.
+        oldWidget.message.error != widget.message.error) {
       _updateActionRowSettle();
     }
 
@@ -320,8 +369,11 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
     }
 
     _displayedContentFrameScheduled = true;
-    WidgetsBinding.instance.scheduleFrame();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    // Apply the latest streamed text before build so this requested frame can
+    // render it immediately. Deferring until after the frame creates a second
+    // frame and makes iOS composite the persistent native glass twice for one
+    // visible content update.
+    WidgetsBinding.instance.scheduleFrameCallback((_) {
       _displayedContentFrameScheduled = false;
       if (!mounted) {
         return;
@@ -364,7 +416,6 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
         _isPreparingTtsPlainText) {
       _resetTtsPlainTextState();
     }
-    _updateTypingIndicatorGate();
   }
 
   void _primeInitialStreamingContentFade() {
@@ -400,34 +451,6 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
     });
     _resetTtsPlainTextState();
     _buildCachedAvatar();
-    _updateTypingIndicatorGate();
-  }
-
-  void _updateTypingIndicatorGate() {
-    _typingGateTimer?.cancel();
-    if (_shouldShowStreamingIndicator) {
-      if (_allowTypingIndicator) {
-        return;
-      }
-      _typingGateTimer = Timer(const Duration(milliseconds: 150), () {
-        if (!mounted || !_shouldShowStreamingIndicator) {
-          return;
-        }
-        setState(() {
-          _allowTypingIndicator = true;
-        });
-        // Haptic: typing indicator appeared
-        _streamingHaptic(HapticType.light);
-      });
-    } else if (_allowTypingIndicator) {
-      if (mounted) {
-        setState(() {
-          _allowTypingIndicator = false;
-        });
-      } else {
-        _allowTypingIndicator = false;
-      }
-    }
   }
 
   /// Drives the action-row hysteresis. While the UI still treats the message as
@@ -440,7 +463,8 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
       _actionRowSettled = false;
       return;
     }
-    if (widget.message.metadata?['responseDone'] == true) {
+    if (widget.message.metadata?['responseDone'] == true ||
+        _turnPhase == ChatTurnPhase.failed) {
       _hasStreamedThisMessage = true;
       _actionRowSettled = true;
       return;
@@ -450,11 +474,6 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
       return;
     }
   }
-
-  /// Whether the streaming/typing indicator should currently occupy the footer
-  /// slot. Gated by the 150ms anti-flash window.
-  bool get _showStreamingIndicatorNow =>
-      _allowTypingIndicator && _shouldShowStreamingIndicator;
 
   /// Whether the action row may replace the streaming indicator in the footer.
   bool get _showActionRowNow {
@@ -677,18 +696,6 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
     );
   }
 
-  bool get _hasPendingVisibleStatus => widget.message.statusHistory
-      .where((status) => status.hidden != true)
-      .any((status) => status.done != true);
-
-  /// The streaming indicator lives in the footer slot and persists for the
-  /// whole generation (text/tool-calls/status stream in above it), then is
-  /// swapped for the action row once streaming completes. A pending visible
-  /// status already renders its own shimmer, so suppress the indicator then
-  /// (matches the behaviour the widget test asserts).
-  bool get _shouldShowStreamingIndicator =>
-      _uiTreatsAsStreaming && !_hasPendingVisibleStatus;
-
   bool get _isAssistantResponseEmpty {
     final content = _displayedContent.trim();
     if (content.isNotEmpty) {
@@ -710,10 +717,6 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
       return false;
     }
 
-    // Check if there's a pending (not done) visible status - those have shimmer
-    // so we don't need the typing indicator. But if all visible statuses are
-    // done (e.g., "Retrieved 1 source"), show typing indicator to indicate
-    // the model is still working on generating a response.
     final visibleStatuses = widget.message.statusHistory
         .where((status) => status.hidden != true)
         .toList();
@@ -721,10 +724,8 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
       (status) => status.done != true,
     );
     if (hasPendingStatus) {
-      // Pending status has shimmer effect, no need for typing indicator
       return false;
     }
-    // If all statuses are done but no content yet, show typing indicator
 
     final hasFollowUps = widget.message.followUps.isNotEmpty;
     if (hasFollowUps) {
@@ -851,10 +852,17 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
   void _onStreamingChunk(int previousLength, int newLength) {
     if (newLength <= previousLength) return;
 
-    // Haptic: triple-tap when main content first arrives
-    if (previousLength == 0 && !_hasTriggeredContentHaptic) {
-      _hasTriggeredContentHaptic = true;
-      _tripleHaptic();
+    // The streamed value is replayed immediately when a virtualized row
+    // remounts. Keep this guard outside widget State so that replay cannot
+    // synthesize another 0→N "first chunk" and replay the pulse.
+    if (previousLength == 0 &&
+        _hapticMemory.markFired(
+          widget.message.id,
+          StreamingHapticEvent.contentArrival,
+        )) {
+      // One acknowledgement is enough; the previous three pulses at
+      // 0/150/300ms felt like an unintended rapid vibration after every send.
+      _streamingHaptic(HapticType.medium);
     }
   }
 
@@ -865,23 +873,6 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
       type: type,
       hapticEnabled: enabled,
     );
-  }
-
-  /// Fires three distinct haptic taps to signal content arrival.
-  ///
-  /// Each tap is spaced 150ms apart so the user perceives three
-  /// separate impulses rather than a single buzz.
-  void _tripleHaptic() {
-    if (!_streamingHapticsAllowed) return;
-    PlatformService.hapticFeedback(type: HapticType.medium);
-    Future.delayed(const Duration(milliseconds: 150), () {
-      if (!mounted || !_streamingHapticsAllowed) return;
-      PlatformService.hapticFeedback(type: HapticType.medium);
-    });
-    Future.delayed(const Duration(milliseconds: 300), () {
-      if (!mounted || !_streamingHapticsAllowed) return;
-      PlatformService.hapticFeedback(type: HapticType.medium);
-    });
   }
 
   bool get _streamingHapticsAllowed =>
@@ -912,7 +903,6 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _streamingContentSub?.close();
-    _typingGateTimer?.cancel();
     _resetTtsPlainTextState();
     _fadeController.dispose();
     _streamingContentFade.dispose();
@@ -958,37 +948,6 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
     return oldWidget.isStreaming != widget.isStreaming;
   }
 
-  bool _didTypingIndicatorInputsChange(AssistantMessageWidget oldWidget) {
-    return _statusSignature(oldWidget.message.statusHistory) !=
-            _statusSignature(widget.message.statusHistory) ||
-        _collectionLength(oldWidget.message.files) !=
-            _collectionLength(widget.message.files) ||
-        _collectionLength(oldWidget.message.embeds) !=
-            _collectionLength(widget.message.embeds) ||
-        _collectionLength(oldWidget.message.attachmentIds) !=
-            _collectionLength(widget.message.attachmentIds) ||
-        _collectionLength(oldWidget.message.followUps) !=
-            _collectionLength(widget.message.followUps) ||
-        _collectionLength(oldWidget.message.codeExecutions) !=
-            _collectionLength(widget.message.codeExecutions) ||
-        oldWidget.isStreaming != widget.isStreaming;
-  }
-
-  int _statusSignature(List<ChatStatusUpdate> statuses) {
-    return Object.hashAll(
-      statuses.map(
-        (status) => Object.hash(
-          status.action,
-          status.description,
-          status.done,
-          status.hidden,
-        ),
-      ),
-    );
-  }
-
-  int _collectionLength(Iterable<dynamic>? values) => values?.length ?? 0;
-
   void _clearVisibleFollowUps() {
     _visibleFollowUpScopeId = null;
     _visibleFollowUps = const <String>[];
@@ -1015,6 +974,211 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
     return _buildDocumentationMessage();
   }
 
+  /// Renders the Hermes human-approval gate when the assistant message is
+  /// paused awaiting a decision. Returns an empty box otherwise.
+  Widget _buildHermesApprovalCard() {
+    final approval = widget.message.metadata?['hermesApproval'];
+    if (approval is! Map) return const SizedBox.shrink();
+
+    final rawRunId = approval['runId'];
+    final runId = rawRunId is String ? rawRunId : null;
+    final rawApprovalId = approval['approvalId'];
+    final approvalId = rawApprovalId is String ? rawApprovalId : null;
+    final rawMessageId = widget.message.id;
+    final messageId = rawMessageId is String ? rawMessageId : null;
+    final activeConversation = ref.read(activeConversationProvider);
+    final runKey = activeConversation == null || messageId == null
+        ? null
+        : hermesRunKeyForConversation(
+            ref,
+            conversation: activeConversation,
+            assistantMessageId: messageId,
+          );
+    final registry = ref.read(hermesRunRegistryProvider);
+    final generationToken = runKey == null || runId == null
+        ? null
+        : registry.generationTokenFor(runKey, runId: runId);
+    final cancelToken =
+        runKey == null || runId == null || generationToken == null
+        ? null
+        : registry.cancelTokenForGeneration(
+            runKey,
+            generationToken: generationToken,
+            runId: runId,
+          );
+    if (widget.message.metadata?['transport'] != kHermesTransport ||
+        runId == null ||
+        approvalId == null ||
+        messageId == null ||
+        runKey == null ||
+        generationToken == null ||
+        cancelToken == null) {
+      return const SizedBox.shrink();
+    }
+    final binding = (
+      runKey: runKey,
+      generationToken: generationToken,
+      cancelToken: cancelToken,
+      messageId: messageId,
+      runId: runId,
+      approvalId: approvalId,
+    );
+
+    // Belt-and-suspenders: hide the gate if the server doesn't support approval.
+    final caps = ref.watch(hermesCapabilitiesProvider).asData?.value;
+    if (caps != null && !caps.runApproval) return const SizedBox.shrink();
+
+    final rawState = approval['state'];
+    final stateStr = rawState is String ? rawState : 'pending';
+    final state = switch (stateStr) {
+      'resolving' => HermesApprovalState.resolving,
+      'approved' => HermesApprovalState.approved,
+      'denied' => HermesApprovalState.denied,
+      _ => HermesApprovalState.pending,
+    };
+
+    return HermesApprovalCard(
+      state: state,
+      summary: approval['summary'] is String
+          ? approval['summary'] as String
+          : null,
+      onDecision: (approved) => _resolveHermesApproval(approved, binding),
+    );
+  }
+
+  Future<void> _resolveHermesApproval(
+    bool approved,
+    _HermesApprovalBinding binding,
+  ) async {
+    final approvalId = binding.approvalId;
+    final runId = binding.runId;
+    final messageId = binding.messageId;
+    final activeConversation = ref.read(activeConversationProvider);
+    final runKey = activeConversation == null
+        ? null
+        : hermesRunKeyForConversation(
+            ref,
+            conversation: activeConversation,
+            assistantMessageId: messageId,
+          );
+    final registry = ref.read(hermesRunRegistryProvider);
+    if (runKey == null) {
+      return;
+    }
+
+    // The callback belongs to the generation that rendered this card. A chat
+    // id remap may move that exact generation to a new key, but a same-key
+    // replacement must never let the stale button capture its newer token.
+    if (!registry.ownsGeneration(
+      binding.runKey,
+      generationToken: binding.generationToken,
+      runId: runId,
+    )) {
+      if (runKey == binding.runKey ||
+          !registry.ownsGeneration(
+            runKey,
+            generationToken: binding.generationToken,
+            runId: runId,
+          )) {
+        return;
+      }
+    }
+
+    final messagesNotifier = ref.read(chatMessagesProvider.notifier);
+    final updateProjectionState = captureHermesApprovalProjectionStateUpdater(
+      ref,
+      cancelToken: binding.cancelToken,
+      messageId: messageId,
+      runId: runId,
+      approvalId: approvalId,
+    );
+
+    bool setApprovalState(String next, {required String expectedState}) {
+      final projectionUpdate = updateProjectionState(
+        expectedState: expectedState,
+        nextState: next,
+      );
+      if (projectionUpdate.found && !projectionUpdate.changed) return false;
+
+      final currentConversation = mounted
+          ? ref.read(activeConversationProvider)
+          : null;
+      final currentRunKey = currentConversation == null
+          ? null
+          : hermesRunKeyForConversation(
+              ref,
+              conversation: currentConversation,
+              assistantMessageId: messageId,
+            );
+      final visibleOwnsGeneration =
+          currentRunKey != null &&
+          (projectionUpdate.found
+              ? currentRunKey == projectionUpdate.key
+              : registry.ownsGeneration(
+                  currentRunKey,
+                  generationToken: binding.generationToken,
+                  runId: runId,
+                ));
+      var visibleChanged = false;
+      if (visibleOwnsGeneration) {
+        messagesNotifier.updateMessageById(messageId, (m) {
+          if (m.id != messageId ||
+              m.metadata?['transport'] != kHermesTransport) {
+            return m;
+          }
+          final meta = Map<String, dynamic>.from(m.metadata ?? const {});
+          final current = meta['hermesApproval'];
+          if (current is! Map ||
+              current['approvalId'] != approvalId ||
+              current['runId'] != runId ||
+              (current['state'] ?? 'pending') != expectedState) {
+            return m;
+          }
+          meta['hermesApproval'] = {
+            ...current.cast<String, dynamic>(),
+            'state': next,
+          };
+          visibleChanged = true;
+          return m.copyWith(metadata: meta);
+        });
+      }
+      // Real chat dispatches always have a projection. The visible-only
+      // fallback preserves narrow widget seams while retaining the registry
+      // generation CAS above.
+      return projectionUpdate.found ? projectionUpdate.changed : visibleChanged;
+    }
+
+    // If Hermes was disabled/invalidated between display and tap, the service is
+    // null and `?.resolveApproval` would silently no-op while the UI claimed
+    // success — leaving the server-side run blocked. Keep the gate decidable.
+    final service = ref.read(hermesApiServiceProvider);
+    if (service == null) {
+      DebugLogger.warning('approval-no-service', scope: 'chat/hermes_approval');
+      return;
+    }
+
+    if (!setApprovalState('resolving', expectedState: 'pending')) return;
+    try {
+      await service.resolveApproval(
+        runId,
+        approvalId: approvalId,
+        approved: approved,
+      );
+    } catch (_) {
+      // Surface failure by returning the gate to a decidable state.
+      DebugLogger.error(
+        'approval-resolve-failed',
+        scope: 'chat/hermes_approval',
+      );
+      setApprovalState('pending', expectedState: 'resolving');
+      return;
+    }
+    setApprovalState(
+      approved ? 'approved' : 'denied',
+      expectedState: 'resolving',
+    );
+  }
+
   Widget _buildDocumentationMessage() {
     final displayStatusHistory = filterVisibleStatusUpdates(
       widget.message.statusHistory,
@@ -1035,10 +1199,6 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
         ? queuedCompletionAsync.value
         : null;
     final hasQueuedCompletion = queuedCompletion != null;
-    final footerSwitchDuration =
-        (_showStreamingIndicatorNow || _showActionRowNow)
-        ? const Duration(milliseconds: 180)
-        : Duration.zero;
     final showQueuedAsEmptyState =
         queuedCompletion != null &&
         _isAssistantResponseEmpty &&
@@ -1108,28 +1268,14 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
                 else if (suppressEmptyQueuedContent)
                   const SizedBox.shrink()
                 else
-                  // Content streams in here; the typing indicator now lives in
-                  // the footer slot below (and persists while text streams in
-                  // above it). Empty content renders as SizedBox.shrink.
-                  AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 220),
-                    switchInCurve: Curves.easeOutCubic,
-                    switchOutCurve: Curves.easeInCubic,
-                    transitionBuilder: (child, anim) {
-                      return FadeTransition(
-                        opacity: CurvedAnimation(
-                          parent: anim,
-                          curve: Curves.easeOutCubic,
-                          reverseCurve: Curves.easeInCubic,
-                        ),
-                        child: child,
-                      );
-                    },
-                    child: KeyedSubtree(
-                      key: const ValueKey('content'),
-                      child: _buildStreamingContentBody(),
-                    ),
-                  ),
+                  // Content streams in here. Empty content renders as
+                  // SizedBox.shrink, and the footer indicator covers that
+                  // waiting state until visible content arrives. Keep this
+                  // subtree direct: a stable-key AnimatedSwitcher never
+                  // switched and only obscured the one-shot content fade.
+                  _buildStreamingContentBody(),
+
+                _buildHermesApprovalCard(),
 
                 if (showQueuedRecoveryBanner) ...[
                   const SizedBox(height: Spacing.sm),
@@ -1152,13 +1298,14 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
             ),
           ),
 
-          // Footer slot: the typing indicator occupies the action-row position
-          // while streaming (content streams above it) and crossfades to the
-          // action row exactly once, when generation completes.
+          // Footer slot: keep completion actions inside the message while the
+          // running turn indicator is owned by the timeline.
           if (!hasQueuedCompletion)
             AnimatedSwitcher(
-              duration: footerSwitchDuration,
-              reverseDuration: footerSwitchDuration,
+              // The running indicator is owned by the timeline footer now, so
+              // this switch only swaps in the completed action row instantly.
+              duration: Duration.zero,
+              reverseDuration: Duration.zero,
               switchInCurve: Curves.easeOutCubic,
               switchOutCurve: Curves.easeInCubic,
               layoutBuilder: (currentChild, previousChildren) {
@@ -1203,26 +1350,13 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
     return FadeTransition(opacity: _fadeController, child: content);
   }
 
-  /// Builds the keyed child for the footer [AnimatedSwitcher]: the typing
-  /// indicator while streaming, the action row + follow-ups once completed,
-  /// or an empty slot during the gate / transient window.
+  /// Builds the keyed child for the footer [AnimatedSwitcher]: the action row
+  /// + follow-ups once completed, or an empty slot while streaming.
   Widget _buildFooterSlot({
     required Widget? footer,
     required bool hasFollowUps,
     required List<String> activeFollowUps,
   }) {
-    if (_showStreamingIndicatorNow) {
-      return KeyedSubtree(
-        key: const ValueKey('typing'),
-        child: Padding(
-          padding: EdgeInsets.only(
-            top: ConduitMarkdownStyle.fromTheme(context).paragraphSpacing,
-          ),
-          child: _buildTypingIndicator(),
-        ),
-      );
-    }
-
     if (_showActionRowNow) {
       final children = <Widget>[];
       if (footer != null) {
@@ -1445,6 +1579,21 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
     );
   }
 
+  void _handleMarkdownLinkTap(String url, String _) {
+    launchExternalLink(url, scope: 'chat/assistant');
+  }
+
+  Widget _buildMarkdownImage(Uri uri, String? title, String? alt) {
+    return RepaintBoundary(
+      child: EnhancedImageAttachment(
+        attachmentId: uri.toString(),
+        isMarkdownFormat: true,
+        constraints: const BoxConstraints(maxWidth: 500, maxHeight: 400),
+        disableAnimation: _uiTreatsAsStreaming,
+      ),
+    );
+  }
+
   Widget _buildEnhancedMarkdownContent(String content) {
     if (content.trim().isEmpty) {
       return const SizedBox.shrink();
@@ -1460,23 +1609,15 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
       return StreamingMarkdownWidget(
         content: processedContent,
         isStreaming: bodyTreatsAsStreaming,
-        enableStreamingTextFade: bodyTreatsAsStreaming && !_disableAnimations,
+        // Tokens should appear on the frame they arrive. The surrounding body
+        // already owns the single first-content reveal; re-fading every suffix
+        // makes streaming trail the model.
+        enableStreamingTextFade: false,
         askConduitComposerTargetId: chatComposerTextInsertionTargetId,
         stateScopeId: _markdownStateScopeId(),
-        onTapLink: (url, _) => launchExternalLink(url, scope: 'chat/assistant'),
+        onTapLink: _markdownLinkTapCallback,
         sources: activeSources,
-        imageBuilderOverride: (uri, title, alt) {
-          // Route markdown images through the enhanced image widget so they
-          // get caching, auth headers, fullscreen viewer, and sharing.
-          return RepaintBoundary(
-            child: EnhancedImageAttachment(
-              attachmentId: uri.toString(),
-              isMarkdownFormat: true,
-              constraints: const BoxConstraints(maxWidth: 500, maxHeight: 400),
-              disableAnimation: bodyTreatsAsStreaming,
-            ),
-          );
-        },
+        imageBuilderOverride: _markdownImageBuilder,
       );
     }
 
@@ -1600,45 +1741,36 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
 
     final imageCount = widget.message.attachmentIds!.length;
 
-    // Display images in a clean, modern layout for assistant messages
-    // Use AnimatedSwitcher for smooth transitions when loading
-    return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 300),
-      switchInCurve: Curves.easeInOut,
-      child: imageCount == 1
-          ? Container(
-              key: ValueKey('single_item_${widget.message.attachmentIds![0]}'),
-              child: EnhancedAttachment(
-                attachmentId: widget.message.attachmentIds![0],
-                isMarkdownFormat: true,
-                constraints: const BoxConstraints(
-                  maxWidth: 500,
-                  maxHeight: 400,
-                ),
-                disableAnimation: _uiTreatsAsStreaming,
-              ),
-            )
-          : Wrap(
-              key: ValueKey(
-                'multi_items_${widget.message.attachmentIds!.join('_')}',
-              ),
-              spacing: Spacing.sm,
-              runSpacing: Spacing.sm,
-              children: widget.message.attachmentIds!.map<Widget>((
-                attachmentId,
-              ) {
-                return EnhancedAttachment(
-                  key: ValueKey('attachment_$attachmentId'),
-                  attachmentId: attachmentId,
-                  isMarkdownFormat: true,
-                  constraints: BoxConstraints(
-                    maxWidth: imageCount == 2 ? 245 : 160,
-                    maxHeight: imageCount == 2 ? 245 : 160,
-                  ),
-                  disableAnimation: _uiTreatsAsStreaming,
-                );
-              }).toList(),
-            ),
+    // Preserve stable attachments when another item arrives. Crossfading the
+    // whole grid made already-loaded images disappear and re-enter.
+    if (imageCount == 1) {
+      return Container(
+        key: ValueKey('single_item_${widget.message.attachmentIds![0]}'),
+        child: EnhancedAttachment(
+          attachmentId: widget.message.attachmentIds![0],
+          isMarkdownFormat: true,
+          constraints: const BoxConstraints(maxWidth: 500, maxHeight: 400),
+          disableAnimation: _uiTreatsAsStreaming,
+        ),
+      );
+    }
+
+    return Wrap(
+      key: const ValueKey('assistant-attachment-grid'),
+      spacing: Spacing.sm,
+      runSpacing: Spacing.sm,
+      children: widget.message.attachmentIds!.map<Widget>((attachmentId) {
+        return EnhancedAttachment(
+          key: ValueKey('attachment_$attachmentId'),
+          attachmentId: attachmentId,
+          isMarkdownFormat: true,
+          constraints: BoxConstraints(
+            maxWidth: imageCount == 2 ? 245 : 160,
+            maxHeight: imageCount == 2 ? 245 : 160,
+          ),
+          disableAnimation: _uiTreatsAsStreaming,
+        );
+      }).toList(),
     );
   }
 
@@ -1717,62 +1849,50 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
   Widget _buildImagesFromFiles(List<dynamic> imageFiles) {
     final imageCount = imageFiles.length;
 
-    // Display images using EnhancedImageAttachment for consistency
-    // Use AnimatedSwitcher for smooth transitions
-    return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 300),
-      switchInCurve: Curves.easeInOut,
-      child: imageCount == 1
-          ? Container(
-              key: ValueKey('file_single_${imageFiles[0]['url']}'),
-              child: Builder(
-                builder: (context) {
-                  final imageUrl = getFileUrl(imageFiles[0]);
-                  if (imageUrl == null) return const SizedBox.shrink();
+    // Preserve stable image children instead of crossfading the full grid.
+    if (imageCount == 1) {
+      final imageUrl = getFileUrl(imageFiles.first);
+      if (imageUrl == null) return const SizedBox.shrink();
 
-                  return RepaintBoundary(
-                    child: EnhancedImageAttachment(
-                      attachmentId:
-                          imageUrl, // Pass URL directly as it handles URLs
-                      isMarkdownFormat: true,
-                      constraints: const BoxConstraints(
-                        maxWidth: 500,
-                        maxHeight: 400,
-                      ),
-                      disableAnimation:
-                          false, // Keep animations enabled to prevent black display
-                      httpHeaders: _headersForFile(imageFiles[0]),
-                    ),
-                  );
-                },
-              ),
-            )
-          : Wrap(
-              key: ValueKey(
-                'file_multi_${imageFiles.map((f) => f['url']).join('_')}',
-              ),
-              spacing: Spacing.sm,
-              runSpacing: Spacing.sm,
-              children: imageFiles.map<Widget>((file) {
-                final imageUrl = getFileUrl(file);
-                if (imageUrl == null) return const SizedBox.shrink();
+      return Container(
+        key: ValueKey('file_single_$imageUrl'),
+        child: RepaintBoundary(
+          child: EnhancedImageAttachment(
+            attachmentId: imageUrl,
+            isMarkdownFormat: true,
+            constraints: const BoxConstraints(maxWidth: 500, maxHeight: 400),
+            // Keep the opacity-only image reveal under Reduce Motion. It is
+            // functional feedback and avoids a placeholder-to-image black
+            // frame without introducing spatial movement.
+            disableAnimation: false,
+            httpHeaders: _headersForFile(imageFiles.first),
+          ),
+        ),
+      );
+    }
 
-                return RepaintBoundary(
-                  child: EnhancedImageAttachment(
-                    key: ValueKey('gen_attachment_$imageUrl'),
-                    attachmentId: imageUrl, // Pass URL directly
-                    isMarkdownFormat: true,
-                    constraints: BoxConstraints(
-                      maxWidth: imageCount == 2 ? 245 : 160,
-                      maxHeight: imageCount == 2 ? 245 : 160,
-                    ),
-                    disableAnimation:
-                        false, // Keep animations enabled to prevent black display
-                    httpHeaders: _headersForFile(file),
-                  ),
-                );
-              }).toList(),
+    return Wrap(
+      key: const ValueKey('assistant-file-image-grid'),
+      spacing: Spacing.sm,
+      runSpacing: Spacing.sm,
+      children: imageFiles.map<Widget>((file) {
+        final imageUrl = getFileUrl(file);
+        if (imageUrl == null) return const SizedBox.shrink();
+
+        return RepaintBoundary(
+          child: EnhancedImageAttachment(
+            key: ValueKey('gen_attachment_$imageUrl'),
+            attachmentId: imageUrl,
+            isMarkdownFormat: true,
+            constraints: BoxConstraints(
+              maxWidth: imageCount == 2 ? 245 : 160,
+              maxHeight: imageCount == 2 ? 245 : 160,
             ),
+            disableAnimation: false,
+            httpHeaders: _headersForFile(file),
+          ),
+        );
+      }).toList(),
     );
   }
 
@@ -1822,22 +1942,6 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
           disableAnimation: _uiTreatsAsStreaming,
         );
       }).toList(),
-    );
-  }
-
-  Widget _buildTypingIndicator() {
-    final theme = context.conduitTheme;
-    final dotColor = theme.textSecondary.withValues(alpha: 0.75);
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: Spacing.xs),
-      child: RepaintBoundary(
-        child: FiveRotatingDots(
-          size: 28,
-          color: dotColor,
-          animate: !_disableAnimations,
-        ),
-      ),
     );
   }
 
@@ -2143,30 +2247,17 @@ class _AssistantMessageWidgetState extends ConsumerState<AssistantMessageWidget>
   Widget _buildFollowUpSuggestions(List<String> suggestions) {
     final shouldShow = widget.showFollowUps && suggestions.isNotEmpty;
 
-    return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 220),
-      switchInCurve: Curves.easeOutCubic,
-      switchOutCurve: Curves.easeInCubic,
-      transitionBuilder: (child, animation) {
-        return FadeTransition(
-          opacity: CurvedAnimation(
-            parent: animation,
-            curve: Curves.easeOutCubic,
-            reverseCurve: Curves.easeInCubic,
-          ),
-          child: child,
-        );
-      },
-      child: shouldShow
-          ? KeyedSubtree(
-              key: ValueKey<String>(_followUpStateScopeId()),
-              child: FollowUpSuggestionBar(
-                suggestions: suggestions,
-                onSelected: _handleFollowUpTap,
-                isBusy: _uiTreatsAsStreaming,
-              ),
-            )
-          : const SizedBox.shrink(key: ValueKey('follow-ups-empty')),
+    if (!shouldShow) {
+      return const SizedBox.shrink(key: ValueKey('follow-ups-empty'));
+    }
+
+    return KeyedSubtree(
+      key: ValueKey<String>(_followUpStateScopeId()),
+      child: FollowUpSuggestionBar(
+        suggestions: suggestions,
+        onSelected: _handleFollowUpTap,
+        isBusy: _uiTreatsAsStreaming,
+      ),
     );
   }
 }

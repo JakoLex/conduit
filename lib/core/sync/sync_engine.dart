@@ -11,6 +11,8 @@ import '../models/conversation.dart';
 import '../persistence/persistence_providers.dart';
 import '../providers/app_providers.dart';
 import '../services/connectivity_service.dart';
+import '../services/conversation_parsing.dart';
+import '../services/worker_manager.dart';
 import '../utils/debug_logger.dart';
 import 'backoff.dart';
 import 'chat_adapter.dart';
@@ -37,15 +39,29 @@ const Duration kSyncPullDebounce = Duration(milliseconds: 300);
 
 enum SyncPhase { idle, running }
 
+enum SyncStage { chats, notes, finalizing }
+
 /// Engine status surfaced to the UI.
 class SyncStatus {
   const SyncStatus({
     this.phase = SyncPhase.idle,
+    this.stage,
+    this.completedItems = 0,
+    this.totalItems,
     this.lastSuccessUpdatedAtWatermark,
     this.lastError,
   });
 
   final SyncPhase phase;
+  final SyncStage? stage;
+  final int completedItems;
+  final int? totalItems;
+
+  double? get progress {
+    final total = totalItems;
+    if (phase != SyncPhase.running || total == null || total <= 0) return null;
+    return (completedItems / total).clamp(0.0, 1.0);
+  }
 
   /// Server epoch seconds of the last successful cycle's watermark.
   final int? lastSuccessUpdatedAtWatermark;
@@ -438,6 +454,34 @@ class SyncEngine extends _$SyncEngine {
     }
   }
 
+  /// Drains only while this engine remains bound to [expectedDatabase].
+  ///
+  /// A durable write may finish after the user switches server or auth
+  /// session. Calling the generic [drainNow] there could refresh dependencies
+  /// and drain the newly-active backend instead of the database that owns the
+  /// write. This variant snapshots the engine epoch before its first await and
+  /// refuses to cross either a database or session rebind.
+  Future<void> drainNowForDatabase(AppDatabase expectedDatabase) async {
+    if (!_refreshBoundDependencies() ||
+        _inert ||
+        !identical(_boundDb, expectedDatabase)) {
+      return;
+    }
+    final epoch = _sessionEpoch;
+    await _migrateLegacyTaskQueueIfNeeded();
+    if (!_cycleStillBound(epoch, 'database-owned-drain-after-migration') ||
+        !identical(_boundDb, expectedDatabase)) {
+      return;
+    }
+    final drainer = _ensureDrainer();
+    if (drainer == null) return;
+    try {
+      await drainer.drain();
+    } finally {
+      _clearStaleDrainerIfIdle(drainer);
+    }
+  }
+
   /// Plain outbox drain (no backoff reset). Used by the active-conversation
   /// trigger so a completion deferred because a DIFFERENT chat was foregrounded
   /// (request_completion_runner Option B) runs promptly once the user opens its
@@ -496,18 +540,30 @@ class SyncEngine extends _$SyncEngine {
     return pull.pullChat(chatId);
   }
 
-  PullSync? _buildPullSync() {
+  PullSync? _buildPullSync({SyncItemProgressCallback? onProgress}) {
     final db = _boundDb;
     final client = _boundClient;
     final chatLocks = _boundChatLocks;
     if (db == null || client == null || chatLocks == null) return null;
     final remapper = _ensureRemapper();
     if (remapper == null) return null;
+    final workerManager = ref.read(workerManagerProvider);
     return PullSync(
       client: client,
       db: db,
       locks: chatLocks,
       remapper: remapper,
+      parseOffload: (envelope) => workerManager.schedule(
+        parseFullConversationModelWorker,
+        envelope,
+        debugLabel: 'pull.assembleConversation',
+      ),
+      rowsParseOffload: (response) => workerManager.schedule(
+        parseChatRowsWorker,
+        response,
+        debugLabel: 'pull.normalizeChatRows',
+      ),
+      onProgress: onProgress,
     );
   }
 
@@ -918,6 +974,7 @@ class SyncEngine extends _$SyncEngine {
       if (ref.mounted) {
         state = SyncStatus(
           phase: SyncPhase.running,
+          stage: SyncStage.chats,
           lastSuccessUpdatedAtWatermark: state.lastSuccessUpdatedAtWatermark,
           lastError: state.lastError,
         );
@@ -975,7 +1032,14 @@ class SyncEngine extends _$SyncEngine {
   Future<PullResult?> _runOnce(int cycleEpoch) async {
     final db = _boundDb;
     final clock = _boundClock;
-    final pull = _buildPullSync();
+    final pull = _buildPullSync(
+      onProgress: (completed, total) => _publishProgress(
+        cycleEpoch,
+        stage: SyncStage.chats,
+        completed: completed,
+        total: total,
+      ),
+    );
     if (db == null ||
         clock == null ||
         pull == null ||
@@ -994,6 +1058,13 @@ class SyncEngine extends _$SyncEngine {
     final result = await pull.run();
     if (!_cycleStillBound(cycleEpoch, 'after-chat-pull')) return null;
 
+    _publishProgress(
+      cycleEpoch,
+      stage: SyncStage.notes,
+      completed: 0,
+      total: null,
+    );
+
     // Phase 5 (D-11): pull NOTES through the generic adapter driver, on the
     // SEPARATE nanosecond `notes_pull_watermark` (R-09 — never compared to the
     // chat seconds watermark; runPullFor reads the adapter's OWN key). A note
@@ -1005,7 +1076,16 @@ class SyncEngine extends _$SyncEngine {
     if (noteAdapter != null) {
       try {
         previousNotesWatermark = await db.syncMetaDao.getNotesPullWatermark();
-        noteResult = await runPullFor(noteAdapter, db: db);
+        noteResult = await runPullFor(
+          noteAdapter,
+          db: db,
+          onProgress: (completed, total) => _publishProgress(
+            cycleEpoch,
+            stage: SyncStage.notes,
+            completed: completed,
+            total: total,
+          ),
+        );
         DebugLogger.log(
           'note-cycle-done',
           scope: 'sync/notes',
@@ -1026,6 +1106,13 @@ class SyncEngine extends _$SyncEngine {
       }
       if (!_cycleStillBound(cycleEpoch, 'after-note-pull')) return null;
     }
+
+    _publishProgress(
+      cycleEpoch,
+      stage: SyncStage.finalizing,
+      completed: 0,
+      total: null,
+    );
 
     // A watermark-0 pull is itself a COMPLETE enumeration of the server set,
     // and a watermark-0 DB starts empty (fresh install / post-§9.3 cold pull),
@@ -1134,6 +1221,40 @@ class SyncEngine extends _$SyncEngine {
       await _scheduleFtsBuildIfNeeded(db, cycleEpoch);
     }
     return result;
+  }
+
+  void _publishProgress(
+    int cycleEpoch, {
+    required SyncStage stage,
+    required int completed,
+    required int? total,
+  }) {
+    if (!ref.mounted || !_running || cycleEpoch != _sessionEpoch) return;
+    final current = state;
+    if (current.phase != SyncPhase.running) return;
+
+    if (current.stage == stage &&
+        current.totalItems == total &&
+        total != null &&
+        total > 100 &&
+        completed < total &&
+        (current.completedItems * 100 ~/ total) == (completed * 100 ~/ total)) {
+      return;
+    }
+    if (current.stage == stage &&
+        current.completedItems == completed &&
+        current.totalItems == total) {
+      return;
+    }
+
+    state = SyncStatus(
+      phase: SyncPhase.running,
+      stage: stage,
+      completedItems: completed,
+      totalItems: total,
+      lastSuccessUpdatedAtWatermark: current.lastSuccessUpdatedAtWatermark,
+      lastError: current.lastError,
+    );
   }
 
   void _clearCachedDrainerIfIdle() {

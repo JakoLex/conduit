@@ -66,6 +66,7 @@ class ConduitMarkdownWidget extends ConsumerStatefulWidget {
     this.stateScopeId,
     this.enableStreamingTextFade = false,
     this.heavyBlockPolicy = MarkdownHeavyBlockPolicy.eager,
+    this.trimLastBlockBottomPadding = true,
     this.debugTreatAsWidgetTest,
     this.debugOnCompiledViewMounted,
     this.debugOnCompiledViewDisposed,
@@ -106,6 +107,10 @@ class ConduitMarkdownWidget extends ConsumerStatefulWidget {
 
   /// Controls how expensive preview-backed blocks should behave.
   final MarkdownHeavyBlockPolicy heavyBlockPolicy;
+
+  /// Whether the final rendered root block should drop trailing paragraph
+  /// spacing. Multi-part streaming renders keep spacing on non-final parts.
+  final bool trimLastBlockBottomPadding;
 
   @visibleForTesting
   final bool? debugTreatAsWidgetTest;
@@ -156,15 +161,14 @@ class _ConduitMarkdownWidgetState extends ConsumerState<ConduitMarkdownWidget> {
 
   @override
   Widget build(BuildContext context) {
-    final prepared =
-        widget.compiledDocument?.normalizedContent ?? _preparedData;
-    if (prepared.trim().isEmpty) {
+    final directDocument = widget.compiledDocument;
+    if (directDocument?.isEmpty ?? _preparedData.trim().isEmpty) {
       return const SizedBox.shrink();
     }
 
-    final document = widget.compiledDocument ?? _compiledDocument;
+    final document = directDocument ?? _compiledDocument;
     if (document == null) {
-      return MarkdownLoadingSkeleton(contentLength: prepared.length);
+      return MarkdownLoadingSkeleton(contentLength: _preparedData.length);
     }
 
     return _CompiledMarkdownView(
@@ -176,6 +180,7 @@ class _ConduitMarkdownWidgetState extends ConsumerState<ConduitMarkdownWidget> {
       stateScopeId: widget.stateScopeId,
       enableStreamingTextFade: widget.enableStreamingTextFade,
       heavyBlockPolicy: widget.heavyBlockPolicy,
+      trimLastBlockBottomPadding: widget.trimLastBlockBottomPadding,
       debugOnMounted: widget.debugOnCompiledViewMounted,
       debugOnDisposed: widget.debugOnCompiledViewDisposed,
       debugOnBaseRender: widget.debugOnBaseRender,
@@ -191,11 +196,8 @@ class _ConduitMarkdownWidgetState extends ConsumerState<ConduitMarkdownWidget> {
   void _primeDocument() {
     final directDocument = widget.compiledDocument;
     if (directDocument != null) {
-      final nextPrepared = directDocument.normalizedContent;
-      final changed =
-          nextPrepared != _preparedData || _compiledDocument != directDocument;
-      _preparedData = nextPrepared;
-      if (!changed) {
+      if (identical(_compiledDocument, directDocument) &&
+          identical(_documentController.compiledDocument, directDocument)) {
         return;
       }
       _documentController.applyDirectDocument(directDocument);
@@ -210,10 +212,7 @@ class _ConduitMarkdownWidgetState extends ConsumerState<ConduitMarkdownWidget> {
     _documentController.resolvePrepared(prepared, clearDocumentWhenAsync: true);
   }
 
-  void _applyCompiledDocumentState(
-    String compiledPreparedContent,
-    CompiledMarkdownDocument? document,
-  ) {
+  void _applyCompiledDocumentState(CompiledMarkdownDocument? document) {
     if (!mounted) {
       _compiledDocument = document;
       return;
@@ -232,6 +231,7 @@ class _CompiledMarkdownView extends StatefulWidget {
     this.stateScopeId,
     this.enableStreamingTextFade = false,
     this.heavyBlockPolicy = MarkdownHeavyBlockPolicy.eager,
+    this.trimLastBlockBottomPadding = true,
     this.debugOnMounted,
     this.debugOnDisposed,
     this.debugOnBaseRender,
@@ -245,6 +245,7 @@ class _CompiledMarkdownView extends StatefulWidget {
   final String? stateScopeId;
   final bool enableStreamingTextFade;
   final MarkdownHeavyBlockPolicy heavyBlockPolicy;
+  final bool trimLastBlockBottomPadding;
   final VoidCallback? debugOnMounted;
   final VoidCallback? debugOnDisposed;
   final VoidCallback? debugOnBaseRender;
@@ -273,6 +274,7 @@ class _CompiledMarkdownViewState extends State<_CompiledMarkdownView>
   // itself is freshly derived every build, so caching on it would never reuse;
   // these inputs only change when the theme/scaling actually changes.
   Object? _renderedThemeKey;
+  TextTheme? _renderedTextTheme;
   TextScaler? _renderedTextScaler;
   Future<void>? _renderedLatexStartupFuture;
   MarkdownRenderTier? _renderedTier;
@@ -281,6 +283,7 @@ class _CompiledMarkdownViewState extends State<_CompiledMarkdownView>
   // ends and must re-hydrate previews).
   MarkdownHeavyBlockPolicy? _renderedHeavyBlockPolicy;
   bool? _renderedEnableStreamingTextFade;
+  bool? _renderedTrimLastBlockBottomPadding;
   LinkTapCallback? _renderedOnLinkTap;
   List<ChatSourceReference>? _renderedSources;
   void Function(int sourceIndex)? _renderedOnSourceTap;
@@ -338,7 +341,7 @@ class _CompiledMarkdownViewState extends State<_CompiledMarkdownView>
       'markdown_build',
       scope: 'markdown',
       data: {
-        'length': widget.document.normalizedContent.length,
+        'length': widget.document.normalizedContentLength,
         'tier': widget.document.renderTier,
         'heavyBlocks': widget.document.heavyBlockCount,
       },
@@ -352,8 +355,22 @@ class _CompiledMarkdownViewState extends State<_CompiledMarkdownView>
     }
 
     try {
-      final style = ConduitMarkdownStyle.fromTheme(context);
-      _ensureBaseRender(style);
+      final themeKey = context.conduitTheme;
+      final textTheme = Theme.of(context).textTheme;
+      final textScaler = MediaQuery.textScalerOf(context);
+      if (!_canReuseBaseRender(
+        themeKey: themeKey,
+        textTheme: textTheme,
+        textScaler: textScaler,
+      )) {
+        final style = ConduitMarkdownStyle.fromTheme(context);
+        _rebuildBaseRender(
+          style,
+          themeKey: themeKey,
+          textTheme: textTheme,
+          textScaler: textScaler,
+        );
+      }
       return _cachedView!;
     } finally {
       PerformanceProfiler.instance.finishTask(
@@ -387,33 +404,41 @@ class _CompiledMarkdownViewState extends State<_CompiledMarkdownView>
     return widget.enableStreamingTextFade ? this : null;
   }
 
-  /// Builds (or reuses) the opacity-1 base render for the current document.
-  ///
-  /// The span tree and gesture recognizers are produced once per content change
-  /// (or when a render input such as the resolved [style] or LaTeX startup
-  /// future changes). Fade frames reuse this cache, so they never rebuild the
-  /// span tree or recreate [TapGestureRecognizer]s.
-  void _ensureBaseRender(ConduitMarkdownStyle style) {
-    final themeKey = context.conduitTheme;
-    final textScaler = MediaQuery.textScalerOf(context);
-    final reuse =
-        _cachedView != null &&
+  bool _canReuseBaseRender({
+    required Object themeKey,
+    required TextTheme textTheme,
+    required TextScaler textScaler,
+  }) {
+    return _cachedView != null &&
         identical(_renderedDocument, widget.document) &&
         identical(_renderedThemeKey, themeKey) &&
+        _renderedTextTheme == textTheme &&
         _renderedTextScaler == textScaler &&
         identical(_renderedLatexStartupFuture, _latexStartupFuture) &&
         _renderedTier == widget.document.renderTier &&
         _renderedHeavyBlockPolicy == widget.heavyBlockPolicy &&
         _renderedEnableStreamingTextFade == widget.enableStreamingTextFade &&
+        _renderedTrimLastBlockBottomPadding ==
+            widget.trimLastBlockBottomPadding &&
         identical(_renderedOnLinkTap, widget.onLinkTap) &&
         identical(_renderedSources, widget.sources) &&
         identical(_renderedOnSourceTap, widget.onSourceTap) &&
         identical(_renderedImageBuilder, widget.imageBuilder) &&
         _renderedStateScopeId == widget.stateScopeId;
-    if (reuse) {
-      return;
-    }
+  }
 
+  /// Rebuilds the opacity-1 base render after its cheap cache keys change.
+  ///
+  /// The span tree and gesture recognizers are produced once per content change
+  /// (or when a render input such as the resolved [style] or LaTeX startup
+  /// future changes). Fade frames reuse this cache, so they never rebuild the
+  /// span tree or recreate [TapGestureRecognizer]s.
+  void _rebuildBaseRender(
+    ConduitMarkdownStyle style, {
+    required Object themeKey,
+    required TextTheme textTheme,
+    required TextScaler textScaler,
+  }) {
     widget.debugOnBaseRender?.call();
 
     // Recognizer churn happens here — once per content change — not per frame.
@@ -432,27 +457,33 @@ class _CompiledMarkdownViewState extends State<_CompiledMarkdownView>
     _cachedView = switch (widget.document.renderTier) {
       MarkdownRenderTier.plainText => _buildPlainText(inlineRenderer, style),
       MarkdownRenderTier.richText => _buildRichText(inlineRenderer, style),
-      MarkdownRenderTier.blocks => BlockRenderer(
-        context,
-        style,
-        inlineRenderer,
-        _latexPreprocessor,
-        widget.onLinkTap,
-        widget.imageBuilder,
-        widget.stateScopeId,
-        null,
-        widget.heavyBlockPolicy,
-        _fadeSourceOrNull(),
-      ).renderCompiledBlocks(widget.document.blocks),
+      MarkdownRenderTier.blocks =>
+        BlockRenderer(
+          context,
+          style,
+          inlineRenderer,
+          _latexPreprocessor,
+          widget.onLinkTap,
+          widget.imageBuilder,
+          widget.stateScopeId,
+          null,
+          widget.heavyBlockPolicy,
+          _fadeSourceOrNull(),
+        ).renderCompiledBlocks(
+          widget.document.blocks,
+          trimLastBlockBottomPadding: widget.trimLastBlockBottomPadding,
+        ),
     };
 
     _renderedDocument = widget.document;
     _renderedThemeKey = themeKey;
+    _renderedTextTheme = textTheme;
     _renderedTextScaler = textScaler;
     _renderedLatexStartupFuture = _latexStartupFuture;
     _renderedTier = widget.document.renderTier;
     _renderedHeavyBlockPolicy = widget.heavyBlockPolicy;
     _renderedEnableStreamingTextFade = widget.enableStreamingTextFade;
+    _renderedTrimLastBlockBottomPadding = widget.trimLastBlockBottomPadding;
     _renderedOnLinkTap = widget.onLinkTap;
     _renderedSources = widget.sources;
     _renderedOnSourceTap = widget.onSourceTap;
@@ -463,11 +494,13 @@ class _CompiledMarkdownViewState extends State<_CompiledMarkdownView>
   void _invalidateBaseRender() {
     _renderedDocument = null;
     _renderedThemeKey = null;
+    _renderedTextTheme = null;
     _renderedTextScaler = null;
     _renderedLatexStartupFuture = null;
     _renderedTier = null;
     _renderedHeavyBlockPolicy = null;
     _renderedEnableStreamingTextFade = null;
+    _renderedTrimLastBlockBottomPadding = null;
     _renderedOnLinkTap = null;
     _renderedSources = null;
     _renderedOnSourceTap = null;

@@ -1,18 +1,44 @@
+import 'dart:async';
+
 import 'package:checks/checks.dart';
+import 'package:conduit/core/database/chat_database_repository.dart';
 import 'package:conduit/core/models/chat_message.dart';
 import 'package:conduit/core/models/conversation.dart';
+import 'package:conduit/core/models/model.dart';
 import 'package:conduit/core/models/server_config.dart';
 import 'package:conduit/core/providers/app_providers.dart';
 import 'package:conduit/core/services/api_service.dart';
 import 'package:conduit/core/services/socket_service.dart';
 import 'package:conduit/core/services/worker_manager.dart';
 import 'package:conduit/features/chat/providers/chat_providers.dart';
+import 'package:conduit/features/direct_connections/direct_connections.dart';
+import 'package:conduit/features/hermes/services/hermes_run_transport.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import '../../../support/openwebui_storage_test_overrides.dart';
 
 class _TestActiveConversationNotifier extends ActiveConversationNotifier {
   @override
   Conversation? build() => null;
+}
+
+class _FixedModels extends Models {
+  _FixedModels(this.models);
+
+  final List<Model> models;
+
+  @override
+  Future<List<Model>> build() async => models;
+}
+
+class _DeferredModels extends Models {
+  _DeferredModels(this.models);
+
+  final Future<List<Model>> models;
+
+  @override
+  Future<List<Model>> build() => models;
 }
 
 class _RecordingConversations extends Conversations {
@@ -60,6 +86,7 @@ class _FakeSocketService extends SocketService {
     String? sessionId,
     String? messageId,
     bool requireFocus = true,
+    bool keepsAliveInBackground = false,
     required SocketChatEventHandler handler,
   }) {
     void wrapped(
@@ -128,6 +155,7 @@ class _FakeApiService extends ApiService {
   List<String> taskIds = const <String>[];
 
   int getConversationCalls = 0;
+  int getTaskIdsCalls = 0;
 
   @override
   Future<Conversation> getConversation(String id) async {
@@ -136,7 +164,10 @@ class _FakeApiService extends ApiService {
   }
 
   @override
-  Future<List<String>> getTaskIdsByChat(String chatId) async => taskIds;
+  Future<List<String>> getTaskIdsByChat(String chatId) async {
+    getTaskIdsCalls++;
+    return taskIds;
+  }
 }
 
 ChatMessage _userMessage(String id, String content, DateTime timestamp) =>
@@ -166,10 +197,176 @@ Conversation _conversation(
 
 Future<void> pumpMicrotasks() => Future<void>.delayed(Duration.zero);
 
+({DirectModelRegistry registry, Model model, String wireModelId})
+_serverDirectModel() {
+  final profile = DirectConnectionProfile(
+    id: 'server-direct-profile',
+    name: 'Server direct connection',
+    adapterKey: kOpenAiCompatibleAdapterKey,
+    baseUrl: 'https://provider.example.test/v1',
+    modelIdPrefix: 'shared',
+  );
+  final registry = DirectModelRegistry();
+  final model = registry
+      .replaceProfileModels(
+        profile,
+        <DirectRemoteModel>[DirectRemoteModel(id: 'model')],
+        source: DirectModelSource.openWebUi,
+        openWebUiUrlIndex: 2,
+      )
+      .single;
+  return (registry: registry, model: model, wireModelId: 'shared.model');
+}
+
+ProviderContainer _modelRebindContainer({
+  required DirectModelRegistry registry,
+  required List<Model> models,
+}) => ProviderContainer(
+  overrides: [
+    ...openWebUiStorageOpenOverrides(),
+    activeConversationProvider.overrideWith(
+      _TestActiveConversationNotifier.new,
+    ),
+    apiServiceProvider.overrideWithValue(null),
+    socketServiceProvider.overrideWithValue(null),
+    directModelRegistryProvider.overrideWithValue(registry),
+    modelsProvider.overrideWith(() => _FixedModels(models)),
+  ],
+);
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   group('ChatMessagesNotifier remote sync', () {
+    test(
+      'a slower model lookup cannot overwrite a newer conversation',
+      () async {
+        final models = Completer<List<Model>>();
+        const priorSelection = Model(
+          id: 'previous-model',
+          name: 'Previous model',
+        );
+        const modelA = Model(id: 'model-a', name: 'Model A');
+        const modelB = Model(id: 'model-b', name: 'Model B');
+        final container = ProviderContainer(
+          overrides: [
+            ...openWebUiStorageOpenOverrides(),
+            activeConversationProvider.overrideWith(
+              _TestActiveConversationNotifier.new,
+            ),
+            apiServiceProvider.overrideWithValue(null),
+            socketServiceProvider.overrideWithValue(null),
+            modelsProvider.overrideWith(() => _DeferredModels(models.future)),
+          ],
+        );
+        addTearDown(container.dispose);
+        container.read(chatMessagesProvider);
+        container.read(selectedModelProvider.notifier).set(priorSelection);
+
+        Conversation conversation(String id, String model) =>
+            withChatStorageProvenance(
+              _conversation(
+                id,
+                const <ChatMessage>[],
+                DateTime.utc(2026, 7, 15),
+              ).copyWith(model: model),
+              ChatStorageKind.openWebUi,
+            );
+
+        container
+            .read(activeConversationProvider.notifier)
+            .set(conversation('chat-a', modelA.id));
+        await pumpMicrotasks();
+        container
+            .read(activeConversationProvider.notifier)
+            .set(conversation('chat-b', modelB.id));
+        await pumpMicrotasks();
+
+        models.complete(const <Model>[modelA, modelB]);
+        await pumpMicrotasks();
+        await pumpMicrotasks();
+
+        check(container.read(selectedModelProvider)).identicalTo(modelB);
+      },
+    );
+
+    test(
+      'cold reopen rebinds an Open WebUI wire model to its trusted direct model',
+      () async {
+        final direct = _serverDirectModel();
+        const priorSelection = Model(
+          id: 'previous-model',
+          name: 'Previous model',
+        );
+        final container = _modelRebindContainer(
+          registry: direct.registry,
+          models: <Model>[direct.model],
+        );
+        addTearDown(container.dispose);
+        container.read(chatMessagesProvider);
+        container.read(selectedModelProvider.notifier).set(priorSelection);
+
+        container
+            .read(activeConversationProvider.notifier)
+            .set(
+              withChatStorageProvenance(
+                _conversation(
+                  'server-direct-chat',
+                  const <ChatMessage>[],
+                  DateTime.utc(2026, 7, 15),
+                ).copyWith(model: direct.wireModelId),
+                ChatStorageKind.openWebUi,
+              ),
+            );
+        await pumpMicrotasks();
+        await pumpMicrotasks();
+
+        check(direct.model.id).not((it) => it.equals(direct.wireModelId));
+        check(container.read(selectedModelProvider)).identicalTo(direct.model);
+        check(
+          direct.registry.resolve(container.read(selectedModelProvider)!),
+        ).isNotNull();
+      },
+    );
+
+    test(
+      'cold reopen prefers trusted direct binding over a same-id server model',
+      () async {
+        final direct = _serverDirectModel();
+        final serverCollision = Model(
+          id: direct.wireModelId,
+          name: 'Untrusted server collision',
+        );
+        final container = _modelRebindContainer(
+          registry: direct.registry,
+          models: <Model>[serverCollision, direct.model],
+        );
+        addTearDown(container.dispose);
+        container.read(chatMessagesProvider);
+        container.read(selectedModelProvider.notifier).set(serverCollision);
+
+        container
+            .read(activeConversationProvider.notifier)
+            .set(
+              withChatStorageProvenance(
+                _conversation(
+                  'server-direct-collision-chat',
+                  const <ChatMessage>[],
+                  DateTime.utc(2026, 7, 15),
+                ).copyWith(model: direct.wireModelId),
+                ChatStorageKind.openWebUi,
+              ),
+            );
+        await pumpMicrotasks();
+        await pumpMicrotasks();
+
+        check(container.read(selectedModelProvider)).identicalTo(direct.model);
+        check(
+          container.read(selectedModelProvider),
+        ).not((it) => it.identicalTo(serverCollision));
+      },
+    );
+
     test('adopts a fetched snapshot for the same conversation ID', () async {
       final timestamp = DateTime.now();
       final initialMessages = [
@@ -183,6 +380,7 @@ void main() {
 
       final container = ProviderContainer(
         overrides: [
+          ...openWebUiStorageOpenOverrides(),
           activeConversationProvider.overrideWith(
             () => _TestActiveConversationNotifier(),
           ),
@@ -226,6 +424,7 @@ void main() {
 
         final container = ProviderContainer(
           overrides: [
+            ...openWebUiStorageOpenOverrides(),
             activeConversationProvider.overrideWith(
               () => _TestActiveConversationNotifier(),
             ),
@@ -278,6 +477,7 @@ void main() {
 
       final container = ProviderContainer(
         overrides: [
+          ...openWebUiStorageOpenOverrides(),
           activeConversationProvider.overrideWith(
             () => _TestActiveConversationNotifier(),
           ),
@@ -328,6 +528,7 @@ void main() {
 
       final container = ProviderContainer(
         overrides: [
+          ...openWebUiStorageOpenOverrides(),
           activeConversationProvider.overrideWith(
             () => _TestActiveConversationNotifier(),
           ),
@@ -406,6 +607,7 @@ void main() {
 
         final container = ProviderContainer(
           overrides: [
+            ...openWebUiStorageOpenOverrides(),
             activeConversationProvider.overrideWith(
               () => _TestActiveConversationNotifier(),
             ),
@@ -441,11 +643,13 @@ void main() {
           _userMessage('user-1', 'Hi', timestamp),
           _assistantMessage('assistant-1', 'Partial', timestamp),
         ];
-        final api = _FakeApiService(_conversation('chat-1', messages, timestamp))
-          ..taskIds = ['task-1'];
+        final api = _FakeApiService(
+          _conversation('chat-1', messages, timestamp),
+        )..taskIds = ['task-1'];
 
         final container = ProviderContainer(
           overrides: [
+            ...openWebUiStorageOpenOverrides(),
             activeConversationProvider.overrideWith(
               () => _TestActiveConversationNotifier(),
             ),
@@ -482,6 +686,7 @@ void main() {
 
       final container = ProviderContainer(
         overrides: [
+          ...openWebUiStorageOpenOverrides(),
           activeConversationProvider.overrideWith(
             () => _TestActiveConversationNotifier(),
           ),
@@ -518,6 +723,7 @@ void main() {
 
       final container = ProviderContainer(
         overrides: [
+          ...openWebUiStorageOpenOverrides(),
           activeConversationProvider.overrideWith(
             () => _TestActiveConversationNotifier(),
           ),
@@ -541,72 +747,76 @@ void main() {
       check(last.isStreaming).isTrue();
     });
 
-    test(
-      'resume poll adopts server content matched by the bound foreign '
-      'message id (socket bound a server id then died)',
-      () async {
-        final timestamp = DateTime.now();
-        final opened = [
-          _userMessage('user-1', 'Hi', timestamp),
-          _assistantMessage('assistant-local', 'Partial', timestamp),
-        ];
-        // The server persists the message under its OWN (foreign) id, not the
-        // local placeholder id.
-        final grown = [
-          _userMessage('user-1', 'Hi', timestamp),
-          _assistantMessage('server-foreign', 'Partial answer that grew', timestamp),
-        ];
-        final api = _FakeApiService(_conversation('chat-1', grown, timestamp))
-          ..taskIds = ['task-1'];
-
-        final container = ProviderContainer(
-          overrides: [
-            activeConversationProvider.overrideWith(
-              () => _TestActiveConversationNotifier(),
-            ),
-            socketServiceProvider.overrideWithValue(null),
-            apiServiceProvider.overrideWithValue(api),
-          ],
-        );
-        addTearDown(container.dispose);
-
-        // Construct the notifier (so its conversation-change listener is live)
-        // before setting the conversation, so active-on-open fires.
-        check(container.read(chatMessagesProvider)).isEmpty();
-        final notifier = container.read(chatMessagesProvider.notifier);
-        container
-            .read(activeConversationProvider.notifier)
-            .set(_conversation('chat-1', opened, timestamp));
-
-        // Active-on-open re-engages streaming and arms the monitor. The first
-        // poll cannot match yet (server id differs, no bound id), so content
-        // stays 'Partial'.
-        await pumpMicrotasks();
-        await pumpMicrotasks();
-        check(container.read(chatMessagesProvider).last.isStreaming).isTrue();
-        check(container.read(chatMessagesProvider).last.content).equals('Partial');
-
-        notifier.debugCancelRemoteTaskMonitorTimer();
-        while (notifier.debugTaskStatusCheckInFlight) {
-          await pumpMicrotasks();
-        }
-
-        // The streaming helper binds the foreign server id to the local tail.
-        notifier.recordResumeBoundRemoteMessageId(
-          'assistant-local',
+    test('resume poll adopts server content matched by the bound foreign '
+        'message id (socket bound a server id then died)', () async {
+      final timestamp = DateTime.now();
+      final opened = [
+        _userMessage('user-1', 'Hi', timestamp),
+        _assistantMessage('assistant-local', 'Partial', timestamp),
+      ];
+      // The server persists the message under its OWN (foreign) id, not the
+      // local placeholder id.
+      final grown = [
+        _userMessage('user-1', 'Hi', timestamp),
+        _assistantMessage(
           'server-foreign',
-        );
+          'Partial answer that grew',
+          timestamp,
+        ),
+      ];
+      final api = _FakeApiService(_conversation('chat-1', grown, timestamp))
+        ..taskIds = ['task-1'];
 
-        // Next poll resolves the server message by the bound foreign id and
-        // adopts its grown content (instead of leaving the chat stuck).
-        await notifier.debugSyncRemoteTaskStatus();
+      final container = ProviderContainer(
+        overrides: [
+          ...openWebUiStorageOpenOverrides(),
+          activeConversationProvider.overrideWith(
+            () => _TestActiveConversationNotifier(),
+          ),
+          socketServiceProvider.overrideWithValue(null),
+          apiServiceProvider.overrideWithValue(api),
+        ],
+      );
+      addTearDown(container.dispose);
+
+      // Construct the notifier (so its conversation-change listener is live)
+      // before setting the conversation, so active-on-open fires.
+      check(container.read(chatMessagesProvider)).isEmpty();
+      final notifier = container.read(chatMessagesProvider.notifier);
+      container
+          .read(activeConversationProvider.notifier)
+          .set(_conversation('chat-1', opened, timestamp));
+
+      // Active-on-open re-engages streaming and arms the monitor. The first
+      // poll cannot match yet (server id differs, no bound id), so content
+      // stays 'Partial'.
+      await pumpMicrotasks();
+      await pumpMicrotasks();
+      check(container.read(chatMessagesProvider).last.isStreaming).isTrue();
+      check(
+        container.read(chatMessagesProvider).last.content,
+      ).equals('Partial');
+
+      notifier.debugCancelRemoteTaskMonitorTimer();
+      while (notifier.debugTaskStatusCheckInFlight) {
         await pumpMicrotasks();
+      }
 
-        check(
-          container.read(chatMessagesProvider).last.content,
-        ).equals('Partial answer that grew');
-      },
-    );
+      // The streaming helper binds the foreign server id to the local tail.
+      notifier.recordResumeBoundRemoteMessageId(
+        'assistant-local',
+        'server-foreign',
+      );
+
+      // Next poll resolves the server message by the bound foreign id and
+      // adopts its grown content (instead of leaving the chat stuck).
+      await notifier.debugSyncRemoteTaskStatus();
+      await pumpMicrotasks();
+
+      check(
+        container.read(chatMessagesProvider).last.content,
+      ).equals('Partial answer that grew');
+    });
 
     test('temporary chats are never probed for active tasks', () async {
       final timestamp = DateTime.now();
@@ -614,11 +824,13 @@ void main() {
         _userMessage('user-1', 'Hi', timestamp),
         _assistantMessage('assistant-1', 'Partial', timestamp),
       ];
-      final api = _FakeApiService(_conversation('local:tmp', messages, timestamp))
-        ..taskIds = ['task-1'];
+      final api = _FakeApiService(
+        _conversation('local:tmp', messages, timestamp),
+      )..taskIds = ['task-1'];
 
       final container = ProviderContainer(
         overrides: [
+          ...openWebUiStorageOpenOverrides(),
           activeConversationProvider.overrideWith(
             () => _TestActiveConversationNotifier(),
           ),
@@ -640,6 +852,155 @@ void main() {
       // is skipped, so the message stays settled.
       check(container.read(chatMessagesProvider).last.isStreaming).isFalse();
     });
+
+    test('Hermes tails never start OpenWebUI task recovery, including in an '
+        'OpenWebUI-backed chat', () async {
+      final timestamp = DateTime.now();
+      final api = _FakeApiService(
+        _conversation('unused', const <ChatMessage>[], timestamp),
+      );
+      final container = ProviderContainer(
+        overrides: [
+          ...openWebUiStorageOpenOverrides(),
+          activeConversationProvider.overrideWith(
+            () => _TestActiveConversationNotifier(),
+          ),
+          socketServiceProvider.overrideWithValue(null),
+          apiServiceProvider.overrideWithValue(api),
+        ],
+      );
+      addTearDown(container.dispose);
+
+      final notifier = container.read(chatMessagesProvider.notifier);
+      final active = container.read(activeConversationProvider.notifier);
+      final nativeHermesTail = ChatMessage(
+        id: 'native-hermes-assistant',
+        role: 'assistant',
+        content: 'Working',
+        timestamp: timestamp,
+        isStreaming: true,
+        metadata: const <String, dynamic>{'transport': kHermesTransport},
+      );
+      active.set(
+        Conversation(
+          id: 'native-hermes-chat',
+          title: 'Native Hermes',
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          messages: <ChatMessage>[nativeHermesTail],
+          metadata: const <String, dynamic>{'backend': 'hermes'},
+        ),
+      );
+      await pumpMicrotasks();
+      await pumpMicrotasks();
+
+      check(notifier.debugHasOpenWebUiTaskRecoverableTail).isFalse();
+      await notifier.debugSyncRemoteTaskStatus();
+      check(api.getTaskIdsCalls).equals(0);
+
+      final mixedHermesTail = nativeHermesTail.copyWith(
+        id: 'mixed-hermes-assistant',
+      );
+      active.set(
+        withChatStorageProvenance(
+          Conversation(
+            id: 'openwebui-chat-with-hermes-turn',
+            title: 'Mixed transport',
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            messages: <ChatMessage>[mixedHermesTail],
+          ),
+          ChatStorageKind.openWebUi,
+        ),
+      );
+      await pumpMicrotasks();
+      await pumpMicrotasks();
+
+      check(notifier.debugHasOpenWebUiTaskRecoverableTail).isFalse();
+      await notifier.debugSyncRemoteTaskStatus();
+      check(api.getTaskIdsCalls).equals(0);
+
+      final completedMixedHermesTail = mixedHermesTail.copyWith(
+        isStreaming: false,
+      );
+      active.set(
+        withChatStorageProvenance(
+          Conversation(
+            id: 'openwebui-chat-with-completed-hermes-turn',
+            title: 'Completed mixed transport',
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            messages: <ChatMessage>[completedMixedHermesTail],
+          ),
+          ChatStorageKind.openWebUi,
+        ),
+      );
+      await pumpMicrotasks();
+      await pumpMicrotasks();
+
+      // Active-on-open must not reinterpret a completed Hermes turn as an
+      // OpenWebUI task placeholder merely because its chat is stored there.
+      check(container.read(chatMessagesProvider).single.isStreaming).isFalse();
+      check(api.getTaskIdsCalls).equals(0);
+    });
+
+    test(
+      'a genuine OpenWebUI streaming tail still starts task recovery',
+      () async {
+        final timestamp = DateTime.now();
+        final assistant = ChatMessage(
+          id: 'openwebui-assistant',
+          role: 'assistant',
+          content: 'Working',
+          timestamp: timestamp,
+          isStreaming: true,
+          metadata: const <String, dynamic>{'transport': 'taskSocket'},
+        );
+        final api = _FakeApiService(
+          _conversation('openwebui-chat', <ChatMessage>[assistant], timestamp),
+        );
+        final container = ProviderContainer(
+          overrides: [
+            ...openWebUiStorageOpenOverrides(),
+            activeConversationProvider.overrideWith(
+              () => _TestActiveConversationNotifier(),
+            ),
+            socketServiceProvider.overrideWithValue(null),
+            apiServiceProvider.overrideWithValue(api),
+          ],
+        );
+        addTearDown(container.dispose);
+
+        final notifier = container.read(chatMessagesProvider.notifier);
+        container
+            .read(activeConversationProvider.notifier)
+            .set(
+              withChatStorageProvenance(
+                _conversation('openwebui-chat', <ChatMessage>[
+                  assistant,
+                ], timestamp).copyWith(
+                  // A previous direct turn may leave this transport hint on
+                  // the conversation. Explicit OpenWebUI storage still owns
+                  // passive/task sync; the tail message selects the transport.
+                  metadata: const <String, dynamic>{'backend': 'direct'},
+                ),
+                ChatStorageKind.openWebUi,
+              ),
+            );
+        await pumpMicrotasks();
+        await pumpMicrotasks();
+        notifier.debugCancelRemoteTaskMonitorTimer();
+        while (notifier.debugTaskStatusCheckInFlight) {
+          await pumpMicrotasks();
+        }
+
+        check(notifier.debugHasOpenWebUiTaskRecoverableTail).isTrue();
+        check(api.getTaskIdsCalls).isGreaterThan(0);
+        api.getTaskIdsCalls = 0;
+        await notifier.debugSyncRemoteTaskStatus();
+        check(api.getTaskIdsCalls).equals(1);
+      },
+    );
 
     test(
       'tasksDone poll defers force-adoption while a socket resume stream '
@@ -669,6 +1030,7 @@ void main() {
 
         final container = ProviderContainer(
           overrides: [
+            ...openWebUiStorageOpenOverrides(),
             activeConversationProvider.overrideWith(
               () => _TestActiveConversationNotifier(),
             ),
@@ -737,8 +1099,9 @@ void main() {
         // getConversation force-adopt + the settled, adopted message.
         await notifier.debugSyncRemoteTaskStatus();
         check(api.getConversationCalls).equals(1);
-        check(container.read(chatMessagesProvider).last.content)
-            .equals('Final answer');
+        check(
+          container.read(chatMessagesProvider).last.content,
+        ).equals('Final answer');
         check(container.read(chatMessagesProvider).last.isStreaming).isFalse();
       },
     );
@@ -756,6 +1119,7 @@ void main() {
 
       final container = ProviderContainer(
         overrides: [
+          ...openWebUiStorageOpenOverrides(),
           activeConversationProvider.overrideWith(
             () => _TestActiveConversationNotifier(),
           ),
@@ -791,6 +1155,7 @@ void main() {
 
         final container = ProviderContainer(
           overrides: [
+            ...openWebUiStorageOpenOverrides(),
             activeConversationProvider.overrideWith(
               () => _TestActiveConversationNotifier(),
             ),
