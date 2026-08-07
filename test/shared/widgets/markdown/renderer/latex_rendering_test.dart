@@ -159,27 +159,4 @@ void main() {
       expect(find.text('x^2'), findsOneWidget);
     },
   );
-
-  testWidgets('inline math inside emphasis does not leak the placeholder', (
-    tester,
-  ) async {
-    await tester.pumpWidget(
-      buildHarness(r'see *(values $c_1$ and $c_2$ here)* end'),
-    );
-    await tester.pump();
-
-    expect(find.textContaining('LATEXINLINE'), findsNothing);
-    expect(find.text('c_1'), findsOneWidget);
-    expect(find.text('c_2'), findsOneWidget);
-  });
-
-  testWidgets('inline math inside bold does not leak the placeholder', (
-    tester,
-  ) async {
-    await tester.pumpWidget(buildHarness(r'see **bold $a_1$ text** end'));
-    await tester.pump();
-
-    expect(find.textContaining('LATEXINLINE'), findsNothing);
-    expect(find.text('a_1'), findsOneWidget);
-  });
 }

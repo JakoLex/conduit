@@ -7,6 +7,25 @@ import XCTest
 
 class RunnerTests: XCTestCase {
 
+  func testNativeModelSelectorKeepsCurrentSelectionWithPinnedModels() {
+    XCTAssertEqual(
+      nativeModelSelectorFeaturedIds(
+        pinnedModelIds: ["pinned-model"],
+        configuredFeaturedModelIds: ["fallback-model"],
+        selectedModelId: "selected-model"
+      ),
+      ["pinned-model", "selected-model"]
+    )
+    XCTAssertEqual(
+      nativeModelSelectorFeaturedIds(
+        pinnedModelIds: ["selected-model"],
+        configuredFeaturedModelIds: ["fallback-model"],
+        selectedModelId: "selected-model"
+      ),
+      ["selected-model"]
+    )
+  }
+
   func testHermesFlutterAssetCanBeLoadedAsAnImage() {
     let image = loadFlutterAssetImage("assets/icons/hermes_agent.png")
     XCTAssertNotNil(image)
@@ -151,6 +170,36 @@ class RunnerTests: XCTestCase {
     XCTAssertFalse(nativeSheetRedirectStaysWithinOrigin(
       originalURL: original,
       redirectURL: try XCTUnwrap(URL(string: "http://example.test/final"))
+    ))
+
+    let googleFavicon = try XCTUnwrap(
+      URL(string: "https://www.google.com/s2/favicons?domain=example.test")
+    )
+    XCTAssertTrue(nativeSheetRedirectStaysWithinOrigin(
+      originalURL: googleFavicon,
+      redirectURL: try XCTUnwrap(
+        URL(string: "https://t3.gstatic.com/faviconV2?client=SOCIAL")
+      )
+    ))
+    XCTAssertFalse(nativeSheetRedirectStaysWithinOrigin(
+      originalURL: googleFavicon,
+      redirectURL: try XCTUnwrap(
+        URL(string: "https://t3.gstatic.com/unrelated")
+      )
+    ))
+    XCTAssertFalse(nativeSheetRedirectStaysWithinOrigin(
+      originalURL: googleFavicon,
+      redirectURL: try XCTUnwrap(
+        URL(string: "https://images.gstatic.com/faviconV2")
+      )
+    ))
+    XCTAssertFalse(nativeSheetRedirectStaysWithinOrigin(
+      originalURL: try XCTUnwrap(
+        URL(string: "https://www.google.com/unrelated")
+      ),
+      redirectURL: try XCTUnwrap(
+        URL(string: "https://t3.gstatic.com/faviconV2")
+      )
     ))
   }
 
@@ -483,6 +532,119 @@ class RunnerTests: XCTestCase {
 
     XCTAssertEqual(actual, expected)
     XCTAssertNotNil(coordinatedURL)
+  }
+
+  func testNativePasteDefaultStoreMatchesDartTemporaryRoot() throws {
+    let cacheRoot = try XCTUnwrap(
+      FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+    )
+    XCTAssertEqual(
+      NativePasteDeliveryStore().rootURL,
+      cacheRoot.appendingPathComponent(
+        NativePasteDeliveryStore.stagingDirectoryName,
+        isDirectory: true
+      ).standardizedFileURL
+    )
+  }
+
+  func testNativePasteRejectsMalformedAdvertisedPngData() {
+    XCTAssertNil(nativePasteValidatedImageTypeIdentifier(
+      for: Data([0x89, 0x50, 0x4e, 0x47]),
+      advertisedIdentifier: "public.png"
+    ))
+  }
+
+  func testNativePasteTrustsDetectedTypeOverAdvertisedType() {
+    let pngData = UIGraphicsImageRenderer(
+      size: CGSize(width: 1, height: 1)
+    ).pngData { context in
+      context.cgContext.setFillColor(UIColor.red.cgColor)
+      context.cgContext.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+    }
+
+    XCTAssertEqual(
+      nativePasteValidatedImageTypeIdentifier(
+        for: pngData,
+        advertisedIdentifier: "public.jpeg"
+      ),
+      "public.png"
+    )
+  }
+
+  func testNativePasteStagesDataRepresentationBeforeFileFallback() {
+    let expectedData = Data([0x89, 0x50, 0x4e, 0x47])
+    let stagedURL = URL(fileURLWithPath: "/tmp/native-paste-data.png")
+    var loadOrder: [String] = []
+    var stagedData: Data?
+    var result: (URL?, Int64)?
+    let representations = NativePasteProviderRepresentations(
+      loadData: { completion in
+        loadOrder.append("data")
+        completion(expectedData, nil)
+      },
+      loadFile: { completion in
+        loadOrder.append("file")
+        completion(nil, nil)
+      },
+      loadInPlaceFile: { completion in
+        loadOrder.append("in-place")
+        completion(nil, false, nil)
+      }
+    )
+    let stager = NativePasteProviderStager(
+      stageData: { data in
+        stagedData = data
+        return (stagedURL, Int64(data.count))
+      },
+      stageFile: { _ in nil },
+      stageInPlaceFile: { _ in nil }
+    )
+
+    stager.stage(representations: representations, maxBytes: 1024) {
+      result = ($0, $1)
+    }
+
+    XCTAssertEqual(loadOrder, ["data"])
+    XCTAssertEqual(stagedData, expectedData)
+    XCTAssertEqual(result?.0, stagedURL)
+    XCTAssertEqual(result?.1, Int64(expectedData.count))
+  }
+
+  func testNativePasteFallsBackToFileWhenDataIsUnavailable() {
+    let sourceURL = URL(fileURLWithPath: "/tmp/native-paste-source.png")
+    let stagedURL = URL(fileURLWithPath: "/tmp/native-paste-staged.png")
+    var loadOrder: [String] = []
+    var result: (URL?, Int64)?
+    let representations = NativePasteProviderRepresentations(
+      loadData: { completion in
+        loadOrder.append("data")
+        completion(nil, CocoaError(.fileReadUnknown))
+      },
+      loadFile: { completion in
+        loadOrder.append("file")
+        completion(sourceURL, nil)
+      },
+      loadInPlaceFile: { completion in
+        loadOrder.append("in-place")
+        completion(nil, false, nil)
+      }
+    )
+    let stager = NativePasteProviderStager(
+      stageData: { _ in nil },
+      stageFile: { url in
+        XCTAssertEqual(url, sourceURL)
+        return (stagedURL, 4)
+      },
+      stageInPlaceFile: { _ in nil }
+    )
+
+    stager.stage(representations: representations, maxBytes: 1024) {
+      result = ($0, $1)
+    }
+
+    XCTAssertEqual(loadOrder, ["data", "file"])
+    XCTAssertEqual(result?.0, stagedURL)
+    XCTAssertEqual(result?.1, 4)
   }
 
   func testNativePasteCreatesPendingMarkerBeforeAnyStagedItem() throws {

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:ui' show Tristate;
 
+import 'package:adaptive_platform_ui/adaptive_platform_ui.dart';
 import 'package:checks/checks.dart';
 import 'package:conduit/core/database/chat_database_repository.dart';
 import 'package:conduit/core/database/database_provider.dart';
@@ -59,6 +60,47 @@ Finder _sidebarBottomNavTabLabel(String label) =>
     find.descendant(of: find.byType(NavigationBar), matching: find.text(label));
 
 void main() {
+  testWidgets('native glass profile avatar stays compact and Flutter-owned', (
+    tester,
+  ) async {
+    var presses = 0;
+    const profileButtonKey = ValueKey<String>('sidebar-profile-button');
+
+    await tester.pumpWidget(
+      CupertinoApp(
+        home: Center(
+          child: buildSidebarProfileButton(
+            supportsNativeGlass: true,
+            onPressed: () => presses++,
+            fallbackStyle: AdaptiveButtonStyle.glass,
+            child: const SizedBox.square(dimension: 36),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.byType(CupertinoButton), findsOneWidget);
+    expect(find.byType(AdaptiveButton), findsNothing);
+    expect(tester.getSize(find.byKey(profileButtonKey)), const Size(44, 44));
+    await tester.tap(find.byKey(profileButtonKey));
+    expect(presses, 1);
+
+    await tester.pumpWidget(
+      CupertinoApp(
+        home: Center(
+          child: buildSidebarProfileButton(
+            supportsNativeGlass: false,
+            onPressed: () {},
+            fallbackStyle: AdaptiveButtonStyle.plain,
+            child: const SizedBox.square(dimension: 36),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.byType(AdaptiveButton), findsOneWidget);
+  });
+
   test('Hermes profile host fallback comes from localizations', () {
     check(
       AppLocalizationsEn().hermesSelfHostedAgentLabel,
@@ -538,6 +580,113 @@ void main() {
     check(controllers.chatRefreshCalls).equals(1);
     pendingRefresh.complete();
     await tester.pumpAndSettle();
+  });
+
+  testWidgets(
+    'chat pull-to-refresh reserves a gutter above conversation rows',
+    (tester) async {
+      final controllers = _SidebarHarnessControllers();
+      final pendingRefresh = controllers.keepChatRefreshPending();
+      final timestamp = DateTime(2026, 1, 1);
+      final conversation = Conversation(
+        id: 'refresh-layout-chat',
+        title: 'Refresh layout',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      );
+
+      await tester.pumpWidget(
+        _buildSidebarHarness(
+          controllers: controllers,
+          conversations: [conversation],
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final tile = find.byKey(
+        ValueKey<String>('drawer-chat-${conversationScopedId(conversation)}'),
+      );
+      final refreshSlot = find.byKey(
+        const ValueKey<String>('chats-refresh-slot'),
+      );
+      final idleSlotHeight = tester.getSize(refreshSlot).height;
+      final refreshControl = tester.widget<RefreshIndicator>(
+        find.descendant(
+          of: _layerRootFinder(_SidebarTabLayer.chats),
+          matching: find.byType(RefreshIndicator),
+        ),
+      );
+      check(refreshControl.onStatusChange).isNotNull();
+      refreshControl.onStatusChange!(RefreshIndicatorStatus.refresh);
+      final refreshing = refreshControl.onRefresh();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200));
+
+      check(controllers.chatRefreshCalls).equals(1);
+      final progress = find.byKey(
+        const ValueKey<String>('chats-refresh-progress'),
+      );
+      check(progress.evaluate()).length.equals(1);
+      expect(
+        find.descendant(
+          of: progress,
+          matching: find.byType(CircularProgressIndicator),
+        ),
+        findsOneWidget,
+      );
+      check(
+        tester.getBottomLeft(progress).dy <= tester.getTopLeft(tile).dy,
+      ).isTrue();
+      check(tester.getSize(refreshSlot).height > idleSlotHeight).isTrue();
+
+      pendingRefresh.complete();
+      await refreshing;
+      refreshControl.onStatusChange!(RefreshIndicatorStatus.done);
+      await tester.pump(const Duration(milliseconds: 500));
+      await tester.pumpAndSettle();
+      check(progress.evaluate()).isEmpty();
+      check(tester.getSize(refreshSlot).height).equals(idleSlotHeight);
+    },
+  );
+
+  testWidgets('chat pull-to-refresh uses Cupertino progress on iOS', (
+    tester,
+  ) async {
+    final controllers = _SidebarHarnessControllers();
+    final timestamp = DateTime(2026, 1, 1);
+
+    await tester.pumpWidget(
+      _buildSidebarHarness(
+        controllers: controllers,
+        conversations: [
+          Conversation(
+            id: 'cupertino-refresh-chat',
+            title: 'Cupertino refresh',
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          ),
+        ],
+        theme: ThemeData(platform: TargetPlatform.iOS),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final refreshControl = tester.widget<RefreshIndicator>(
+      find.byType(RefreshIndicator),
+    );
+    refreshControl.onStatusChange!(RefreshIndicatorStatus.refresh);
+    await tester.pump();
+
+    final progress = find.byKey(
+      const ValueKey<String>('chats-refresh-progress'),
+    );
+    expect(
+      find.descendant(
+        of: progress,
+        matching: find.byType(CupertinoActivityIndicator),
+      ),
+      findsOneWidget,
+    );
   });
 
   testWidgets('collapsed paginated chat sections do not consume hidden pages', (

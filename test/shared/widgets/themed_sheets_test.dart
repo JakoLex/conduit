@@ -10,8 +10,396 @@ import 'package:checks/checks.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:stupid_simple_sheet/stupid_simple_sheet.dart';
 
 void main() {
+  test(
+    'native SF Symbols keep compact optical sizes inside scaled controls',
+    () {
+      check(kConduitNativeSidebarSymbolExtent).equals(20);
+      check(kConduitNativeToolbarSymbolExtent).equals(22);
+      check(kConduitNativeGroupedToolbarSymbolExtent).equals(22);
+      check(kConduitNativeVisibilitySymbolExtent).equals(18);
+      check(kConduitNativeUtilitySymbolExtent).equals(17);
+      check(kConduitNativePrimarySymbolExtent).equals(17);
+      check(kConduitNativeModelChevronExtent).equals(13);
+      check(
+        kConduitNativeUtilitySymbolExtent,
+      ).isLessThan(kConduitNativeToolbarSymbolExtent);
+      check(kConduitNativeUtilitySymbolExtent).isLessThan(IconSize.large);
+      check(
+        kConduitNativePrimarySymbolExtent,
+      ).equals(kConduitNativeUtilitySymbolExtent);
+    },
+  );
+
+  test('toolbar icons preserve their SF Symbol lookup values', () {
+    check(
+      conduitToolbarSfSymbolForIcon(CupertinoIcons.line_horizontal_3),
+    ).equals('line.3.horizontal');
+    check(
+      conduitToolbarSfSymbolForIcon(Icons.menu),
+    ).equals('line.3.horizontal');
+    check(
+      conduitToolbarSfSymbolForIcon(CupertinoIcons.chevron_back),
+    ).equals('chevron.left');
+    check(
+      conduitToolbarSfSymbolForIcon(CupertinoIcons.create),
+    ).equals('square.and.pencil');
+    check(
+      conduitToolbarSfSymbolForIcon(CupertinoIcons.eye_slash),
+    ).equals('eye.slash');
+    check(
+      conduitToolbarSfSymbolForIcon(Icons.people_outline),
+    ).equals('person.2');
+    check(
+      conduitToolbarSfSymbolForIcon(Icons.circle, iosSymbol: 'ellipsis'),
+    ).equals('ellipsis');
+    check(conduitToolbarSfSymbolForIcon(Icons.delete)).isNull();
+  });
+
+  test('toolbar symbols use optical sizes across shared app bars', () {
+    check(conduitNativeToolbarSymbolExtentFor('line.3.horizontal')).equals(20);
+    check(conduitNativeToolbarSymbolExtentFor('chevron.left')).equals(20);
+    check(conduitNativeToolbarSymbolExtentFor('eye')).equals(18);
+    check(conduitNativeToolbarSymbolExtentFor('eye.slash')).equals(18);
+    check(conduitNativeToolbarSymbolExtentFor('square.and.pencil')).equals(22);
+    check(conduitNativeToolbarSymbolExtentFor('person.2')).equals(22);
+    check(conduitNativeToolbarSymbolExtentFor(null)).equals(22);
+  });
+
+  test('native model-selector labels remain on one line within their cap', () {
+    const maxWidth = 198.0;
+    final shortWidth = resolveConduitNativeModelSelectorWidth(
+      label: 'Inkling',
+      isLoading: false,
+      showChevron: true,
+      // Widget tests use the wide Ahem test font rather than UIKit's SF Pro.
+      // Leave enough room here to exercise the untruncated branch itself.
+      maxWidth: 400,
+      textDirection: TextDirection.ltr,
+    );
+    final shortLabel = resolveConduitNativeModelSelectorLabel(
+      label: 'Inkling',
+      isLoading: false,
+      showChevron: true,
+      availableWidth: shortWidth,
+      textDirection: TextDirection.ltr,
+    );
+    final longLabel = resolveConduitNativeModelSelectorLabel(
+      label: 'google/gemma-4-31b-it',
+      isLoading: false,
+      showChevron: true,
+      availableWidth: maxWidth,
+      textDirection: TextDirection.ltr,
+    );
+
+    check(shortLabel).equals('Inkling');
+    expect(shortWidth, lessThan(400));
+    check(longLabel).contains('…');
+    check(longLabel.contains('\n')).isFalse();
+    check(longLabel.length).isLessThan('google/gemma-4-31b-it'.length);
+    check(
+      conduitNativeModelSelectorSymbol(showChevron: true),
+    ).equals('chevron.down');
+    check(conduitNativeModelSelectorSymbol(showChevron: false)).isNull();
+  });
+
+  test('native model-selector identity follows its foreground color', () {
+    final lightKey = conduitNativeModelSelectorViewKey(Colors.black);
+    final darkKey = conduitNativeModelSelectorViewKey(Colors.white);
+    final largeTextKey = conduitNativeModelSelectorViewKey(
+      Colors.black,
+      titleFontSize: 34,
+    );
+
+    check(lightKey == darkKey).isFalse();
+    check(lightKey == largeTextKey).isFalse();
+    check(lightKey).equals(conduitNativeModelSelectorViewKey(Colors.black));
+  });
+
+  test('native model-selector parameters preserve the full label', () {
+    final label = '${List.filled(5000, 'a').join()}-model-tail';
+    final bounded = boundConduitNativeModelLabel(label);
+    final params = encodeConduitNativeModelSelectorParams(
+      label: label,
+      symbolName: 'chevron.down',
+      foregroundColor: Colors.black,
+      titleFontSize: 17,
+      enabled: true,
+    );
+
+    check(params['label']).equals(label);
+    check(params['label'] == bounded).isFalse();
+  });
+
+  test('native model-selector title follows Dynamic Type', () {
+    check(
+      resolveConduitNativeModelTitleFontSize(TextScaler.noScaling),
+    ).equals(17);
+    check(
+      resolveConduitNativeModelTitleFontSize(const TextScaler.linear(2)),
+    ).equals(34);
+  });
+
+  test('native model-selector semantics expose only valid activation', () {
+    var activations = 0;
+    void activate() => activations += 1;
+
+    final enabled = conduitNativeModelSelectorActivation(
+      isLoading: false,
+      showChevron: true,
+      onPressed: activate,
+    );
+    enabled!();
+
+    check(activations).equals(1);
+    check(
+      conduitNativeModelSelectorActivation(
+        isLoading: true,
+        showChevron: true,
+        onPressed: activate,
+      ),
+    ).isNull();
+    check(
+      conduitNativeModelSelectorActivation(
+        isLoading: false,
+        showChevron: false,
+        onPressed: activate,
+      ),
+    ).isNull();
+  });
+
+  test('native model-selector bounds untrusted labels before layout', () {
+    final oversized = '${List.filled(5000, 'a').join()}-model-tail';
+    final bounded = boundConduitNativeModelLabel(oversized);
+
+    check(bounded.length).isLessOrEqual(kConduitNativeModelLabelMaxCodeUnits);
+    check(bounded).startsWith('aaa');
+    check(bounded).contains('…');
+    check(bounded).endsWith('-model-tail');
+  });
+
+  testWidgets('model-selector semantics preserve the full label', (
+    tester,
+  ) async {
+    final label = '${List.filled(5000, 'a').join()}-model-tail';
+    final bounded = boundConduitNativeModelLabel(label);
+    final semantics = tester.ensureSemantics();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ConduitAdaptiveAppBarModelSelector(
+            label: label,
+            maxWidth: 198,
+            onPressed: () {},
+          ),
+        ),
+      ),
+    );
+
+    expect(find.bySemanticsLabel(label), findsOneWidget);
+    expect(find.bySemanticsLabel(bounded), findsNothing);
+    semantics.dispose();
+  });
+
+  test('native model-selector omits chevron width when hidden', () {
+    final withChevron = resolveConduitNativeModelSelectorWidth(
+      label: 'Inkling',
+      isLoading: false,
+      showChevron: true,
+      maxWidth: 400,
+      textDirection: TextDirection.ltr,
+    );
+    final withoutChevron = resolveConduitNativeModelSelectorWidth(
+      label: 'Inkling',
+      isLoading: false,
+      showChevron: false,
+      maxWidth: 400,
+      textDirection: TextDirection.ltr,
+    );
+
+    check(withoutChevron).isLessThan(withChevron);
+    check(
+      resolveConduitNativeModelSelectorLabel(
+        label: 'Inkling',
+        isLoading: false,
+        showChevron: false,
+        availableWidth: withoutChevron,
+        textDirection: TextDirection.ltr,
+      ),
+    ).equals('Inkling');
+  });
+
+  testWidgets('adaptive sheets use the iOS 26 glass route on iOS', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: AppTheme.light(
+          TweakcnThemes.t3Chat,
+        ).copyWith(platform: TargetPlatform.iOS),
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: TextButton(
+              onPressed: () => ThemedSheets.showAdaptive<void>(
+                context: context,
+                builder: (_) => const ConduitAdaptiveSheetSurface(
+                  child: Text('Adaptive content'),
+                ),
+              ),
+              child: const Text('Open'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Open'));
+    await tester.pumpAndSettle();
+
+    final route = ModalRoute.of(tester.element(find.text('Adaptive content')));
+    expect(route, isA<StupidSimpleGlassSheetRoute<void>>());
+    final glassRoute = route! as StupidSimpleGlassSheetRoute<void>;
+    final shape = glassRoute.shape as RoundedSuperellipseBorder;
+    final context = tester.element(find.text('Adaptive content'));
+    expect(shape.side.color, context.conduitTheme.dividerColor);
+    expect(shape.side.width, BorderWidth.regular);
+  });
+
+  testWidgets('adaptive sheets use the plain package route off iOS', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: AppTheme.light(
+          TweakcnThemes.t3Chat,
+        ).copyWith(platform: TargetPlatform.android),
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: TextButton(
+              onPressed: () => ThemedSheets.showAdaptive<void>(
+                context: context,
+                builder: (_) => const ConduitAdaptiveSheetSurface(
+                  child: Text('Adaptive content'),
+                ),
+              ),
+              child: const Text('Open'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Open'));
+    await tester.pumpAndSettle();
+
+    final route = ModalRoute.of(tester.element(find.text('Adaptive content')));
+    expect(route, isA<StupidSimpleSheetRoute<void>>());
+    expect(find.byType(SheetBackground), findsOneWidget);
+    final contentContext = tester.element(find.text('Adaptive content'));
+    expect(
+      DefaultTextStyle.of(contentContext).style.decoration,
+      TextDecoration.none,
+      reason: 'The package popup route must not leak WidgetsApp debug text.',
+    );
+  });
+
+  for (final entry in <TargetPlatform, double>{
+    TargetPlatform.iOS: 36,
+    TargetPlatform.android: 24,
+  }.entries) {
+    testWidgets(
+      'reduced-motion adaptive sheets keep the ${entry.key.name} shape',
+      (tester) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: AppTheme.light(
+              TweakcnThemes.t3Chat,
+            ).copyWith(platform: entry.key),
+            home: Builder(
+              builder: (context) => MediaQuery(
+                data: MediaQuery.of(context).copyWith(disableAnimations: true),
+                child: Builder(
+                  builder: (reducedMotionContext) => Scaffold(
+                    body: TextButton(
+                      onPressed: () => ThemedSheets.showAdaptive<void>(
+                        context: reducedMotionContext,
+                        builder: (_) => const ConduitAdaptiveSheetSurface(
+                          child: Text('Reduced-motion content'),
+                        ),
+                      ),
+                      child: const Text('Open'),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+
+        await tester.tap(find.text('Open'));
+        await tester.pumpAndSettle();
+
+        final bottomSheet = tester.widget<BottomSheet>(
+          find.byType(BottomSheet),
+        );
+        final shape = bottomSheet.shape! as RoundedSuperellipseBorder;
+        expect(
+          shape.borderRadius.resolve(TextDirection.ltr).topLeft.x,
+          entry.value,
+        );
+        final dismissBarrier = tester
+            .widgetList<ModalBarrier>(find.byType(ModalBarrier))
+            .firstWhere((barrier) => barrier.dismissible);
+        expect(dismissBarrier.semanticsLabel, 'Dismiss');
+      },
+    );
+  }
+
+  testWidgets('adaptive surfaces can defer the bottom safe area to the route', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(402, 874);
+    tester.view.padding = const FakeViewPadding(bottom: 34);
+    tester.view.viewPadding = const FakeViewPadding(bottom: 34);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetPadding);
+    addTearDown(tester.view.resetViewPadding);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: AppTheme.light(TweakcnThemes.t3Chat),
+        home: const Scaffold(
+          body: ConduitAdaptiveSheetSurface(
+            bottomSafeArea: false,
+            padding: EdgeInsets.zero,
+            child: Align(
+              alignment: Alignment.bottomCenter,
+              child: SizedBox(
+                key: ValueKey<String>('bottom-aligned-action'),
+                width: 120,
+                height: TouchTarget.comfortable,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(
+      tester
+          .getBottomLeft(
+            find.byKey(const ValueKey<String>('bottom-aligned-action')),
+          )
+          .dy,
+      874,
+    );
+  });
+
   testWidgets('all themed sheets use the shared edge-to-edge rounded route', (
     tester,
   ) async {
@@ -211,10 +599,19 @@ void main() {
       find.descendant(of: header, matching: find.byType(Divider)),
       findsOneWidget,
     );
-    expect(
-      find.descendant(of: header, matching: find.byType(AdaptiveButton)),
-      findsOneWidget,
-    );
+    if (conduitSupportsNativeGlass()) {
+      expect(
+        find.descendant(of: header, matching: find.byType(AdaptiveButton)),
+        findsOneWidget,
+      );
+    } else {
+      final closeButton = find.descendant(
+        of: header,
+        matching: find.byType(IconButton),
+      );
+      expect(closeButton, findsOneWidget);
+      expect(tester.getSize(closeButton), const Size.square(36));
+    }
   });
 
   testWidgets('root sheets remove native toolbar chrome beneath their edges', (

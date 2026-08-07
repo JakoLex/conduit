@@ -4,11 +4,12 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/models/chat_message.dart';
 import '../../../core/services/platform_service.dart';
 import '../../../core/services/settings_service.dart';
+import '../providers/streaming_haptic_memory.dart';
 import '../providers/queued_completion_provider.dart';
 import '../views/chat_turn_render_state.dart';
 import '../../../shared/theme/theme_extensions.dart';
 import '../../../shared/widgets/markdown/renderer/markdown_style.dart';
-import 'five_rotating_dots.dart';
+import 'conduit_streaming_orbit.dart';
 
 class StreamingTurnFooter extends ConsumerStatefulWidget {
   const StreamingTurnFooter({
@@ -47,6 +48,11 @@ class _StreamingTurnFooterState extends ConsumerState<StreamingTurnFooter> {
 
   void _syncRunningHaptic(bool shouldShow) {
     if (!shouldShow) {
+      if (_didTriggerRunningHaptic) {
+        ref
+            .read(streamingHapticMemoryProvider)
+            .rearmRunningIndicator(widget.message.id);
+      }
       _didTriggerRunningHaptic = false;
       return;
     }
@@ -54,6 +60,12 @@ class _StreamingTurnFooterState extends ConsumerState<StreamingTurnFooter> {
       return;
     }
     _didTriggerRunningHaptic = true;
+    final shouldTrigger = ref
+        .read(streamingHapticMemoryProvider)
+        .markFired(widget.message.id, StreamingHapticEvent.runningIndicator);
+    if (!shouldTrigger) {
+      return;
+    }
     _streamingHaptic();
   }
 
@@ -113,7 +125,7 @@ class _StreamingTurnFooterState extends ConsumerState<StreamingTurnFooter> {
                       bottom: Spacing.xs,
                     ),
                     child: RepaintBoundary(
-                      child: FiveRotatingDots(
+                      child: ConduitStreamingOrbit(
                         size: 28,
                         color: context.conduitTheme.textSecondary.withValues(
                           alpha: 0.75,

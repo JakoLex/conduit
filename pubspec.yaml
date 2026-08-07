@@ -1,6 +1,6 @@
 name: conduit
 description: Open-source mobile client for Open-WebUI
-version: 3.4.3+136
+version: 4.0.3+140
 publish_to: 'none'
 
 environment:
@@ -39,7 +39,7 @@ dependencies:
   pdfrx: ^2.4.7
   archive: ^4.0.9
   xml: ^7.0.1
-  flutter_inappwebview: ^6.1.5
+  flutter_inappwebview: ^6.2.0-beta.3
   flutter_svg: ^2.3.0
   # Native Mermaid renderer. These unpublished workspace packages are pinned
   # as submodules under third_party/.
@@ -54,6 +54,7 @@ dependencies:
   
   # Modern Animations
   flutter_animate: ^4.5.0
+  stupid_simple_sheet: ^0.9.1+1
   
   # Platform Features
   vad: ^0.0.8
@@ -102,12 +103,6 @@ dependencies:
   jovial_svg: ^1.1.29
   highlight: ^0.7.0
   geolocator: ^14.0.2
-  # Fork provides zero-lag StickTarget.bottom anchoring used by chat timelines.
-  # The fork publishes no tags, so pin its latest verified commit exactly.
-  super_sliver_list:
-    git:
-      url: https://github.com/Telosnex/super_sliver_list.git
-      ref: fe038453b41305baf032b29bbdf3aa64f62b2c09
   drift: ^2.34.2
   drift_flutter: ^0.3.1
   fleather: ^1.27.0
@@ -153,11 +148,11 @@ flutter:
   assets:
     - THIRD_PARTY_NOTICES.md
     - assets/icons/
+    - assets/release_notes/
     - assets/chartjs.min.js
     - assets/flutter_tex.js
     - assets/flutter_tex.css
     - assets/vad/
-    - assets/pyodide/
 
   fonts:
     - family: Geist Sans

@@ -1,19 +1,229 @@
+import 'dart:io';
+
 import 'package:conduit/core/models/model.dart';
 import 'package:conduit/core/models/server_config.dart';
 import 'package:conduit/core/providers/app_providers.dart';
 import 'package:conduit/core/services/api_service.dart';
+import 'package:conduit/core/services/settings_service.dart';
 import 'package:conduit/core/services/worker_manager.dart';
 import 'package:conduit/features/chat/providers/chat_providers.dart';
+import 'package:conduit/features/chat/services/voice_input_service.dart';
 import 'package:conduit/features/chat/widgets/composer_overflow_menu.dart';
 import 'package:conduit/features/chat/widgets/modern_chat_input.dart';
 import 'package:conduit/features/direct_connections/direct_connections.dart';
 import 'package:conduit/l10n/app_localizations.dart';
+import 'package:conduit/shared/theme/theme_extensions.dart';
+import 'package:conduit/shared/widgets/adaptive_toolbar_components.dart';
 import 'package:conduit/shared/widgets/themed_sheets.dart';
+import 'package:adaptive_platform_ui/adaptive_platform_ui.dart';
+import 'package:checks/checks.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('native composer glass uses non-animated cursor opacity', () {
+    check(
+      composerCursorOpacityAnimates(usesNativePlatformView: true),
+    ).equals(false);
+    check(
+      composerCursorOpacityAnimates(usesNativePlatformView: false),
+    ).equals(true);
+  });
+
+  test('iOS composer uses the native system menu whenever supported', () {
+    check(
+      composerUsesNativeSystemSelectionMenu(
+        isIOS: true,
+        systemMenuSupported: true,
+      ),
+    ).isTrue();
+    check(
+      composerUsesNativeSystemSelectionMenu(
+        isIOS: true,
+        systemMenuSupported: false,
+      ),
+    ).isFalse();
+    check(
+      composerUsesNativeSystemSelectionMenu(
+        isIOS: false,
+        systemMenuSupported: true,
+      ),
+    ).isFalse();
+  });
+
+  test(
+    'native composer edit items remain stable across selection rebuilds',
+    () {
+      const defaults = <IOSSystemContextMenuItem>[
+        IOSSystemContextMenuItemCopy(),
+        IOSSystemContextMenuItemSelectAll(),
+      ];
+
+      final first = buildComposerSystemContextMenuItems(
+        defaultItems: defaults,
+        ensurePaste: true,
+      );
+      final second = buildComposerSystemContextMenuItems(
+        defaultItems: defaults,
+        ensurePaste: true,
+      );
+
+      expect(first, orderedEquals(second));
+      expect(first.whereType<IOSSystemContextMenuItemCustom>(), isEmpty);
+      expect(first[0], isA<IOSSystemContextMenuItemCopy>());
+      expect(first[1], isA<IOSSystemContextMenuItemPaste>());
+      expect(first[2], isA<IOSSystemContextMenuItemSelectAll>());
+    },
+  );
+
+  test('native toolbar action groups preserve action and menu order', () {
+    final actions = [
+      ConduitNativeToolbarAction(
+        iosSymbol: 'square.and.pencil',
+        accessibilityLabel: 'New Chat',
+        symbolSize: kConduitNativeVisibilitySymbolExtent,
+        onPressed: () {},
+      ),
+      ConduitNativeToolbarAction(
+        iosSymbol: 'ellipsis',
+        accessibilityLabel: 'More',
+        menuItems: [
+          ConduitNativeToolbarMenuItem(
+            label: 'Rename',
+            iosSymbol: 'pencil',
+            onSelected: () {},
+          ),
+          ConduitNativeToolbarMenuItem(
+            label: 'Delete',
+            iosSymbol: 'trash',
+            isDestructive: true,
+            onSelected: () {},
+          ),
+        ],
+      ),
+    ];
+    final creationParams = encodeConduitNativeToolbarActionGroupParams(actions);
+    final params = creationParams['actions']! as List<Map<String, Object?>>;
+
+    check(creationParams['symbolSize']).equals(22.0);
+    check(params.length).equals(2);
+    check(params[0]['iosSymbol']).equals('square.and.pencil');
+    check(params[0]['symbolSize']).equals(18.0);
+    check(params[1]['iosSymbol']).equals('ellipsis');
+    final menuItems = params[1]['menuItems']! as List<Map<String, Object?>>;
+    check(
+      menuItems.map((item) => item['label']),
+    ).deepEquals(['Rename', 'Delete']);
+    check(menuItems[1]['isDestructive']).equals(true);
+  });
+
+  test('native toolbar action groups support one optical-sized menu', () {
+    final params = encodeConduitNativeToolbarActionGroupParams([
+      ConduitNativeToolbarAction(
+        iosSymbol: 'ellipsis',
+        accessibilityLabel: 'More',
+        symbolSize: kConduitNativeToolbarSymbolExtent,
+        menuItems: [
+          ConduitNativeToolbarMenuItem(
+            label: 'Delete',
+            isDestructive: true,
+            onSelected: () {},
+          ),
+        ],
+      ),
+    ]);
+    final actions = params['actions']! as List<Map<String, Object?>>;
+
+    check(actions).length.equals(1);
+    check(actions.single['iosSymbol']).equals('ellipsis');
+    check(actions.single['symbolSize']).equals(22.0);
+  });
+
+  test('native toolbar menu adapters preserve values, order, and state', () {
+    String? selected;
+    final action = buildConduitNativeToolbarMenuAction<String>(
+      iosSymbol: 'ellipsis',
+      accessibilityLabel: 'More',
+      tintColor: Colors.black,
+      symbolSize: kConduitNativeToolbarSymbolExtent,
+      items: const [
+        AdaptivePopupMenuItem<String>(
+          value: 'edit',
+          label: 'Edit',
+          icon: 'pencil',
+        ),
+        AdaptivePopupMenuItem<String>(
+          value: 'delete',
+          label: 'Delete',
+          icon: 'trash',
+          enabled: false,
+          isDestructive: true,
+        ),
+      ],
+      onSelected: (value) => selected = value,
+    );
+
+    check(action).isNotNull();
+    check(
+      action!.menuItems.map((item) => item.label),
+    ).deepEquals(['Edit', 'Delete']);
+    check(action.menuItems[1].enabled).isFalse();
+    check(action.menuItems[1].isDestructive).isTrue();
+    action.menuItems[0].onSelected();
+    check(selected).equals('edit');
+  });
+
+  test('native toolbar groups accept three shared actions', () {
+    final actions = List.generate(
+      3,
+      (index) => ConduitNativeToolbarAction(
+        iosSymbol: 'circle',
+        accessibilityLabel: 'Action $index',
+        onPressed: () {},
+      ),
+    );
+
+    check(
+      ConduitNativeToolbarActionGroup(actions: actions).actions,
+    ).length.equals(3);
+  });
+
+  test('composer measurement style matches recording typography', () {
+    final recordingStyle = ModernChatInput.debugComposerInputTextStyle(
+      isRecording: true,
+    );
+    final idleStyle = ModernChatInput.debugComposerInputTextStyle(
+      isRecording: false,
+    );
+
+    check(recordingStyle.fontWeight).equals(FontWeight.w500);
+    check(recordingStyle.fontStyle).equals(FontStyle.italic);
+    check(idleStyle.fontWeight).equals(FontWeight.w400);
+    check(idleStyle.fontStyle).equals(FontStyle.normal);
+  });
+
+  test('only Android enlarges the compact overflow add glyph', () {
+    check(
+      ModernChatInput.debugOverflowIconSize(
+        isAndroid: true,
+        attachmentPanelVisible: false,
+      ),
+    ).equals(28);
+    check(
+      ModernChatInput.debugOverflowIconSize(
+        isAndroid: false,
+        attachmentPanelVisible: false,
+      ),
+    ).equals(IconSize.large);
+    check(
+      ModernChatInput.debugOverflowIconSize(
+        isAndroid: true,
+        attachmentPanelVisible: true,
+      ),
+    ).equals(IconSize.large);
+  });
+
   test('OpenWebUI explicit attachment capability denials fail closed', () {
     final model = Model.fromJson({
       'id': 'text-only',
@@ -71,6 +281,29 @@ void main() {
     expect(extensions, isNot(contains('png')));
     expect(extensions, isNot(contains('heic')));
     expect(extensions, isNot(contains('pdf')));
+  });
+
+  test('OpenRouter direct file picking exposes bounded PDF inputs', () {
+    final registry = DirectModelRegistry();
+    final directModel = registry.replaceProfileModels(
+      DirectConnectionProfile(
+        id: 'openrouter',
+        name: 'OpenRouter',
+        adapterKey: kOpenAiCompatibleAdapterKey,
+        baseUrl: kOpenRouterApiBaseUrl,
+      ),
+      [DirectRemoteModel(id: 'anthropic/claude-sonnet-4')],
+    ).single;
+
+    final extensions = localFilePickerExtensionsForModel(directModel)!;
+
+    expect(extensions, contains('pdf'));
+    expect(directModel.capabilities?['web_search'], isTrue);
+    expect(
+      directModel.capabilities?['image_generation'],
+      isTrue,
+      reason: 'The OpenRouter Image API works with text-only parent models.',
+    );
   });
 
   test('attachment panel matches the full IME footprint', () {
@@ -691,6 +924,410 @@ void main() {
     await tester.pumpAndSettle();
     expect(ThemedSheets.hasActiveSheet, isFalse);
   });
+
+  testWidgets('focus stays compact until the composer becomes multiline', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [apiServiceProvider.overrideWithValue(null)],
+        child: MaterialApp(
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(body: ModernChatInput(onSendMessage: (_) {})),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    const compactShellKey = ValueKey('compact-composer-shell');
+    const expandedShellKey = ValueKey('expanded-composer-shell');
+    const expandedInputKey = ValueKey('composer-expanded-input');
+    const expandedButtonsKey = ValueKey('composer-expanded-buttons');
+    const quickPillsKey = ValueKey('composer-quick-pills');
+
+    expect(find.byKey(compactShellKey), findsOneWidget);
+    expect(find.byKey(expandedShellKey), findsNothing);
+
+    await tester.tap(find.byType(TextField));
+    await tester.pump();
+    await tester.pump();
+
+    final composerField = tester.widget<TextField>(find.byType(TextField));
+    expect(composerField.focusNode?.hasFocus, isTrue);
+    expect(find.byKey(compactShellKey), findsOneWidget);
+    expect(find.byKey(expandedShellKey), findsNothing);
+
+    await tester.enterText(find.byType(TextField), 'first line\nsecond line');
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.byKey(compactShellKey), findsNothing);
+    expect(find.byKey(expandedShellKey), findsOneWidget);
+    expect(find.byKey(expandedInputKey), findsOneWidget);
+    expect(find.byKey(expandedButtonsKey), findsOneWidget);
+    expect(find.byKey(quickPillsKey), findsNothing);
+
+    final inputInsets = tester
+        .widget<Padding>(find.byKey(expandedInputKey))
+        .padding
+        .resolve(TextDirection.ltr);
+    final actionInsets = tester
+        .widget<Padding>(find.byKey(expandedButtonsKey))
+        .padding
+        .resolve(TextDirection.ltr);
+    expect(inputInsets.left, 8);
+    expect(inputInsets.right, 8);
+    expect(actionInsets.left, 8);
+    expect(actionInsets.right, 8);
+
+    await tester.enterText(find.byType(TextField), 'single line');
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.byKey(compactShellKey), findsOneWidget);
+    expect(find.byKey(expandedShellKey), findsNothing);
+    expect(
+      tester.widget<TextField>(find.byType(TextField)).focusNode?.hasFocus,
+      isTrue,
+    );
+  });
+
+  testWidgets('a visually wrapped second line expands the composer', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(320, 800);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    addTearDown(tester.view.resetPhysicalSize);
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [apiServiceProvider.overrideWithValue(null)],
+        child: MaterialApp(
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(body: ModernChatInput(onSendMessage: (_) {})),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    const wrappedText = 'A focused message wraps onto line two';
+    expect(wrappedText.length, lessThan(51));
+
+    final editable = tester.widget<EditableText>(find.byType(EditableText));
+    final editableContext = tester.element(find.byType(EditableText));
+    final textPainter = TextPainter(
+      text: TextSpan(text: wrappedText, style: editable.style),
+      textDirection: Directionality.of(editableContext),
+      textScaler: MediaQuery.textScalerOf(editableContext),
+      maxLines: 2,
+    );
+    try {
+      textPainter.layout(
+        maxWidth: tester.getSize(find.byType(EditableText)).width,
+      );
+      expect(textPainter.computeLineMetrics().length, 2);
+    } finally {
+      textPainter.dispose();
+    }
+
+    await tester.tap(find.byType(TextField));
+    await tester.enterText(find.byType(TextField), wrappedText);
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey('compact-composer-shell')), findsNothing);
+    expect(
+      find.byKey(const ValueKey('expanded-composer-shell')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('unchanged draft reflows when the composer width changes', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(1000, 800);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    addTearDown(tester.view.resetPhysicalSize);
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [apiServiceProvider.overrideWithValue(null)],
+        child: MaterialApp(
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(body: ModernChatInput(onSendMessage: (_) {})),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    const compactShellKey = ValueKey('compact-composer-shell');
+    const expandedShellKey = ValueKey('expanded-composer-shell');
+    const wrappedText = 'A focused message wraps onto line two';
+
+    await tester.enterText(find.byType(TextField), wrappedText);
+    await tester.pump();
+    await tester.pump();
+    expect(find.byKey(compactShellKey), findsOneWidget);
+    expect(find.byKey(expandedShellKey), findsNothing);
+
+    tester.view.physicalSize = const Size(320, 800);
+    await tester.pump();
+    await tester.pump();
+    expect(find.byKey(compactShellKey), findsNothing);
+    expect(find.byKey(expandedShellKey), findsOneWidget);
+
+    tester.view.physicalSize = const Size(1000, 800);
+    await tester.pump();
+    await tester.pump();
+    expect(find.byKey(compactShellKey), findsOneWidget);
+    expect(find.byKey(expandedShellKey), findsNothing);
+  });
+
+  testWidgets('compact composer uses symmetric horizontal insets', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [apiServiceProvider.overrideWithValue(null)],
+        child: MaterialApp(
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(
+            body: ModernChatInput(
+              onSendMessage: (_) {},
+              onFileAttachment: _noop,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final compactInsets = tester
+        .widget<Container>(
+          find.byKey(const ValueKey('compact-composer-content')),
+        )
+        .padding!
+        .resolve(TextDirection.ltr);
+
+    expect(compactInsets.left, 8);
+    expect(compactInsets.right, 8);
+
+    final compactShell = find.byKey(const ValueKey('compact-composer-shell'));
+    final overflowButton = find.byKey(
+      const ValueKey('composer-overflow-button'),
+    );
+    expect(
+      find.descendant(of: compactShell, matching: overflowButton),
+      findsOneWidget,
+    );
+
+    final shellRect = tester.getRect(compactShell);
+    final viewWidth =
+        tester.view.physicalSize.width / tester.view.devicePixelRatio;
+    expect(shellRect.left, 16);
+    expect(viewWidth - shellRect.right, 16);
+
+    final overflowCenter = tester.getCenter(find.byIcon(Icons.add));
+    final primaryCenter = tester.getCenter(
+      find.byKey(const ValueKey('primary-btn-send-muted')),
+    );
+    expect(
+      overflowCenter.dx - shellRect.left,
+      closeTo(shellRect.right - primaryCenter.dx, 0.01),
+    );
+
+    await tester.enterText(find.byType(TextField), 'Hi');
+    await tester.pump();
+
+    final fieldRect = tester.getRect(find.byType(TextField));
+    final overflowRect = tester.getRect(overflowButton);
+    final activePrimaryRect = tester.getRect(
+      find.byKey(const ValueKey('primary-btn-send')),
+    );
+    expect(fieldRect.left - overflowRect.right, Spacing.xs);
+    expect(activePrimaryRect.left - fieldRect.right, Spacing.xs);
+  });
+
+  testWidgets('secondary composer actions use plain icon buttons', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          apiServiceProvider.overrideWithValue(null),
+          notesFeatureEnabledProvider.overrideWith(
+            _EnabledNotesFeatureNotifier.new,
+          ),
+        ],
+        child: MaterialApp(
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(
+            body: ModernChatInput(
+              onSendMessage: (_) {},
+              onFileAttachment: _noop,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    AdaptiveButton actionButton(Finder ancestor) => tester.widget(
+      find.descendant(of: ancestor, matching: find.byType(AdaptiveButton)),
+    );
+
+    expect(
+      actionButton(
+        find.byKey(const ValueKey('composer-overflow-button')),
+      ).style,
+      AdaptiveButtonStyle.plain,
+    );
+
+    await tester.tap(find.byType(TextField));
+    await tester.enterText(find.byType(TextField), 'Draft\nnote');
+    await tester.pump();
+    await tester.pump();
+
+    expect(
+      tester
+          .widget<AdaptiveButton>(
+            find.byKey(const ValueKey('create-draft-note-button')),
+          )
+          .style,
+      AdaptiveButtonStyle.plain,
+    );
+  });
+
+  testWidgets('non-Android add icon matches the standard mic glyph', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          apiServiceProvider.overrideWithValue(null),
+          voiceInputAvailableProvider.overrideWith((_) async => true),
+        ],
+        child: MaterialApp(
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(
+            body: ModernChatInput(
+              onSendMessage: (_) {},
+              onFileAttachment: _noop,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final addIcon = tester.widget<Icon>(find.byIcon(Icons.add));
+    final micIcon = tester.widget<Icon>(find.byIcon(Icons.mic));
+    final expectedAddIconSize = Platform.isAndroid ? 28 : IconSize.large;
+    expect(addIcon.size, expectedAddIconSize);
+    expect(micIcon.size, IconSize.large);
+
+    final addButton = find.byKey(
+      const ValueKey<String>('composer-overflow-button'),
+    );
+    final micButton = find.byKey(
+      const ValueKey<String>('composer-dictation-start'),
+    );
+    expect(tester.getSize(addButton), tester.getSize(micButton));
+  });
+
+  testWidgets('overflow close control keeps its compact size when expanded', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [apiServiceProvider.overrideWithValue(null)],
+        child: MaterialApp(
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(
+            body: ModernChatInput(
+              onSendMessage: (_) {},
+              onFileAttachment: _noop,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final overflowButton = find.byKey(
+      const ValueKey<String>('composer-overflow-button'),
+    );
+    final addControlSize = tester.getSize(overflowButton);
+
+    await tester.tap(find.byIcon(Icons.add));
+    await tester.pumpAndSettle();
+
+    final compactCloseControlSize = tester.getSize(overflowButton);
+    final compactCloseGlyphSize = tester
+        .widget<Icon>(find.byIcon(Icons.close))
+        .size;
+    expect(compactCloseControlSize, addControlSize);
+
+    await tester.enterText(find.byType(TextField), 'first line\nsecond line');
+    await tester.pump();
+    await tester.pump();
+
+    expect(
+      find.byKey(const ValueKey('expanded-composer-shell')),
+      findsOneWidget,
+    );
+    expect(tester.getSize(overflowButton), compactCloseControlSize);
+    expect(
+      tester.widget<Icon>(find.byIcon(Icons.close)).size,
+      compactCloseGlyphSize,
+    );
+  });
+
+  testWidgets('explicit quick-pill selection keeps pill composer visible', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          apiServiceProvider.overrideWithValue(null),
+          appSettingsProvider.overrideWith(_QuickPillAppSettingsNotifier.new),
+          webSearchAvailableProvider.overrideWithValue(true),
+        ],
+        child: MaterialApp(
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(body: ModernChatInput(onSendMessage: (_) {})),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(
+      find.byKey(const ValueKey('expanded-composer-shell')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('composer-quick-pills')), findsOneWidget);
+    expect(find.text('Web'), findsOneWidget);
+  });
+}
+
+final class _QuickPillAppSettingsNotifier extends AppSettingsNotifier {
+  @override
+  AppSettings build() => const AppSettings(quickPills: ['web']);
+}
+
+final class _EnabledNotesFeatureNotifier extends NotesFeatureEnabledNotifier {
+  @override
+  bool build() => true;
 }
 
 final class _FixedDiscoveryController extends DirectModelDiscoveryController {

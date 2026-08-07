@@ -74,6 +74,8 @@ typedef _ModelAuthReadiness = ({
 /// sign-out wipe.
 void _resetProvidersAfterFullAppDataClear(Ref ref) {
   ref.read(activeConversationProvider.notifier).set(null);
+  ref.invalidate(directLocalDatabaseProvider);
+  ref.invalidate(conversationsProvider);
 
   ref.invalidate(appSettingsProvider);
   ref.invalidate(appThemeModeProvider);
@@ -136,12 +138,11 @@ final class SignOutCoordinator {
   }
 
   Future<void> _signOut({required bool keepServerDetails}) async {
-    final directProfiles = _ref.read(
-      directConnectionProfilesProvider.notifier,
-    );
+    final directProfiles = _ref.read(directConnectionProfilesProvider.notifier);
     final hermesConfig = _ref.read(hermesConfigProvider.notifier);
     final directRuns = _ref.read(directRunRegistryProvider);
     FullAppDataClearOutcome? outcome;
+    var directLocalPurgeCompleted = false;
 
     void resumeGlobalAdmission() {
       directRuns.resumeAdmissionAfterAppDataClearAbort();
@@ -182,9 +183,14 @@ final class SignOutCoordinator {
             beforeClear: prepareForClear,
           );
       switch (outcome) {
-        case FullAppDataClearOutcome.cleared:
-          PreferencesStore.resumeWritesAfterAppDataClear();
-          SecureCredentialStorage.resumeDirectIdentityWritesAfterAppDataClear();
+        case FullAppDataClearOutcome.cleared ||
+            FullAppDataClearOutcome.localDataClearedSessionCleanupIncomplete:
+          // The auth transaction has committed and did not yield to a newer
+          // session. Only now is it safe to destructively remove the
+          // app-global direct-local database; beforeClear is a reversible
+          // admission barrier and may still lose auth ownership.
+          await _ref.read(directLocalDatabasePurgeProvider)();
+          directLocalPurgeCompleted = true;
           _resetProvidersAfterFullAppDataClear(_ref);
         case FullAppDataClearOutcome.incomplete:
           await Future.wait<void>([
@@ -193,16 +199,22 @@ final class SignOutCoordinator {
           ]);
           directProfiles.revokeRuntimeAfterIncompleteAppDataClear();
           hermesConfig.revokeRuntimeAfterIncompleteAppDataClear();
-          PreferencesStore.resumeWritesAfterAppDataClear();
-          SecureCredentialStorage.resumeDirectIdentityWritesAfterAppDataClear();
         case FullAppDataClearOutcome.ownershipYielded:
           resumeGlobalAdmission();
           directProfiles.resumeMutationsAfterAppDataClearAbort();
           hermesConfig.resumeMutationsAfterAppDataClearAbort();
       }
     } finally {
-      PreferencesStore.resumeWritesAfterAppDataClear();
-      SecureCredentialStorage.resumeDirectIdentityWritesAfterAppDataClear();
+      final committedClearStillNeedsDirectPurge =
+          (outcome == FullAppDataClearOutcome.cleared ||
+              outcome ==
+                  FullAppDataClearOutcome
+                      .localDataClearedSessionCleanupIncomplete) &&
+          !directLocalPurgeCompleted;
+      if (!committedClearStillNeedsDirectPurge) {
+        PreferencesStore.resumeWritesAfterAppDataClear();
+        SecureCredentialStorage.resumeDirectIdentityWritesAfterAppDataClear();
+      }
       if (outcome == null) {
         resumeGlobalAdmission();
         directProfiles.resumeMutationsAfterAppDataClearAbort();
@@ -2448,7 +2460,8 @@ class SelectedModel extends _$SelectedModel {
           switch (preferredBackend) {
             PreferredBackend.direct =>
               isLocallyMintedDirectModel(current) &&
-                  ref.read(directModelRegistryProvider).resolve(current) != null,
+                  ref.read(directModelRegistryProvider).resolve(current) !=
+                      null,
             PreferredBackend.hermes =>
               isHermesModel(current) && ref.read(hermesConfigProvider).isUsable,
             _ => false,
@@ -3425,9 +3438,9 @@ class Conversations extends _$Conversations {
     return cancellation;
   }
 
-  /// Refreshing is a pull request; the database stream delivers the result.
-  /// Folders are part of every pull cycle, so [includeFolders] needs no extra
-  /// work.
+  /// Refreshing pulls changed rows and reconciles remote deletions; the
+  /// database stream delivers the result. Folders are part of every pull
+  /// cycle, so [includeFolders] needs no extra work.
   Future<void> refresh({
     bool includeFolders = false,
     bool forceFresh = false,
@@ -3439,9 +3452,12 @@ class Conversations extends _$Conversations {
     // optional Open WebUI side when it is available.
     if (ref.read(appDatabaseProvider) != null &&
         ref.read(isAuthenticatedProvider2)) {
-      await ref
-          .read(syncEngineProvider.notifier)
-          .requestPull(reason: 'refresh');
+      final syncEngine = ref.read(syncEngineProvider.notifier);
+      await syncEngine.requestPull(reason: 'refresh');
+      // A normal pull uses the 24-hour background deletion throttle. A user
+      // initiated refresh must also run the unthrottled reconcile so chats
+      // deleted from another Open WebUI client disappear immediately.
+      await syncEngine.reconcileNow();
     }
     folderConversationRefresh.bumpIfMounted();
   }
@@ -3669,6 +3685,77 @@ class Conversations extends _$Conversations {
     Conversation Function(Conversation conversation) transform,
   ) {
     updateConversation(id, transform);
+  }
+
+  /// Applies Open WebUI's `chat:title` event without changing `updatedAt`.
+  ///
+  /// Title generation updates the server row and blob but does not advance the
+  /// server watermark. Persist the event directly so a title cannot remain
+  /// stale merely because the row is outside the loaded page.
+  void applyServerGeneratedTitle(String serverId, String title) {
+    final normalizedTitle = title.trim();
+    final identity = ChatStorageIdentity.parse(serverId);
+    final rawId = identity.rawId;
+    if (rawId.isEmpty ||
+        normalizedTitle.isEmpty ||
+        identity.storage == ChatStorageKind.directLocal ||
+        isTemporaryChat(rawId)) {
+      return;
+    }
+
+    final db = ref.read(appDatabaseProvider);
+    if (db == null) {
+      _applyGeneratedTitleToLoadedState(rawId, normalizedTitle);
+      return;
+    }
+    final locks = ref.read(chatLocksProvider);
+    unawaited(
+      locks
+          .runExclusive(
+            rawId,
+            () =>
+                db.chatsDao.updateServerGeneratedTitle(rawId, normalizedTitle),
+          )
+          .then<void>((persistedTitle) {
+            if (persistedTitle != null) {
+              _applyGeneratedTitleToLoadedState(rawId, persistedTitle);
+            }
+          })
+          .catchError((Object error, StackTrace stackTrace) {
+            DebugLogger.error(
+              'generated-title-write-failed',
+              scope: 'conversations',
+              error: error,
+              stackTrace: stackTrace,
+              data: {'id': rawId},
+            );
+          }),
+    );
+  }
+
+  void _applyGeneratedTitleToLoadedState(String rawId, String title) {
+    final scopedId = ChatStorageIdentity(
+      rawId: rawId,
+      storage: ChatStorageKind.openWebUi,
+    ).scopedId;
+    final current = state.asData?.value;
+    final index = current == null
+        ? -1
+        : _conversationIndexForSelection(current, scopedId);
+    if (current != null && index >= 0 && current[index].title != title) {
+      final updated = <Conversation>[...current];
+      updated[index] = current[index].copyWith(title: title);
+      state = AsyncData<List<Conversation>>(
+        List<Conversation>.unmodifiable(updated),
+      );
+    }
+
+    final active = ref.read(activeConversationProvider);
+    if (active != null && conversationMatchesScopedId(active, scopedId)) {
+      ref
+          .read(activeConversationProvider.notifier)
+          .set(active.copyWith(title: title));
+    }
   }
 
   /// Rows are id-keyed in the database; the summary "trust" machinery is
@@ -5924,6 +6011,16 @@ bool _modelSupportsFeature(Model? model, String featureKey) {
 }
 
 final imageGenerationAvailableProvider = Provider<bool>((ref) {
+  final selectedModel = ref.watch(selectedModelProvider);
+  final directBinding = selectedModel == null
+      ? null
+      : ref.watch(directModelRegistryProvider).resolve(selectedModel);
+  if (selectedModel != null && hasReservedDirectIdentity(selectedModel)) {
+    return directBinding?.source == DirectModelSource.device &&
+        selectedModel.capabilities?['openrouter'] == true &&
+        selectedModel.capabilities?['image_generation'] == true;
+  }
+
   final perms = ref.watch(userPermissionsProvider);
   return perms.maybeWhen(
     data: (data) {
@@ -5950,11 +6047,16 @@ final webSearchAvailableProvider = Provider<bool>((ref) {
       : ref.watch(directModelRegistryProvider).resolve(selectedModel);
   if (selectedModel != null && hasReservedDirectIdentity(selectedModel)) {
     // Device-owned direct models must never fall through to OpenWebUI
-    // permissions. Ollama Cloud is currently the only direct transport with
-    // a native, permission-aware web-search execution path.
-    return directBinding?.source == DirectModelSource.device &&
+    // permissions. Only locally minted provider capabilities can enable a
+    // Conduit-managed search path.
+    final isTrustedOllamaCloud =
         directBinding?.adapterKey == kOllamaAdapterKey &&
-        selectedModel.capabilities?['ollama_cloud'] == true &&
+        selectedModel.capabilities?['ollama_cloud'] == true;
+    final isTrustedOpenRouter =
+        directBinding?.adapterKey == kOpenAiCompatibleAdapterKey &&
+        selectedModel.capabilities?['openrouter'] == true;
+    return directBinding?.source == DirectModelSource.device &&
+        (isTrustedOllamaCloud || isTrustedOpenRouter) &&
         selectedModel.capabilities?['web_search'] == true;
   }
 
@@ -5978,27 +6080,6 @@ final webSearchAvailableProvider = Provider<bool>((ref) {
       user: user,
       permissions: data,
       featureKey: 'web_search',
-    ),
-    // Permissions unavailable (loading, error, older server) — assume available.
-    orElse: () => true,
-  );
-});
-
-final codeInterpreterAvailableProvider = Provider<bool>((ref) {
-  final selectedModel = ref.watch(selectedModelProvider);
-  if (!_modelSupportsFeature(selectedModel, 'code_interpreter')) {
-    return false;
-  }
-
-  final user = ref
-      .watch(currentUserProvider)
-      .maybeWhen(data: (value) => value, orElse: () => null);
-  final perms = ref.watch(userPermissionsProvider);
-  return perms.maybeWhen(
-    data: (data) => _userCanUseFeature(
-      user: user,
-      permissions: data,
-      featureKey: 'code_interpreter',
     ),
     // Permissions unavailable (loading, error, older server) — assume available.
     orElse: () => true,
@@ -6950,13 +7031,13 @@ class ActiveChatIds extends _$ActiveChatIds {
   }
 }
 
-/// Keeps [activeChatIdsProvider] correct beyond the locally-streaming chat.
+/// Keeps global chat task state and generated titles synchronized.
 ///
 /// OpenWebUI's sidebar both bulk-fetches active chats on load and listens for
 /// `chat:active` events for any chat. This provider mirrors that: it
 /// bulk-fetches on cold open + socket reconnect (`setAll`) and registers a
-/// GLOBAL `chat:active` handler so generations started by other sessions/
-/// devices also light up the sidebar spinner.
+/// GLOBAL chat handler so generations started by other sessions/devices light
+/// up the sidebar spinner and `chat:title` events update durable list state.
 @Riverpod(keepAlive: true)
 class ActiveChatsSync extends _$ActiveChatsSync {
   SocketEventSubscription? _globalActiveSub;
@@ -7063,6 +7144,7 @@ class ActiveChatsSync extends _$ActiveChatsSync {
           return;
         }
         _handleChatActiveEvent(map);
+        _handleChatTitleEvent(map);
       },
     );
 
@@ -7096,7 +7178,7 @@ class ActiveChatsSync extends _$ActiveChatsSync {
     if (active is! bool) {
       return;
     }
-    final chatId = _extractActiveChatId(map);
+    final chatId = _extractChatEventId(map);
     if (chatId == null || chatId.isEmpty) {
       return;
     }
@@ -7108,7 +7190,35 @@ class ActiveChatsSync extends _$ActiveChatsSync {
     }
   }
 
-  String? _extractActiveChatId(Map<String, dynamic> map) {
+  void _handleChatTitleEvent(Map<String, dynamic> map) {
+    final data = map['data'];
+    if (data is! Map || data['type'] != 'chat:title') {
+      return;
+    }
+    final payload = data['data'];
+    final title = switch (payload) {
+      String value => value.trim(),
+      Map value when value['title'] is String =>
+        (value['title'] as String).trim(),
+      _ => '',
+    };
+    final chatId = _extractChatEventId(map);
+    if (chatId == null || chatId.isEmpty || title.isEmpty) {
+      return;
+    }
+
+    DebugLogger.log(
+      'generated-title-received',
+      scope: 'chat/global-sync',
+      data: {'chatId': chatId},
+    );
+
+    ref
+        .read(conversationsProvider.notifier)
+        .applyServerGeneratedTitle(chatId, title);
+  }
+
+  String? _extractChatEventId(Map<String, dynamic> map) {
     final direct = map['chat_id'] ?? map['chatId'];
     if (direct != null) {
       return direct.toString();

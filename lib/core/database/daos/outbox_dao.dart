@@ -65,7 +65,6 @@ class RequestCompletionPayload {
     this.terminalId,
     this.enableWebSearch = false,
     this.enableImageGeneration = false,
-    this.enableCodeInterpreter = false,
     this.sessionIdOverride,
   });
 
@@ -81,7 +80,6 @@ class RequestCompletionPayload {
   final String? terminalId;
   final bool enableWebSearch;
   final bool enableImageGeneration;
-  final bool enableCodeInterpreter;
   final String? sessionIdOverride;
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -92,7 +90,6 @@ class RequestCompletionPayload {
     if (terminalId != null) 'terminalId': terminalId,
     'enableWebSearch': enableWebSearch,
     'enableImageGeneration': enableImageGeneration,
-    'enableCodeInterpreter': enableCodeInterpreter,
     if (sessionIdOverride != null) 'sessionIdOverride': sessionIdOverride,
   };
 
@@ -107,7 +104,6 @@ class RequestCompletionPayload {
           : null,
       enableWebSearch: json['enableWebSearch'] == true,
       enableImageGeneration: json['enableImageGeneration'] == true,
-      enableCodeInterpreter: json['enableCodeInterpreter'] == true,
       sessionIdOverride: json['sessionIdOverride'] is String
           ? json['sessionIdOverride'] as String
           : null,

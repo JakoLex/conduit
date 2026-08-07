@@ -55,6 +55,7 @@ class _MockSocketService implements SocketService {
     String? messageId,
     bool requireFocus = true,
     bool keepsAliveInBackground = false,
+    SocketReplayGapCallback? onReplayGap,
     required SocketChatEventHandler handler,
   }) {
     final reg = _CapturedRegistration(
@@ -94,6 +95,7 @@ class _FakeApiService extends ApiService {
       );
 
   Set<String> nextActive = const <String>{};
+  Object? nextError;
   int checkActiveChatsCalls = 0;
   List<String>? lastCheckedIds;
 
@@ -101,6 +103,8 @@ class _FakeApiService extends ApiService {
   Future<Set<String>> checkActiveChats(List<String> chatIds) async {
     checkActiveChatsCalls += 1;
     lastCheckedIds = chatIds;
+    final error = nextError;
+    if (error != null) throw error;
     return nextActive;
   }
 }
@@ -144,6 +148,14 @@ Map<String, dynamic> _activeEnvelope({
     },
   };
 }
+
+Map<String, dynamic> _titleEnvelope({
+  required String chatId,
+  required Object payload,
+}) => <String, dynamic>{
+  'chat_id': chatId,
+  'data': <String, dynamic>{'type': 'chat:title', 'data': payload},
+};
 
 ProviderContainer _makeContainer({
   required _MockSocketService socket,
@@ -296,6 +308,54 @@ void main() {
         ).contains('background-chat');
       },
     );
+
+    test('persists generated titles delivered by the global handler', () async {
+      final socket = _MockSocketService();
+      addTearDown(socket.disposeController);
+      final container = _makeContainer(
+        socket: socket,
+        conversations: [_conv('c1')],
+      );
+      container.read(activeChatsSyncProvider);
+      await container.read(conversationsProvider.future);
+      container.read(activeConversationProvider.notifier).set(_conv('c1'));
+
+      socket.registrations.single.handler(
+        _titleEnvelope(chatId: 'c1', payload: 'Generated title'),
+        null,
+      );
+
+      check(
+        container.read(conversationsProvider).requireValue.single.title,
+      ).equals('Generated title');
+      check(
+        container.read(activeConversationProvider)?.title,
+      ).equals('Generated title');
+      check(container.read(activeChatIdsProvider)).isEmpty();
+    });
+
+    test('persists a Map-shaped generated title payload', () async {
+      final socket = _MockSocketService();
+      addTearDown(socket.disposeController);
+      final container = _makeContainer(
+        socket: socket,
+        conversations: [_conv('c1')],
+      );
+      container.read(activeChatsSyncProvider);
+      await container.read(conversationsProvider.future);
+
+      socket.registrations.single.handler(
+        _titleEnvelope(
+          chatId: 'c1',
+          payload: <String, dynamic>{'title': 'Mapped title'},
+        ),
+        null,
+      );
+
+      check(
+        container.read(conversationsProvider).requireValue.single.title,
+      ).equals('Mapped title');
+    });
   });
 
   group('ActiveChatsSync — reconciliation fallback', () {
@@ -343,6 +403,25 @@ void main() {
         check(container.read(activeChatIdsProvider)).deepEquals({'c1'});
       },
     );
+
+    test('transient reconciliation failure preserves active state', () async {
+      final socket = _MockSocketService();
+      addTearDown(socket.disposeController);
+      final api = _FakeApiService()..nextError = StateError('offline');
+      final container = _makeContainer(
+        socket: socket,
+        api: api,
+        conversations: [_conv('c1')],
+      );
+      container.read(activeChatIdsProvider.notifier).setActive('c1');
+
+      container.read(activeChatsSyncProvider);
+      await container.read(conversationsProvider.future);
+      await Future<void>.delayed(Duration.zero);
+
+      check(api.checkActiveChatsCalls).equals(1);
+      check(container.read(activeChatIdsProvider)).deepEquals({'c1'});
+    });
   });
 
   group('ActiveChatsSync — logout / socket teardown', () {

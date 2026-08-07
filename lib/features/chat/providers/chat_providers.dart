@@ -1,12 +1,16 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:dio/dio.dart' show CancelToken;
 import 'package:drift/drift.dart' show Value;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter/widgets.dart'
+    show AppLifecycleState, WidgetsBinding, WidgetsBindingObserver;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'package:uuid/uuid.dart';
@@ -28,6 +32,7 @@ import '../../../core/database/chat_database_repository.dart';
 import '../../../core/database/local_conversation_loader.dart';
 import '../../../core/database/mappers/chat_blob_mapper.dart';
 import '../../../core/database/mappers/conversation_assembler.dart';
+import '../../../core/database/models/chat_transcript_window.dart';
 import '../../../core/providers/app_providers.dart';
 import '../../../core/sync/chat_locks.dart';
 import '../../../core/sync/clock.dart';
@@ -43,9 +48,7 @@ import '../../../core/services/settings_service.dart';
 import '../../../core/services/socket_service.dart';
 import '../../../core/services/streaming_response_controller.dart';
 import '../../../core/services/performance_profiler.dart';
-import '../../../core/services/pyodide_code_runner.dart';
 import '../../../core/services/conversation_parsing.dart';
-import '../../../core/services/pyodide_code_runner.dart';
 import '../../../core/services/worker_manager.dart';
 import '../../../core/utils/debug_logger.dart';
 import '../../../core/utils/json_normalization.dart';
@@ -67,6 +70,7 @@ import '../providers/context_attachments_provider.dart';
 import '../providers/reasoning_effort_provider.dart';
 import '../../tools/providers/tools_providers.dart';
 import '../services/chat_transport_dispatch.dart';
+import '../services/chat_history_reader.dart';
 import '../services/file_attachment_service.dart';
 import '../services/reviewer_mode_service.dart';
 
@@ -79,6 +83,110 @@ final chatMessagesProvider =
     NotifierProvider<ChatMessagesNotifier, List<ChatMessage>>(
       ChatMessagesNotifier.new,
     );
+
+class ChatTranscriptPagingNotifier extends Notifier<ChatTranscriptPagingState> {
+  @override
+  ChatTranscriptPagingState build() => const ChatTranscriptPagingState();
+
+  void reset({required int totalMessages}) {
+    final loaded = math.min(kChatTranscriptPageSize, totalMessages);
+    state = ChatTranscriptPagingState(
+      hasOlder: totalMessages > loaded,
+      loadedCount: loaded,
+      generation: state.generation + 1,
+    );
+  }
+
+  Future<bool> fetchOlder({required int totalMessages}) async {
+    if (state.isLoadingOlder || !state.hasOlder) return false;
+    state = state.copyWith(isLoadingOlder: true, clearError: true);
+    try {
+      final loaded = math.min(
+        totalMessages,
+        state.loadedCount + kChatTranscriptPageSize,
+      );
+      state = state.copyWith(
+        isLoadingOlder: false,
+        loadedCount: loaded,
+        hasOlder: loaded < totalMessages,
+        clearError: true,
+      );
+      return true;
+    } catch (error) {
+      state = state.copyWith(isLoadingOlder: false, error: error);
+      return false;
+    }
+  }
+
+  void ensureTotal(int totalMessages) {
+    final loaded = math.min(state.loadedCount, totalMessages);
+    final normalized = totalMessages == 0
+        ? 0
+        : math.max(math.min(kChatTranscriptPageSize, totalMessages), loaded);
+    if (normalized == state.loadedCount &&
+        state.hasOlder == (normalized < totalMessages)) {
+      return;
+    }
+    state = state.copyWith(
+      loadedCount: normalized,
+      hasOlder: normalized < totalMessages,
+    );
+  }
+
+  void restoreLoadedCount({
+    required int totalMessages,
+    required int loadedCount,
+  }) {
+    final normalized = math.min(
+      totalMessages,
+      math.max(kChatTranscriptPageSize, loadedCount),
+    );
+    state = ChatTranscriptPagingState(
+      hasOlder: normalized < totalMessages,
+      loadedCount: normalized,
+      generation: state.generation + 1,
+    );
+  }
+}
+
+final chatTranscriptPagingProvider =
+    NotifierProvider<ChatTranscriptPagingNotifier, ChatTranscriptPagingState>(
+      ChatTranscriptPagingNotifier.new,
+    );
+
+final chatHistoryReaderProvider = Provider<ChatHistoryReader>((ref) {
+  return ChatHistoryReader(
+    repository: ref.watch(chatDatabaseRepositoryProvider),
+    authoritativeLoader: (conversation) => ref.read(
+      loadConversationProvider(conversationScopedId(conversation)).future,
+    ),
+    offload: (envelope) => ref
+        .read(workerManagerProvider)
+        .schedule(
+          parseFullConversationModelWorker,
+          envelope,
+          debugLabel: 'chat.historyReader',
+        ),
+  );
+});
+
+Future<CompleteChatHistory> readCompleteActiveChatHistory(dynamic ref) {
+  final conversation = ref.read(activeConversationProvider);
+  if (conversation == null) {
+    throw StateError('No active conversation.');
+  }
+  final scopedId = conversationScopedId(conversation);
+  return ref
+      .read(chatHistoryReaderProvider)
+      .readCompleteActiveBranch(
+        conversation: conversation,
+        visibleOverlay: ref.read(chatMessagesProvider),
+        ownerIsCurrent: () {
+          final current = ref.read(activeConversationProvider);
+          return current != null && conversationScopedId(current) == scopedId;
+        },
+      );
+}
 
 // Hermes runs are allowed to continue while their conversation is not the
 // visible one. Keep their render state bound to the run owner so navigation
@@ -1371,9 +1479,40 @@ enum _StreamingContentFlushReason {
   replacement,
 }
 
+@visibleForTesting
+Duration debugRemoteTaskPollDelayForTesting({
+  required int fastPollsRemaining,
+  required int consecutiveFailures,
+  required int consecutiveCompletionMisses,
+  required bool hasActiveTask,
+}) {
+  final backoffStep = math.max(
+    consecutiveFailures,
+    consecutiveCompletionMisses,
+  );
+  if (backoffStep > 0) {
+    const delays = <Duration>[
+      Duration(seconds: 2),
+      Duration(seconds: 4),
+      Duration(seconds: 8),
+      Duration(seconds: 16),
+      Duration(seconds: 30),
+    ];
+    return delays[math.min(backoffStep, delays.length) - 1];
+  }
+  if (fastPollsRemaining > 0) {
+    return const Duration(seconds: 1);
+  }
+  return hasActiveTask
+      ? const Duration(seconds: 3)
+      : const Duration(seconds: 5);
+}
+
 // Chat messages notifier class
-class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
+class ChatMessagesNotifier extends Notifier<List<ChatMessage>>
+    with WidgetsBindingObserver {
   static const _passiveRefreshDebounce = Duration(milliseconds: 350);
+  static const int _remoteTaskFastPollCount = 10;
 
   StreamingResponseController? _messageStream;
   ProviderSubscription? _conversationListener;
@@ -1388,6 +1527,7 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
   int _dbMessagesGeneration = 0;
   DateTime? _lastStreamingActivity;
   StringBuffer? _streamingBuffer;
+  String Function()? _pendingStreamingSnapshot;
   Timer? _streamingSyncTimer;
   Timer? _streamingContentTimer;
   bool _streamingContentFrameScheduled = false;
@@ -1400,6 +1540,12 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
   int _streamingCoalescedUpdateCount = 0;
   Timer? _taskStatusTimer;
   String? _remoteTaskMonitorMessageId;
+  StreamSubscription<void>? _remoteTaskReconnectSubscription;
+  SocketService? _remoteTaskWakeSocket;
+  int _remoteTaskFastPollsRemaining = 0;
+  int _remoteTaskConsecutiveFailures = 0;
+  int _remoteTaskCompletionMisses = 0;
+  bool _isAppForeground = true;
   Timer? _passiveConversationRefreshTimer;
   bool _taskStatusCheckInFlight = false;
   int _taskStatusGeneration = 0;
@@ -1409,9 +1555,14 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
   // for a short grace window so the socket's own `done` finalize wins and we
   // never double-finalize. Reset whenever tasks are active again.
   int _tasksDoneGracePolls = 0;
-  // Polls to wait after `tasksDone` before the poll force-adopts server state
-  // over a still-protected socket resume stream (~2s at the 1s cadence).
+  // Consecutive `tasksDone` observations to wait before the poll force-adopts
+  // server state over a still-protected socket resume stream.
   static const int _tasksDoneSocketGracePolls = 2;
+  // Consecutive empty task-registry polls observed for a reopened tail whose
+  // task lookup previously failed. Requiring a second empty observation keeps
+  // a temporarily unregistered server task from being finalized immediately.
+  int _unobservedReopenedEmptyPolls = 0;
+  static const int _unobservedReopenedEmptyPollGrace = 1;
   bool _passiveConversationRefreshInFlight = false;
   int _passiveConversationGeneration = 0;
   int? _queuedPassiveConversationGeneration;
@@ -1435,20 +1586,40 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
   // socket dies after binding but before delivering `done`.
   String? _boundRemoteMessageId;
   String? _boundRemoteMessageOwnerId;
+  // The assistant tail currently being recovered after opening an existing
+  // chat. Unlike a locally-started stream, this transport did not observe the
+  // whole response, so server snapshots must keep reconciling it even after a
+  // live socket attaches.
+  String? _reopenedStreamingMessageId;
+  int _reopenedSocketCatchUpPollsRemaining = 0;
+  bool _awaitingFirstReopenedSocketActivity = false;
+  DateTime? _lastReopenedSnapshotAt;
+  static const int _reopenedSocketCatchUpPolls = 2;
+  static const Duration _reopenedSocketStallThreshold = Duration(seconds: 3);
   String? _streamingProfileTaskKey;
   String? _streamingProfileMessageId;
   DateTime? _streamingProfileStartedAt;
   int _streamingProfileChunkCount = 0;
   int _streamingProfileCharacters = 0;
   int _streamingProfileUtf8Bytes = 0;
+  int _coldHermesRecoveryGeneration = 0;
+  CancelToken? _coldHermesRecoveryCancelToken;
+  HermesRunKey? _coldHermesRecoveryKey;
+  String? _coldHermesRecoveryMessageId;
 
   bool _initialized = false;
   bool _disposed = false;
+
+  List<ChatMessage> get messagesSnapshot => state;
 
   @override
   List<ChatMessage> build() {
     if (!_initialized) {
       _initialized = true;
+      WidgetsBinding.instance.addObserver(this);
+      _isAppForeground = _isLifecycleForeground(
+        WidgetsBinding.instance.lifecycleState,
+      );
       _captureActiveOpenWebUiContext();
       ref.listen(appDatabaseProvider, (_, _) => _onOpenWebUiContextChanged());
       ref.listen(apiServiceProvider, (_, _) => _onOpenWebUiContextChanged());
@@ -1457,6 +1628,18 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
         openWebUiAuthSessionEpochProvider,
         (_, _) => _onOpenWebUiContextChanged(),
       );
+      ref.listen<HermesApiService?>(hermesApiServiceProvider, (_, next) {
+        // A cold recovery is authorized and routed by the concrete Hermes
+        // service that started it. Retire that attempt on every owner change;
+        // otherwise the old poll blocks the new service behind the same-message
+        // guard and can leave the checkpoint streaming forever.
+        _cancelColdHermesRecovery();
+        if (next == null) return;
+        final active = ref.read(activeConversationProvider);
+        if (active != null) {
+          unawaited(_recoverColdHermesCheckpointIfNeeded(active));
+        }
+      });
       _conversationListener = ref.listen(activeConversationProvider, (
         previous,
         next,
@@ -1529,11 +1712,13 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
         // Cancel any existing message stream when switching conversations
         _cancelMessageStream();
         _stopRemoteTaskMonitor();
+        _cancelColdHermesRecovery();
 
         if (next != null) {
           final nextMessages = _restoreLiveTransportRunState(
             _preserveFreshLocalAssistantState(next.messages),
             next,
+            settleOrphanedDirect: true,
           );
           final currentMessagesAlreadyVisible =
               state.isNotEmpty &&
@@ -1542,18 +1727,36 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
             state = nextMessages;
           }
           _syncStreamingProfileWithState();
+          final restoredHermesCheckpoint =
+              nextMessages.isNotEmpty &&
+                  nextMessages.last.role == 'assistant' &&
+                  nextMessages.last.isStreaming &&
+                  nextMessages.last.metadata?['transport'] == kHermesTransport
+              ? nextMessages.last
+              : null;
+          if (restoredHermesCheckpoint != null) {
+            unawaited(
+              _recoverColdHermesCheckpointIfNeeded(
+                next,
+                settleUnrecoverable: true,
+                expectedMessageId: restoredHermesCheckpoint.id,
+              ),
+            );
+          }
 
           // Update selected model if conversation has a different model
           _updateModelForConversation(next, generation: modelRebindGeneration);
 
-          if (_hasOpenWebUiTaskRecoverableTail(next)) {
-            _ensureRemoteTaskMonitor();
-          } else if (!_hasStreamingAssistant &&
-              _conversationUsesOpenWebUiContext(next)) {
-            // The opened chat may still be generating on the server; the server
-            // never sends `isStreaming`, so detect it from the task registry and
-            // re-engage the indicator + monitor.
-            unawaited(_detectActiveOnOpen(next));
+          if (_hasOpenWebUiTaskRecoverableTail(next, requireStreaming: false)) {
+            if (_shouldProtectLocalStreamingState) {
+              _ensureRemoteTaskMonitor();
+            } else {
+              // A restored `isStreaming` flag is only a local checkpoint, not
+              // proof that the task is still alive. Probe both streaming and
+              // settled tails so a cold reopen can either resume or finalize
+              // from the authoritative server transcript.
+              unawaited(_detectActiveOnOpen(next));
+            }
           } else {
             _stopRemoteTaskMonitor();
           }
@@ -1566,6 +1769,7 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
 
       ref.onDispose(() {
         _disposed = true;
+        WidgetsBinding.instance.removeObserver(this);
         for (final subscription in _subscriptions) {
           subscription.cancel();
         }
@@ -1575,6 +1779,7 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
         _cancelDbMessagesWatch();
         _cancelMessageStream(clearStreamingContent: false);
         _stopRemoteTaskMonitor();
+        _cancelColdHermesRecovery();
         _streamingSyncTimer?.cancel();
         _streamingSyncTimer = null;
         _streamingContentTimer?.cancel();
@@ -1594,10 +1799,54 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
     }
     _configurePassiveConversationSync(activeConversation);
     _configureDbMessagesWatch(activeConversation);
-    return _restoreLiveTransportRunState(
+    final initialMessages = _restoreLiveTransportRunState(
       activeConversation?.messages ?? const [],
       activeConversation,
+      settleOrphanedDirect: true,
     );
+    final initialHermesCheckpoint =
+        initialMessages.isNotEmpty &&
+            initialMessages.last.role == 'assistant' &&
+            initialMessages.last.isStreaming &&
+            initialMessages.last.metadata?['transport'] == kHermesTransport
+        ? initialMessages.last
+        : null;
+    if (activeConversation != null && initialHermesCheckpoint != null) {
+      Future.microtask(() {
+        if (_disposed ||
+            !isSameStoredConversation(
+              ref.read(activeConversationProvider),
+              activeConversation,
+            )) {
+          return;
+        }
+        unawaited(
+          _recoverColdHermesCheckpointIfNeeded(
+            activeConversation,
+            settleUnrecoverable: true,
+            expectedMessageId: initialHermesCheckpoint.id,
+          ),
+        );
+      });
+    }
+    if (activeConversation != null && _activeOpenWebUiApi is ApiService) {
+      Future.microtask(() {
+        if (_disposed ||
+            !isSameStoredConversation(
+              ref.read(activeConversationProvider),
+              activeConversation,
+            ) ||
+            !_hasOpenWebUiTaskRecoverableTail(
+              activeConversation,
+              requireStreaming: false,
+            ) ||
+            _shouldProtectLocalStreamingState) {
+          return;
+        }
+        unawaited(_detectActiveOnOpen(activeConversation));
+      });
+    }
+    return initialMessages;
   }
 
   void _clearStaleOpenWebUiActiveConversation(Conversation? expected) {
@@ -1667,7 +1916,7 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
       if (!conversationUsesOpenWebUiStorage(current)) return;
       _configurePassiveConversationSync(current);
       _configureDbMessagesWatch(current);
-      if (current != null && !_hasStreamingAssistant) {
+      if (current != null) {
         unawaited(_detectActiveOnOpen(current));
       }
     });
@@ -2344,8 +2593,9 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
 
   List<ChatMessage> _restoreLiveDirectRunState(
     List<ChatMessage> messages,
-    Conversation? conversation,
-  ) {
+    Conversation? conversation, {
+    bool settleOrphaned = false,
+  }) {
     if (conversation == null || messages.isEmpty) return messages;
     DirectRunRegistry registry;
     try {
@@ -2410,6 +2660,16 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
       if (shouldStream && !message.isStreaming) {
         restored.add(message.copyWith(isStreaming: true));
         changed = true;
+      } else if (!shouldStream &&
+          settleOrphaned &&
+          message.isStreaming &&
+          message.role == 'assistant' &&
+          message.metadata?['transport'] == kDirectTransport) {
+        // Direct transports are client-owned. After process death there is no
+        // server task to resume, so an orphaned pause checkpoint is a retained
+        // partial answer rather than a live stream.
+        restored.add(message.copyWith(isStreaming: false));
+        changed = true;
       } else {
         restored.add(message);
       }
@@ -2419,9 +2679,14 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
 
   List<ChatMessage> _restoreLiveTransportRunState(
     List<ChatMessage> messages,
-    Conversation? conversation,
-  ) => _restoreLiveHermesRunState(
-    _restoreLiveDirectRunState(messages, conversation),
+    Conversation? conversation, {
+    bool settleOrphanedDirect = false,
+  }) => _restoreLiveHermesRunState(
+    _restoreLiveDirectRunState(
+      messages,
+      conversation,
+      settleOrphaned: settleOrphanedDirect,
+    ),
     conversation,
   );
 
@@ -2509,6 +2774,269 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
       }
     }
     return List<ChatMessage>.unmodifiable(restored);
+  }
+
+  bool _hasLiveHermesProjection(
+    Conversation conversation,
+    ChatMessage message,
+  ) {
+    try {
+      final owner = captureChatMutationOwner(ref, conversation);
+      final projections = ref
+          .read(_hermesRunProjectionStoreProvider)
+          .forOwner(
+            ownerConversationId: chatMutationOwnerScopeForConversation(
+              conversation,
+            ),
+            backendIdentity: _hermesBackendIdentityForMutation(owner),
+          );
+      final transportId = _hermesMessageTransportId(message);
+      return projections.any(
+        (projection) =>
+            projection.message.id == message.id ||
+            (transportId != null &&
+                _hermesMessageTransportId(projection.message) == transportId),
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  bool _canRecoverHermesCheckpointFromProvider(
+    Conversation conversation,
+    ChatMessage message,
+  ) {
+    if (!conversationUsesOpenWebUiStorage(conversation)) {
+      return true;
+    }
+    try {
+      final owner = _HermesConversationOwner.capture(ref, conversation);
+      final provenance = _captureHermesMixedSessionProvenance(
+        ref,
+        owner: owner,
+        databaseManager: ref.read(databaseManagerProvider),
+      );
+      return provenance != null &&
+          _mixedHermesMessageHasLocalProvenance(message, provenance);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  void _cancelColdHermesRecovery() {
+    _coldHermesRecoveryGeneration += 1;
+    final token = _coldHermesRecoveryCancelToken;
+    final key = _coldHermesRecoveryKey;
+    _coldHermesRecoveryCancelToken = null;
+    _coldHermesRecoveryKey = null;
+    _coldHermesRecoveryMessageId = null;
+    if (token == null || token.isCancelled) return;
+    try {
+      if (key != null) {
+        // Owner changes only detach this local recovery attempt. They must not
+        // invoke the registry's user-stop callback or stop the durable remote
+        // run; a replacement service can immediately resume the same checkpoint.
+        ref.read(hermesRunRegistryProvider).complete(key, cancelToken: token);
+      }
+      token.cancel('Hermes checkpoint owner changed');
+    } catch (_) {
+      token.cancel('Hermes checkpoint owner changed');
+    }
+  }
+
+  ChatMessageError? _coldHermesTerminalError(String status) {
+    return switch (status) {
+      'completed' => null,
+      'cancelled' || 'canceled' => const ChatMessageError(
+        content: 'Hermes run was cancelled.',
+      ),
+      'stopped' => const ChatMessageError(content: 'Hermes run was stopped.'),
+      'incomplete' => const ChatMessageError(
+        content: 'Hermes stopped this response before it completed.',
+      ),
+      _ => const ChatMessageError(content: 'Hermes run failed.'),
+    };
+  }
+
+  void _settleColdHermesCheckpoint(
+    _HermesConversationOwner owner,
+    ChatMessage checkpoint, {
+    String? authoritativeContent,
+    ChatMessageError? error,
+  }) {
+    if (!owner.isActive(ref)) return;
+    updateMessageById(checkpoint.id, (current) {
+      if (current.metadata?['transport'] != kHermesTransport) return current;
+      return current.copyWith(
+        content: authoritativeContent != null && authoritativeContent.isNotEmpty
+            ? authoritativeContent
+            : current.content,
+        error: error,
+      );
+    });
+    finishStreamingMessage(
+      checkpoint.id,
+      ownerConversationId: owner.scopedConversationId,
+      requireConversationOwner: true,
+    );
+  }
+
+  Future<void> _recoverColdHermesCheckpointIfNeeded(
+    Conversation conversation, {
+    bool settleUnrecoverable = false,
+    String? expectedMessageId,
+  }) async {
+    if (_disposed || state.isEmpty) return;
+    final checkpoint = state.last;
+    if (checkpoint.role != 'assistant' ||
+        (expectedMessageId != null && checkpoint.id != expectedMessageId) ||
+        !checkpoint.isStreaming ||
+        checkpoint.metadata?['transport'] != kHermesTransport ||
+        _hasLiveHermesProjection(conversation, checkpoint) ||
+        _coldHermesRecoveryMessageId == checkpoint.id) {
+      return;
+    }
+
+    final owner = _HermesConversationOwner.capture(ref, conversation);
+    final service = ref.read(hermesApiServiceProvider);
+    if (service == null) {
+      if (settleUnrecoverable) {
+        _settleColdHermesCheckpoint(
+          owner,
+          checkpoint,
+          error: const ChatMessageError(
+            content: 'Hermes recovery service is unavailable.',
+          ),
+        );
+      }
+      return;
+    }
+    if (!_canRecoverHermesCheckpointFromProvider(conversation, checkpoint)) {
+      if (settleUnrecoverable) {
+        _settleColdHermesCheckpoint(
+          owner,
+          checkpoint,
+          error: const ChatMessageError(
+            content: 'Hermes checkpoint ownership could not be verified.',
+          ),
+        );
+      }
+      return;
+    }
+
+    final metadata = checkpoint.metadata ?? const <String, dynamic>{};
+    final runId = metadata['hermesRunId'] is String
+        ? metadata['hermesRunId'] as String
+        : null;
+    final responseId = metadata['hermesResponseId'] is String
+        ? metadata['hermesResponseId'] as String
+        : null;
+    final transportMode = metadata['hermesTransportMode'] is String
+        ? metadata['hermesTransportMode'] as String
+        : null;
+    if ((transportMode == kHermesResponsesMode && responseId == null) ||
+        (transportMode != kHermesResponsesMode && runId == null)) {
+      if (settleUnrecoverable) {
+        _settleColdHermesCheckpoint(
+          owner,
+          checkpoint,
+          error: const ChatMessageError(
+            content: 'Hermes checkpoint is missing its recovery identifier.',
+          ),
+        );
+      }
+      return;
+    }
+
+    _cancelColdHermesRecovery();
+    final generation = _coldHermesRecoveryGeneration;
+    final cancelToken = CancelToken();
+    final key = owner.runKey(checkpoint.id);
+    final registry = ref.read(hermesRunRegistryProvider);
+    final recoverySettled = Completer<void>();
+    _coldHermesRecoveryCancelToken = cancelToken;
+    _coldHermesRecoveryKey = key;
+    _coldHermesRecoveryMessageId = checkpoint.id;
+    registry.registerPending(
+      key,
+      cancelToken: cancelToken,
+      cancellationSettled: recoverySettled.future,
+      onCancelled: () {
+        _settleColdHermesCheckpoint(owner, checkpoint);
+      },
+    );
+    final cleanupSubscription = const Stream<void>.empty().listen((_) {});
+    final attached = transportMode == kHermesResponsesMode
+        ? registry.attachStream(
+            key,
+            cancelToken: cancelToken,
+            subscription: cleanupSubscription,
+          )
+        : registry.attachRun(
+            key,
+            cancelToken: cancelToken,
+            runId: runId!,
+            subscription: cleanupSubscription,
+            stopRemote: (id) => service.stopRun(id),
+          );
+    if (!attached) {
+      if (!recoverySettled.isCompleted) recoverySettled.complete();
+      registry.complete(key, cancelToken: cancelToken);
+      if (identical(_coldHermesRecoveryCancelToken, cancelToken)) {
+        _coldHermesRecoveryCancelToken = null;
+        _coldHermesRecoveryKey = null;
+        _coldHermesRecoveryMessageId = null;
+      }
+      return;
+    }
+
+    try {
+      final recovered = await recoverHermesCheckpoint(
+        service: service,
+        runId: runId,
+        responseId: responseId,
+        transportMode: transportMode,
+        cancelToken: cancelToken,
+      );
+      if (recovered == null ||
+          cancelToken.isCancelled ||
+          _disposed ||
+          generation != _coldHermesRecoveryGeneration ||
+          !identical(ref.read(hermesApiServiceProvider), service) ||
+          !owner.isActive(ref) ||
+          !registry.owns(key, cancelToken: cancelToken)) {
+        return;
+      }
+      _settleColdHermesCheckpoint(
+        owner,
+        checkpoint,
+        authoritativeContent: recovered.text,
+        error: _coldHermesTerminalError(recovered.status),
+      );
+    } catch (_) {
+      if (!cancelToken.isCancelled &&
+          !_disposed &&
+          generation == _coldHermesRecoveryGeneration &&
+          identical(ref.read(hermesApiServiceProvider), service) &&
+          owner.isActive(ref) &&
+          registry.owns(key, cancelToken: cancelToken)) {
+        _settleColdHermesCheckpoint(
+          owner,
+          checkpoint,
+          error: const ChatMessageError(
+            content: 'Hermes could not recover this interrupted response.',
+          ),
+        );
+      }
+    } finally {
+      if (!recoverySettled.isCompleted) recoverySettled.complete();
+      registry.complete(key, cancelToken: cancelToken);
+      if (identical(_coldHermesRecoveryCancelToken, cancelToken)) {
+        _coldHermesRecoveryCancelToken = null;
+        _coldHermesRecoveryKey = null;
+        _coldHermesRecoveryMessageId = null;
+      }
+    }
   }
 
   Future<void> _retryRetainedDirectFinalOutput({
@@ -3042,8 +3570,23 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
 
   void _clearStreamingBuffer() {
     _streamingBuffer = null;
+    _pendingStreamingSnapshot = null;
     _streamingBufferVersion = 0;
     _lastFlushedStreamingBufferVersion = -1;
+  }
+
+  void _realizePendingStreamingSnapshot() {
+    final snapshot = _pendingStreamingSnapshot;
+    if (snapshot == null) return;
+    _pendingStreamingSnapshot = null;
+    try {
+      _streamingBuffer = StringBuffer(_stripStreamingPlaceholders(snapshot()));
+    } catch (error) {
+      DebugLogger.log(
+        'Deferred streaming projection failed: $error',
+        scope: 'chat/providers',
+      );
+    }
   }
 
   /// Records the foreign server message id the streaming helper bound to the
@@ -3195,6 +3738,14 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
         _taskStatusCheckInFlight;
   }
 
+  bool get _isReopenedStreamingTail =>
+      _reopenedStreamingMessageId != null &&
+      state.isNotEmpty &&
+      state.last.role == 'assistant' &&
+      state.last.isStreaming &&
+      (state.last.id == _reopenedStreamingMessageId ||
+          state.last.id == _boundRemoteMessageId);
+
   bool get _shouldProtectLocalStreamingState {
     if (!_hasStreamingAssistant || state.isEmpty) {
       return false;
@@ -3237,13 +3788,24 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
   @visibleForTesting
   int get debugTasksDoneGracePolls => _tasksDoneGracePolls;
 
-  /// Test-only entry point that drives a single remote-task poll iteration,
-  /// mirroring exactly one tick of the 1s monitor. Lets grace-window regression
-  /// tests exercise [_syncRemoteTaskStatus] deterministically.
   @visibleForTesting
-  Future<void> debugSyncRemoteTaskStatus() => _syncRemoteTaskStatus();
+  int get debugReopenedSocketCatchUpPollsRemaining =>
+      _reopenedSocketCatchUpPollsRemaining;
 
-  /// Test-only hook that cancels just the periodic 1s poll timer without
+  @visibleForTesting
+  void debugPrimeReopenedSnapshotAttempt({int catchUpPolls = 0}) {
+    _reopenedSocketCatchUpPollsRemaining = catchUpPolls;
+    _lastReopenedSnapshotAt = null;
+  }
+
+  /// Test-only entry point that drives one remote-task monitor iteration. Lets
+  /// grace-window regression tests exercise [_syncRemoteTaskStatus]
+  /// deterministically.
+  @visibleForTesting
+  Future<void> debugSyncRemoteTaskStatus() =>
+      _syncRemoteTaskStatus(scheduleNext: false);
+
+  /// Test-only hook that cancels just the scheduled poll timer without
   /// clearing observed-task / grace state, so a test can drive poll iterations
   /// manually via [debugSyncRemoteTaskStatus] without the timer racing them.
   @visibleForTesting
@@ -3253,7 +3815,11 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
   }
 
   @visibleForTesting
-  bool get debugHasRemoteTaskMonitor => _taskStatusTimer != null;
+  bool get debugHasRemoteTaskMonitor => _remoteTaskMonitorMessageId != null;
+
+  @visibleForTesting
+  bool get debugHasRemoteTaskPollScheduled =>
+      _taskStatusTimer?.isActive ?? false;
 
   @visibleForTesting
   String? get debugBoundRemoteMessageId => _boundRemoteMessageId;
@@ -3273,11 +3839,11 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
   bool get debugTaskStatusCheckInFlight => _taskStatusCheckInFlight;
 
   /// True while streaming was re-engaged for a reopened, server-active chat
-  /// (typing indicator + 1s poll) with no genuine local transport. The
+  /// (typing indicator + recovery monitor) with no genuine local transport. The
   /// progressive poll owns content updates during this window; passive server
   /// refreshes must not clobber the streaming state and end it prematurely.
   bool get _isResumeStreamingActive =>
-      _taskStatusTimer != null &&
+      _remoteTaskMonitorMessageId != null &&
       _hasStreamingAssistant &&
       !_shouldProtectLocalStreamingState;
 
@@ -3353,17 +3919,24 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
         )) {
       return;
     }
-    // A genuine local stream, or an already-streaming message, owns this chat.
-    if (_shouldProtectLocalStreamingState || _hasStreamingAssistant) {
+    // A genuine local stream owns this chat. A restored `isStreaming` value,
+    // however, is only a crash/switch checkpoint and must be verified.
+    if (_shouldProtectLocalStreamingState || state.isEmpty) {
       return;
     }
+    final openedTail = state.last;
+    if (openedTail.role != 'assistant') return;
+    final openedMessageId = openedTail.id;
+    final openedAsStreaming = openedTail.isStreaming;
+
     // Fast path: the active-chats set (populated by ActiveChatsSync) may already
     // know. Otherwise ask the server's task registry directly. Either way we
     // try to capture an active task id so the resumed message carries stoppable
     // task metadata (stop/delete can then cancel the server task, not just the
     // local subscription).
-    final api = ref.read(apiServiceProvider);
-    if (api == null) return;
+    final apiValue = _readApiServiceOrNull(ref);
+    if (apiValue is! ApiService) return;
+    final api = apiValue;
     final owner = captureOpenWebUiCompletionOwner(
       ref,
       chatId: chatId,
@@ -3379,7 +3952,12 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
         isActive = taskIds.isNotEmpty;
         resumeTaskId = taskIds.isNotEmpty ? taskIds.first : null;
       } catch (_) {
-        // Offline / unreachable: leave the response as-is (static).
+        // Keep a restored checkpoint recoverable while offline. A later monitor
+        // poll will retry both the task registry and authoritative transcript.
+        if (openedAsStreaming &&
+            _stillOwnsReopenedTail(owner, openedMessageId)) {
+          _engageReopenedTailMonitor(openedMessageId);
+        }
         return;
       }
     } else {
@@ -3392,39 +3970,316 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
         // Best-effort only; resume still proceeds without a task id.
       }
     }
-    if (!isActive || _disposed) {
+
+    if (_disposed ||
+        !_stillOwnsReopenedTail(owner, openedMessageId) ||
+        _shouldProtectLocalStreamingState) {
       return;
     }
 
-    // The active chat may have changed, or a real stream may have started,
-    // while we awaited the probe.
-    if (activeOpenWebUiChatIdForMutation(ref, owner) == null) {
+    if (!isActive) {
+      if (!openedAsStreaming) {
+        _reopenedStreamingMessageId = null;
+        _stopRemoteTaskMonitor();
+        return;
+      }
+
+      // The app may have closed after the server task completed but before the
+      // local checkpoint was finalized. Zero tasks is therefore a terminal
+      // signal for an already-streaming restored tail: fetch the final branch
+      // instead of waiting forever for a task this process never observed.
+      final reconciled = await _refreshReopenedStreamFromServer(
+        api: api,
+        owner: owner,
+        expectedLocalMessageId: openedMessageId,
+        streaming: false,
+        source: 'cold-open completion',
+        persist: true,
+      );
+      if (reconciled) {
+        _cancelMessageStream();
+      } else if (_stillOwnsReopenedTail(owner, openedMessageId) &&
+          _hasStreamingAssistant) {
+        _engageReopenedTailMonitor(openedMessageId);
+      }
       return;
     }
-    if (_shouldProtectLocalStreamingState || _hasStreamingAssistant) {
+
+    // Rebase the entire active branch before attaching live deltas. Copying
+    // only the assistant body leaves stale/missing user and assistant turns
+    // around it after a DB-first reopen.
+    _reopenedStreamingMessageId = openedMessageId;
+    final rebaselined = await _refreshReopenedStreamFromServer(
+      api: api,
+      owner: owner,
+      expectedLocalMessageId: openedMessageId,
+      streaming: true,
+      source: 'active-open baseline',
+      persist: true,
+    );
+    if (!rebaselined) {
+      if (openedAsStreaming && _stillOwnsReopenedTail(owner, openedMessageId)) {
+        // Keep a durable checkpoint recoverable without attaching live socket
+        // deltas to an assistant branch that the server snapshot could not
+        // identify. The owner-fenced monitor can retry reconciliation later.
+        _engageReopenedTailMonitor(openedMessageId);
+      } else {
+        _reopenedStreamingMessageId = null;
+      }
       return;
     }
+
+    if (_disposed ||
+        activeOpenWebUiChatIdForMutation(ref, owner) == null ||
+        state.isEmpty ||
+        state.last.role != 'assistant' ||
+        _shouldProtectLocalStreamingState) {
+      return;
+    }
+
+    final currentConversation = ref.read(activeConversationProvider);
     if (!_hasOpenWebUiTaskRecoverableTail(
-      conversation,
+      currentConversation,
       requireStreaming: false,
     )) {
       return;
     }
 
     final last = state.last;
-    state = [
-      ...state.sublist(0, state.length - 1),
-      last.copyWith(isStreaming: true),
-    ];
+    if (!last.isStreaming) {
+      state = [
+        ...state.sublist(0, state.length - 1),
+        last.copyWith(isStreaming: true),
+      ];
+    }
+    _reopenedStreamingMessageId = state.last.id;
     // Pre-seed so the monitor's tasksDone finalization resolves once the server
     // task disappears (otherwise tasksDone could never become true).
     _observedRemoteTask = true;
+    // Arm the authoritative fallback before socket attachment. The connection
+    // can drop between the optimistic connected check and transport binding,
+    // which may otherwise leave this chat without deltas or polling while the
+    // socket reconnect attempt waits.
+    _engageReopenedTailMonitor(state.last.id);
     // Attach a socket resume stream so deltas render token-by-token (mirroring
-    // Open WebUI) instead of waiting on the 1s poll. The poll stays armed as a
-    // safety-net fallback below. When no connected socket is available the
+    // Open WebUI) instead of waiting on the recovery poll. The poll stays armed
+    // as a safety-net fallback below. When no connected socket is available the
     // attach is a no-op and behaviour is identical to today's poll-only resume.
-    _attachResumeSocketStream(conversation, state.last, taskId: resumeTaskId);
+    await _attachResumeSocketStream(
+      currentConversation ?? conversation,
+      state.last,
+      taskId: resumeTaskId,
+    );
+    if (_disposed ||
+        activeOpenWebUiChatIdForMutation(ref, owner) == null ||
+        !_hasStreamingAssistant) {
+      return;
+    }
+    if (_shouldProtectLocalStreamingState) {
+      // One fetch immediately after attachment and one on the next tick close
+      // the emit-before-DB-write window in Open WebUI's event emitter. Beyond
+      // that, full snapshots are only needed when socket activity stalls.
+      _reopenedSocketCatchUpPollsRemaining = _reopenedSocketCatchUpPolls;
+      _awaitingFirstReopenedSocketActivity = true;
+      _lastStreamingActivity = DateTime.now();
+    }
+    _engageReopenedTailMonitor(state.last.id);
+  }
+
+  void _engageReopenedTailMonitor(String messageId) {
+    _reopenedStreamingMessageId = messageId;
     _ensureRemoteTaskMonitor();
+    // `_ensureRemoteTaskMonitor` may retire a monitor left by an earlier probe
+    // and clear the recovery owner while it re-arms.
+    _reopenedStreamingMessageId = messageId;
+  }
+
+  bool _stillOwnsReopenedTail(
+    OpenWebUiCompletionOwner owner,
+    String expectedMessageId,
+  ) {
+    if (_disposed ||
+        activeOpenWebUiChatIdForMutation(ref, owner) == null ||
+        state.isEmpty ||
+        state.last.role != 'assistant') {
+      return false;
+    }
+    return state.last.id == expectedMessageId ||
+        state.last.id == _boundRemoteMessageId;
+  }
+
+  Future<bool> _refreshReopenedStreamFromServer({
+    required ApiService api,
+    required OpenWebUiCompletionOwner owner,
+    required String expectedLocalMessageId,
+    required bool streaming,
+    required String source,
+    bool persist = false,
+  }) async {
+    try {
+      _lastReopenedSnapshotAt = DateTime.now();
+      final serverConversation = await api.getConversation(owner.chatId);
+      if (!_stillOwnsReopenedTail(owner, expectedLocalMessageId)) {
+        return false;
+      }
+      final adopted = _reconcileReopenedServerSnapshot(
+        serverConversation.messages,
+        expectedLocalMessageId: expectedLocalMessageId,
+        streaming: streaming,
+        source: source,
+      );
+      if (adopted && persist) {
+        schedulePullChatNow(ref, owner.chatId);
+      }
+      return adopted;
+    } catch (error) {
+      DebugLogger.log(
+        'Reopened stream snapshot failed: $error',
+        scope: 'chat/resume',
+      );
+      return false;
+    }
+  }
+
+  bool _reconcileReopenedServerSnapshot(
+    List<ChatMessage> serverMessages, {
+    required String expectedLocalMessageId,
+    required bool streaming,
+    required String source,
+  }) {
+    if (serverMessages.isEmpty || state.isEmpty) return false;
+
+    if (_hasStreamingAssistant) {
+      // Socket chunks may still be waiting in the coalescing buffer. Fold them
+      // into the comparison state before deciding whether the server snapshot
+      // is newer.
+      _readStreamingMessageComparisonSnapshot(state.last.id);
+    }
+    if (state.isEmpty || state.last.role != 'assistant') return false;
+
+    final localTail = state.last;
+    var remoteId = _boundRemoteMessageId;
+    var serverIndex = serverMessages.lastIndexWhere(
+      (message) =>
+          message.role == 'assistant' &&
+          (message.id == localTail.id ||
+              message.id == expectedLocalMessageId ||
+              (remoteId != null && message.id == remoteId)),
+    );
+    if (serverIndex < 0) {
+      final inferredIndex = _inferReopenedRemoteAssistantIndex(
+        serverMessages,
+        localTail: localTail,
+      );
+      if (inferredIndex != null) {
+        remoteId = serverMessages[inferredIndex].id;
+        recordResumeBoundRemoteMessageId(localTail.id, remoteId);
+        serverIndex = inferredIndex;
+      }
+    }
+    if (serverIndex < 0) return false;
+    // Open WebUI advances history.currentId on every streamed upsert. The
+    // assistant being resumed must therefore be the fetched active-branch tip;
+    // never mark an older assistant and the current tip as streaming together.
+    if (streaming && serverIndex != serverMessages.length - 1) return false;
+
+    final authoritativeServerTail = serverMessages[serverIndex];
+    if (!streaming &&
+        (authoritativeServerTail.content.trim().isEmpty ||
+            _shouldPreserveLocalAssistantContent(
+              localTail,
+              authoritativeServerTail,
+            ))) {
+      DebugLogger.log(
+        'Deferring reopened completion until the authoritative assistant '
+        'body catches up',
+        scope: 'chat/resume',
+        data: {
+          'messageId': localTail.id,
+          'serverLength': authoritativeServerTail.content.length,
+          'localLength': localTail.content.length,
+        },
+      );
+      return false;
+    }
+
+    final mergedServerMessages = _preserveFreshLocalAssistantState(
+      serverMessages,
+    );
+    var serverTail = mergedServerMessages[serverIndex];
+    final foreignLiveBinding =
+        streaming &&
+        remoteId != null &&
+        serverTail.id == remoteId &&
+        serverTail.id != localTail.id;
+    if (foreignLiveBinding) {
+      // Keep the local widget/transport identity until completion; every live
+      // callback is scoped to it. The final settled snapshot may adopt the
+      // server id once transport ownership is released.
+      serverTail = serverTail.copyWith(id: localTail.id);
+    }
+    serverTail = serverTail.copyWith(isStreaming: streaming);
+
+    final reconciled = List<ChatMessage>.from(mergedServerMessages);
+    reconciled[serverIndex] = serverTail;
+    state = List<ChatMessage>.unmodifiable(reconciled);
+
+    if (streaming && state.last.role == 'assistant') {
+      _streamingContentTimer?.cancel();
+      _streamingContentTimer = null;
+      _streamingBuffer = StringBuffer(state.last.content);
+      _markStreamingBufferChanged();
+      ref
+          .read(streamingContentProvider.notifier)
+          .set(state.last.content.isEmpty ? null : state.last.content);
+      _syncStreamingProfileWithState();
+    } else {
+      _clearStreamingBuffer();
+      _clearStreamingContent();
+      _syncStreamingProfileWithState();
+    }
+
+    DebugLogger.log(
+      'Reconciled reopened chat from $source '
+      '(${serverMessages.length} authoritative messages)',
+      scope: 'chat/resume',
+    );
+    return true;
+  }
+
+  int? _inferReopenedRemoteAssistantIndex(
+    List<ChatMessage> serverMessages, {
+    required ChatMessage localTail,
+  }) {
+    final localTailIndex = state.length - 1;
+    final localParentId = _durableBranchParentId(state, localTailIndex);
+    if (localParentId == null || localParentId.isEmpty) return null;
+
+    int? match;
+    for (var index = 0; index < serverMessages.length; index++) {
+      final message = serverMessages[index];
+      if (message.role != 'assistant' ||
+          message.id == localTail.id ||
+          _durableBranchParentId(serverMessages, index) != localParentId) {
+        continue;
+      }
+      // Ambiguous siblings must wait for a socket binding or an exact ID. A
+      // single assistant with the same durable user-parent is the only safe
+      // foreign-ID mapping after process-local socket state has been lost.
+      if (match != null) return null;
+      match = index;
+    }
+    return match;
+  }
+
+  String? _durableBranchParentId(List<ChatMessage> messages, int messageIndex) {
+    final metadataParent = messages[messageIndex].metadata?['parentId']
+        ?.toString();
+    if (metadataParent != null && metadataParent.isNotEmpty) {
+      return metadataParent;
+    }
+    if (messageIndex <= 0) return null;
+    return messages[messageIndex - 1].id;
   }
 
   /// Feature C: subscribe the reopened, server-active chat to the shared
@@ -3436,11 +4291,11 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
   /// Registering the socket subscriptions makes [_shouldProtectLocalStreamingState]
   /// true for the resumed message, which demotes the poll's content-adoption to
   /// a pure fallback (the socket owns content).
-  void _attachResumeSocketStream(
+  Future<void> _attachResumeSocketStream(
     Conversation conversation,
     ChatMessage last, {
     String? taskId,
-  }) {
+  }) async {
     if (_disposed ||
         isTemporaryChat(conversation.id) ||
         !_hasOpenWebUiTaskRecoverableTail(conversation)) {
@@ -3495,8 +4350,8 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
       api: api,
     );
 
-    unawaited(
-      dispatchChatTransport(
+    try {
+      await dispatchChatTransport(
         ref: ref,
         session: session,
         assistantMessageId: last.id,
@@ -3513,10 +4368,19 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
         toolsEnabled: false,
         isTemporary: false,
         isResume: true,
+        messageNotifier: this,
         ownsActiveConversation: () =>
             activeOpenWebUiChatIdForMutation(ref, resumeOwner) != null,
-      ),
-    );
+        ownsPendingPlaceholder: () =>
+            _hasStreamingAssistant &&
+            _stillOwnsReopenedTail(resumeOwner, last.id),
+      );
+    } catch (error) {
+      DebugLogger.log(
+        'Socket resume attachment failed: $error',
+        scope: 'chat/resume',
+      );
+    }
   }
 
   void _ensureRemoteTaskMonitor() {
@@ -3527,37 +4391,96 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
       return;
     }
     final messageId = state.last.id;
-    if (_taskStatusTimer != null) {
-      if (_remoteTaskMonitorMessageId == messageId) {
-        return;
+    if (_remoteTaskMonitorMessageId == messageId) {
+      _bindRemoteTaskMonitorWakeups();
+      if (_taskStatusTimer == null &&
+          !_taskStatusCheckInFlight &&
+          _isAppForeground) {
+        _scheduleRemoteTaskPoll(Duration.zero);
       }
+      return;
+    }
+    if (_remoteTaskMonitorMessageId != null || _taskStatusTimer != null) {
       _stopRemoteTaskMonitor(retiringMessageId: _remoteTaskMonitorMessageId);
     }
-    // Poll every second for fast recovery from missed socket events.
-    // This is a lightweight API call and provides the best UX for stuck streaming.
+
+    // Recover aggressively for the first few seconds, then move to a bounded
+    // cadence. A one-shot timer allows errors and server-body lag to back off
+    // without leaving a fixed one-second radio wake running indefinitely.
     _remoteTaskMonitorMessageId = messageId;
-    _taskStatusTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+    _remoteTaskFastPollsRemaining = _remoteTaskFastPollCount;
+    _remoteTaskConsecutiveFailures = 0;
+    _remoteTaskCompletionMisses = 0;
+    _bindRemoteTaskMonitorWakeups();
+    _scheduleRemoteTaskPoll(Duration.zero);
+  }
+
+  void _scheduleRemoteTaskPoll(Duration delay, {bool replace = false}) {
+    if (_disposed || !_isAppForeground || _remoteTaskMonitorMessageId == null) {
+      return;
+    }
+    if (!replace && (_taskStatusTimer?.isActive ?? false)) return;
+    _taskStatusTimer?.cancel();
+    _taskStatusTimer = Timer(delay, () {
+      _taskStatusTimer = null;
       if (!_taskStatusCheckInFlight) {
         unawaited(_syncRemoteTaskStatus());
       }
     });
-    if (!_taskStatusCheckInFlight) {
-      unawaited(_syncRemoteTaskStatus());
+  }
+
+  void _bindRemoteTaskMonitorWakeups() {
+    final socket = ref.read(socketServiceProvider);
+    if (identical(socket, _remoteTaskWakeSocket) &&
+        _remoteTaskReconnectSubscription != null) {
+      return;
     }
+    unawaited(_remoteTaskReconnectSubscription?.cancel());
+    _remoteTaskReconnectSubscription = null;
+    _remoteTaskWakeSocket = socket;
+    if (socket == null) return;
+    _remoteTaskReconnectSubscription = socket.onReconnect.listen((_) {
+      _wakeRemoteTaskMonitor();
+    });
+  }
+
+  void _wakeRemoteTaskMonitor() {
+    if (_disposed ||
+        !_isAppForeground ||
+        _remoteTaskMonitorMessageId == null ||
+        !_hasOpenWebUiTaskRecoverableTail(
+          ref.read(activeConversationProvider),
+        )) {
+      return;
+    }
+    _remoteTaskFastPollsRemaining = math.max(_remoteTaskFastPollsRemaining, 2);
+    _remoteTaskConsecutiveFailures = 0;
+    _scheduleRemoteTaskPoll(Duration.zero, replace: true);
   }
 
   void _stopRemoteTaskMonitor({String? retiringMessageId}) {
     _taskStatusTimer?.cancel();
     _taskStatusTimer = null;
+    unawaited(_remoteTaskReconnectSubscription?.cancel());
+    _remoteTaskReconnectSubscription = null;
+    _remoteTaskWakeSocket = null;
     _remoteTaskMonitorMessageId = null;
     _taskStatusCheckInFlight = false;
     _taskStatusGeneration++;
+    _remoteTaskFastPollsRemaining = 0;
+    _remoteTaskConsecutiveFailures = 0;
+    _remoteTaskCompletionMisses = 0;
     _observedRemoteTask = false;
     _tasksDoneGracePolls = 0;
+    _unobservedReopenedEmptyPolls = 0;
+    _reopenedStreamingMessageId = null;
+    _reopenedSocketCatchUpPollsRemaining = 0;
+    _awaitingFirstReopenedSocketActivity = false;
+    _lastReopenedSnapshotAt = null;
     _clearBoundRemoteMessageId(ownedByMessageId: retiringMessageId);
   }
 
-  Future<void> _syncRemoteTaskStatus() async {
+  Future<void> _syncRemoteTaskStatus({bool scheduleNext = true}) async {
     if (_taskStatusCheckInFlight) {
       return;
     }
@@ -3581,21 +4504,51 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
     if (activeOpenWebUiChatIdForMutation(ref, owner) == null) return;
 
     _taskStatusCheckInFlight = true;
+    var hasActiveTasks = false;
+    var taskLookupSucceeded = false;
+    var completionNeedsRetry = false;
+    var completionGraceActive = false;
     try {
       // Check both task status and server message state
       final taskIds = await api.getTaskIdsByChat(activeConversation.id);
+      taskLookupSucceeded = true;
       if (generation != _taskStatusGeneration ||
           activeOpenWebUiChatIdForMutation(ref, owner) == null) {
         return;
       }
-      final hasActiveTasks = taskIds.isNotEmpty;
+      hasActiveTasks = taskIds.isNotEmpty;
+      final reopenedTail = _isReopenedStreamingTail;
 
       if (hasActiveTasks) {
         _observedRemoteTask = true;
+        _unobservedReopenedEmptyPolls = 0;
+      } else if (reopenedTail && !_observedRemoteTask) {
+        _unobservedReopenedEmptyPolls++;
+      } else {
+        _unobservedReopenedEmptyPolls = 0;
       }
 
-      // When no active tasks and we previously observed tasks, streaming should be done.
-      final tasksDone = _observedRemoteTask && !hasActiveTasks;
+      // A reopened checkpoint may have completed before this process observed
+      // any task. If the initial task lookup failed, require two consecutive
+      // empty registry observations before treating that checkpoint as done.
+      // This retains eventual settlement without racing task registration.
+      final tasksDone =
+          !hasActiveTasks &&
+          (_observedRemoteTask ||
+              (reopenedTail &&
+                  _unobservedReopenedEmptyPolls >
+                      _unobservedReopenedEmptyPollGrace));
+      DebugLogger.log(
+        'Remote task recovery status',
+        scope: 'chat/resume',
+        data: {
+          'chatId': activeConversation.id,
+          'messageId': state.last.id,
+          'active': hasActiveTasks,
+          'reopened': reopenedTail,
+          'protected': _shouldProtectLocalStreamingState,
+        },
+      );
 
       // Feature C race guard: when a socket resume stream still owns this chat
       // (protection holds), let its own `done` finalize win. Defer the poll's
@@ -3612,55 +4565,50 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
           _shouldProtectLocalStreamingState &&
           _tasksDoneGracePolls > 0 &&
           _tasksDoneGracePolls <= _tasksDoneSocketGracePolls;
+      completionGraceActive = socketResumeGraceActive;
+      final now = DateTime.now();
+      final protectedResumeNeedsSnapshot =
+          reopenedTail &&
+          _shouldProtectLocalStreamingState &&
+          (_reopenedSocketCatchUpPollsRemaining > 0 ||
+              ((_lastStreamingActivity == null ||
+                      now.difference(_lastStreamingActivity!) >=
+                          _reopenedSocketStallThreshold) &&
+                  (_lastReopenedSnapshotAt == null ||
+                      now.difference(_lastReopenedSnapshotAt!) >=
+                          _reopenedSocketStallThreshold)));
+      final unprotectedResumeNeedsSnapshot =
+          reopenedTail &&
+          !_shouldProtectLocalStreamingState &&
+          (_lastReopenedSnapshotAt == null ||
+              now.difference(_lastReopenedSnapshotAt!) >=
+                  _reopenedSocketStallThreshold);
 
-      // Resume case: while the server task is still running and no genuine local
-      // stream owns this chat (i.e. we re-engaged streaming on reopen), adopt the
-      // growing server content so a reopened in-flight chat streams in instead of
-      // showing an empty/partial response. A real local send delivers its own
-      // socket/HTTP deltas, so it is excluded via _shouldProtectLocalStreamingState.
+      // Resume case: reconcile the complete authoritative branch while the
+      // server task runs. A reattached socket only sees future events, so its
+      // transport protection must not suppress snapshots that fill the gap
+      // accumulated while another chat (or no app process) owned the screen.
       if (_hasStreamingAssistant &&
           hasActiveTasks &&
-          !_shouldProtectLocalStreamingState) {
-        try {
-          final refreshed = await pullChatOrFetch(ref, activeConversation.id);
-          // Bail if we switched chats or a real stream started during the await.
-          if (refreshed == null ||
-              _disposed ||
-              generation != _taskStatusGeneration ||
-              activeOpenWebUiChatIdForMutation(ref, owner) == null ||
-              !_hasStreamingAssistant ||
-              _shouldProtectLocalStreamingState) {
-            return;
-          }
-          if (state.isNotEmpty) {
-            final localLast = state.last;
-            if (localLast.role == 'assistant' && localLast.isStreaming) {
-              final snapshot = _readStreamingMessageComparisonSnapshot(
-                localLast.id,
-              );
-              final serverVersion = refreshed.messages
-                  .where(
-                    (m) =>
-                        m.id == localLast.id || m.id == _boundRemoteMessageId,
-                  )
-                  .firstOrNull;
-              final serverContent = serverVersion?.content ?? '';
-              // Monotonic growth guard: only adopt when the server has strictly
-              // more content than we already show (prevents flicker/duplicates).
-              if (serverVersion != null &&
-                  serverContent.length > snapshot.comparisonContent.length) {
-                state = [
-                  ...state.sublist(0, state.length - 1),
-                  serverVersion.copyWith(isStreaming: true),
-                ];
-              }
-            }
-          }
-        } catch (e) {
-          DebugLogger.log(
-            'Progressive resume fetch failed: $e',
-            scope: 'chat/providers',
-          );
+          (unprotectedResumeNeedsSnapshot || protectedResumeNeedsSnapshot)) {
+        final expectedMessageId = _reopenedStreamingMessageId ?? state.last.id;
+        if (_shouldProtectLocalStreamingState &&
+            _reopenedSocketCatchUpPollsRemaining > 0) {
+          // Consume the finite catch-up budget on attempt, even when the
+          // fetched snapshot cannot bind to the local assistant branch.
+          _reopenedSocketCatchUpPollsRemaining--;
+        }
+        await _refreshReopenedStreamFromServer(
+          api: api,
+          owner: owner,
+          expectedLocalMessageId: expectedMessageId,
+          streaming: true,
+          source: 'active task poll',
+        );
+        if (_disposed ||
+            generation != _taskStatusGeneration ||
+            activeOpenWebUiChatIdForMutation(ref, owner) == null) {
+          return;
         }
       }
 
@@ -3679,78 +4627,67 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
       // if the socket silently died and dropped protection) the poll resumes as
       // the authoritative recovery finalizer.
       if (_hasStreamingAssistant && tasksDone && !socketResumeGraceActive) {
-        try {
-          final serverConversation = await api.getConversation(
-            activeConversation.id,
-          );
-          if (generation != _taskStatusGeneration ||
-              activeOpenWebUiChatIdForMutation(ref, owner) == null) {
-            return;
-          }
-          final serverMessages = serverConversation.messages;
-
-          if (serverMessages.isNotEmpty && state.isNotEmpty) {
-            final localLast = state.last;
-
-            // Case 1: Server has more messages than local - streaming must be done
-            if (serverMessages.length > state.length) {
-              DebugLogger.log(
-                'Server sync: server has more messages '
-                '(${serverMessages.length} vs ${state.length})',
-                scope: 'chat/providers',
-              );
-              state = serverMessages;
-              _cancelMessageStream();
-              return;
-            }
-
-            // Case 2: Find the local streaming message in server messages by ID
-            // This handles cases where last messages differ
-            if (localLast.role == 'assistant' && localLast.isStreaming) {
-              final comparisonSnapshot =
-                  _readStreamingMessageComparisonSnapshot(localLast.id);
-              final serverVersion = serverMessages
-                  .where(
-                    (m) =>
-                        m.id == localLast.id || m.id == _boundRemoteMessageId,
-                  )
-                  .firstOrNull;
-
-              if (serverVersion != null) {
-                final serverHasContent = serverVersion.content
-                    .trim()
-                    .isNotEmpty;
-
-                // Since tasksDone already guarantees tasks genuinely completed,
-                // server content should be the final version. Adopt if the
-                // server has any content (replaces broken isStreaming check).
-                if (serverHasContent) {
-                  DebugLogger.log(
-                    'Server sync: adopting server state '
-                    '(serverHasContent=$serverHasContent, '
-                    'serverLen=${serverVersion.content.length}, '
-                    'localLen=${comparisonSnapshot.comparisonContent.length})',
-                    scope: 'chat/providers',
-                  );
-                  state = serverMessages;
-                  _cancelMessageStream();
-                }
-              }
-            }
-          }
-        } catch (e) {
-          DebugLogger.log(
-            'Server conversation fetch failed: $e',
-            scope: 'chat/providers',
-          );
+        final expectedMessageId = _reopenedStreamingMessageId ?? state.last.id;
+        final reconciled = await _refreshReopenedStreamFromServer(
+          api: api,
+          owner: owner,
+          expectedLocalMessageId: expectedMessageId,
+          streaming: false,
+          source: 'completed task poll',
+          persist: true,
+        );
+        if (generation != _taskStatusGeneration ||
+            activeOpenWebUiChatIdForMutation(ref, owner) == null) {
+          return;
+        }
+        if (reconciled) {
+          _cancelMessageStream();
+        } else {
+          completionNeedsRetry = true;
         }
       }
     } catch (err, stack) {
-      DebugLogger.log('Task status poll failed: $err', scope: 'chat/provider');
-      debugPrintStack(stackTrace: stack);
+      // Any failure in the iteration, including authoritative transcript
+      // reconciliation after a successful task lookup, should cool the monitor
+      // down rather than re-entering the steady cadence.
+      taskLookupSucceeded = false;
+      DebugLogger.error(
+        'remote-task-poll-failed',
+        scope: 'chat/resume',
+        error: err,
+        stackTrace: stack,
+      );
     } finally {
       if (generation == _taskStatusGeneration) {
         _taskStatusCheckInFlight = false;
+        if (taskLookupSucceeded) {
+          _remoteTaskConsecutiveFailures = 0;
+          _remoteTaskCompletionMisses = completionNeedsRetry
+              ? _remoteTaskCompletionMisses + 1
+              : 0;
+        } else {
+          _remoteTaskConsecutiveFailures++;
+        }
+        if (scheduleNext &&
+            _remoteTaskMonitorMessageId != null &&
+            _hasOpenWebUiTaskRecoverableTail(
+              ref.read(activeConversationProvider),
+            )) {
+          final delay = completionGraceActive
+              ? const Duration(seconds: 1)
+              : debugRemoteTaskPollDelayForTesting(
+                  fastPollsRemaining: _remoteTaskFastPollsRemaining,
+                  consecutiveFailures: _remoteTaskConsecutiveFailures,
+                  consecutiveCompletionMisses: _remoteTaskCompletionMisses,
+                  hasActiveTask: hasActiveTasks,
+                );
+          if (_remoteTaskConsecutiveFailures == 0 &&
+              _remoteTaskCompletionMisses == 0 &&
+              _remoteTaskFastPollsRemaining > 0) {
+            _remoteTaskFastPollsRemaining--;
+          }
+          _scheduleRemoteTaskPoll(delay, replace: true);
+        }
       }
     }
   }
@@ -3770,6 +4707,18 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
 
   void _touchStreamingActivity() {
     _lastStreamingActivity = DateTime.now();
+    if (_isReopenedStreamingTail &&
+        _shouldProtectLocalStreamingState &&
+        _awaitingFirstReopenedSocketActivity) {
+      // The first live delta may follow a gap accumulated between the baseline
+      // fetch and socket attachment. Guarantee one post-delta rebase without
+      // paying for a full conversation fetch on every subsequent token.
+      _awaitingFirstReopenedSocketActivity = false;
+      _reopenedSocketCatchUpPollsRemaining = math.max(
+        _reopenedSocketCatchUpPollsRemaining,
+        1,
+      );
+    }
     if (!_hasOpenWebUiTaskRecoverableTail(
       ref.read(activeConversationProvider),
     )) {
@@ -3778,7 +4727,7 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
     }
     if (_hasStreamingAssistant) {
       // Reset observed flag each time a new streaming session starts.
-      if (_taskStatusTimer == null) {
+      if (_remoteTaskMonitorMessageId == null) {
         _observedRemoteTask = false;
       }
       _ensureRemoteTaskMonitor();
@@ -3786,6 +4735,34 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
       _stopRemoteTaskMonitor();
     }
   }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached) {
+      _isAppForeground = false;
+      _taskStatusTimer?.cancel();
+      _taskStatusTimer = null;
+      return;
+    }
+    if (state == AppLifecycleState.resumed) {
+      final wasForeground = _isAppForeground;
+      _isAppForeground = true;
+      if (!wasForeground) _wakeRemoteTaskMonitor();
+      return;
+    }
+    if (state == AppLifecycleState.inactive) {
+      final wasForeground = _isAppForeground;
+      _isAppForeground = true;
+      if (!wasForeground) _wakeRemoteTaskMonitor();
+    }
+  }
+
+  bool _isLifecycleForeground(AppLifecycleState? state) =>
+      state == null ||
+      state == AppLifecycleState.resumed ||
+      state == AppLifecycleState.inactive;
 
   // Enhanced streaming recovery method similar to OpenWebUI's approach
   void recoverStreamingIfNeeded() {
@@ -3920,6 +4897,12 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
     _activeStreamingTransportMessageId = messageId;
     _socketSubscriptions.addAll(subscriptions);
     _socketTeardown = onDispose;
+    if (subscriptions.isNotEmpty && _isReopenedStreamingTail) {
+      _reopenedSocketCatchUpPollsRemaining = math.max(
+        _reopenedSocketCatchUpPollsRemaining,
+        1,
+      );
+    }
   }
 
   void cancelSocketSubscriptions() {
@@ -4279,6 +5262,10 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
       return;
     }
 
+    // A direct append supersedes any deferred full projection. In practice the
+    // reasoning path finalizes through replaceLastMessageContent first, but
+    // realizing here keeps this public seam authoritative for every caller.
+    _realizePendingStreamingSnapshot();
     // Initialize buffer with existing content on first chunk
     _streamingBuffer ??= StringBuffer(lastMessage.content);
     _streamingBuffer!.write(content);
@@ -4451,6 +5438,7 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
     if (_disposed) {
       return;
     }
+    _realizePendingStreamingSnapshot();
     final buffer = _streamingBuffer;
     if (buffer == null) return;
     if (_streamingBufferVersion == _lastFlushedStreamingBufferVersion) {
@@ -4493,6 +5481,7 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
   }
 
   ChatMessage _messageWithBufferedStreamingContent(ChatMessage message) {
+    _realizePendingStreamingSnapshot();
     final buffer = _streamingBuffer;
     if (buffer == null ||
         state.isEmpty ||
@@ -4546,6 +5535,7 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
   /// Syncs the accumulated streaming buffer content into
   /// the message list state.
   void _syncStreamingBufferToState() {
+    _realizePendingStreamingSnapshot();
     if (_streamingBuffer == null || state.isEmpty) {
       return;
     }
@@ -4584,7 +5574,9 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
     if (lastMessage.role != 'assistant' || !lastMessage.isStreaming) return;
 
     final sanitized = _stripStreamingPlaceholders(content);
-    if (_streamingBuffer?.toString() == sanitized) {
+    final hadPendingSnapshot = _pendingStreamingSnapshot != null;
+    _pendingStreamingSnapshot = null;
+    if (!hadPendingSnapshot && _streamingBuffer?.toString() == sanitized) {
       return;
     }
     _streamingBuffer = StringBuffer(sanitized);
@@ -4597,6 +5589,23 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
     );
     _touchStreamingActivity();
     _syncStreamingProfileWithBufferedContent();
+  }
+
+  /// Defers an expensive cumulative streaming projection until the same
+  /// cadence that publishes visible content. Repeated transport deltas replace
+  /// the pending snapshot without materializing or semantic-rendering every
+  /// intermediate state.
+  void bufferLastMessageContentSnapshot(String Function() snapshot) {
+    if (state.isEmpty) return;
+
+    final lastMessage = state.last;
+    if (lastMessage.role != 'assistant' || !lastMessage.isStreaming) return;
+
+    _streamingBuffer ??= StringBuffer(lastMessage.content);
+    _pendingStreamingSnapshot = snapshot;
+    _markStreamingBufferChanged();
+    _scheduleStreamingContentUpdate();
+    _touchStreamingActivity();
   }
 
   void replaceLastMessageContent(String content) {
@@ -4615,7 +5624,9 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
       _touchStreamingActivity();
       return;
     }
-    if (_streamingBuffer?.toString() == sanitized) {
+    final hadPendingSnapshot = _pendingStreamingSnapshot != null;
+    _pendingStreamingSnapshot = null;
+    if (!hadPendingSnapshot && _streamingBuffer?.toString() == sanitized) {
       return;
     }
     _streamingBuffer = StringBuffer(sanitized);
@@ -5018,6 +6029,71 @@ class ChatMessagesNotifier extends Notifier<List<ChatMessage>> {
     );
   }
 
+  /// Reconciles stream leases the native background service could no longer
+  /// protect. Live client transports keep their registry ownership; orphaned
+  /// direct/Hermes checkpoints use their cold-recovery paths, while OpenWebUI
+  /// streams re-enter the task/socket reconciliation flow.
+  Future<void> reconcileBackgroundServiceFailure(
+    Iterable<String> streamIds,
+  ) async {
+    const prefix = 'chat-stream-';
+    final failedMessageIds = <String>{
+      for (final streamId in streamIds)
+        if (streamId.startsWith(prefix) && streamId.length > prefix.length)
+          streamId.substring(prefix.length),
+    };
+    if (failedMessageIds.isEmpty || state.isEmpty) return;
+    final target = state.last;
+    if (target.role != 'assistant' ||
+        !target.isStreaming ||
+        !failedMessageIds.contains(target.id)) {
+      return;
+    }
+
+    final activeAtFailure = ref.read(activeConversationProvider);
+    if (activeAtFailure == null) return;
+    await persistPauseCheckpoint();
+    if (_disposed) return;
+    final active = ref.read(activeConversationProvider);
+    if (active == null || !isSameStoredConversation(activeAtFailure, active)) {
+      return;
+    }
+    if (state.isEmpty ||
+        state.last.id != target.id ||
+        !state.last.isStreaming) {
+      return;
+    }
+
+    final transport = target.metadata?['transport'];
+    if (transport == kDirectTransport) {
+      final restored = _restoreLiveDirectRunState(
+        state,
+        active,
+        settleOrphaned: true,
+      );
+      if (!identical(restored, state)) {
+        state = restored;
+        _syncConversationStateAfterStreamingUpdate();
+        _persistCompletedTurn();
+      }
+      return;
+    }
+    if (transport == kHermesTransport) {
+      await _recoverColdHermesCheckpointIfNeeded(
+        active,
+        settleUnrecoverable: true,
+      );
+      return;
+    }
+    if (_hasOpenWebUiTaskRecoverableTail(active)) {
+      if (_shouldProtectLocalStreamingState) {
+        _ensureRemoteTaskMonitor();
+      } else {
+        await _detectActiveOnOpen(active);
+      }
+    }
+  }
+
   Future<void> _writeTurnEcho({
     required AppDatabase db,
     required ChatLocks locks,
@@ -5143,6 +6219,45 @@ String? _messageModelName(ChatMessage message) {
 
 List<ChatMessageVersion> _buildReplayVersions(ChatMessage message) {
   return [...message.versions, _buildAssistantVersionSnapshot(message)];
+}
+
+ChatMessage _directRegenerationCompletedBase(ChatMessage message) {
+  final isEmptyPlaceholder =
+      message.content.isEmpty &&
+      message.files?.isNotEmpty != true &&
+      message.output?.isNotEmpty != true &&
+      message.embeds?.isNotEmpty != true &&
+      message.sources.isEmpty &&
+      message.statusHistory.isEmpty &&
+      message.followUps.isEmpty &&
+      message.codeExecutions.isEmpty &&
+      message.usage?.isNotEmpty != true &&
+      message.error == null;
+  if (!message.isStreaming || message.versions.isEmpty || !isEmptyPlaceholder) {
+    return message.copyWith(isStreaming: false);
+  }
+  final completed = message.versions.last;
+  final metadata = <String, dynamic>{...?message.metadata};
+  final modelName = completed.modelName?.trim();
+  if (modelName != null && modelName.isNotEmpty) {
+    metadata['modelName'] = modelName;
+  }
+  return message.copyWith(
+    content: completed.content,
+    timestamp: completed.timestamp,
+    model: completed.model,
+    files: completed.files,
+    output: completed.output,
+    embeds: completed.embeds,
+    sources: completed.sources,
+    followUps: completed.followUps,
+    codeExecutions: completed.codeExecutions,
+    usage: completed.usage,
+    versions: message.versions.sublist(0, message.versions.length - 1),
+    error: completed.error,
+    metadata: metadata.isEmpty ? null : metadata,
+    isStreaming: false,
+  );
 }
 
 // Pre-seed an assistant skeleton message (with a given id or a new one) and
@@ -5919,7 +7034,7 @@ List<String> selectedFilterIdsForModel(dynamic ref, Model model) {
 }
 
 // Start a new chat (unified function for both "New Chat" button and home screen)
-void startNewChat(dynamic ref) {
+void startNewChat(dynamic ref, {Model? modelForNewConversation}) {
   resetHermesForNewChat(ref);
   resetDirectRunsForNewChat(ref);
   clearSelectedFiltersForConversationBoundary(ref);
@@ -5936,8 +7051,18 @@ void startNewChat(dynamic ref) {
   // Clear any pending folder selection
   ref.read(pendingFolderIdProvider.notifier).clear();
 
-  // Reset to default model for new conversations (fixes #296)
-  restoreDefaultModel(ref);
+  if (modelForNewConversation != null) {
+    // Voice startup admits a concrete transport before this reset. Keep that
+    // exact model pinned so the asynchronous default restore cannot switch the
+    // first voice turn to a different, potentially unauthenticated backend.
+    ref.read(isManualModelSelectionProvider.notifier).set(true);
+    ref
+        .read(selectedModelProvider.notifier)
+        .set(modelForNewConversation, allowHidden: true);
+  } else {
+    // Reset to default model for new conversations (fixes #296)
+    restoreDefaultModel(ref);
+  }
 
   final settings = ref.read(appSettingsProvider);
   ref
@@ -5999,7 +7124,6 @@ Future<void> restoreDefaultModel(dynamic ref) async {
 typedef _ChatFeatureDefaults = ({
   bool webSearchEnabled,
   bool imageGenerationEnabled,
-  bool codeInterpreterEnabled,
 });
 
 Map<String, dynamic>? _asStringDynamicMap(dynamic value) {
@@ -6090,29 +7214,16 @@ _ChatFeatureDefaults _resolveChatFeatureDefaults({
         legacyKey: 'imageGenerationEnabled',
       ) ||
       defaultFeatureIds.contains('image_generation');
-  final codeInterpreterDefault =
-      _isAlwaysOnChatFeatureSetting(
-        userSettings,
-        uiKey: 'codeInterpreter',
-        legacyKey: 'codeInterpreterEnabled',
-      ) ||
-      defaultFeatureIds.contains('code_interpreter');
 
   return (
     webSearchEnabled: appSettings.chatWebSearchEnabled ?? webSearchDefault,
     imageGenerationEnabled:
         appSettings.chatImageGenerationEnabled ?? imageGenerationDefault,
-    codeInterpreterEnabled:
-        appSettings.chatCodeInterpreterEnabled ?? codeInterpreterDefault,
   );
 }
 
 @visibleForTesting
-({
-  bool webSearchEnabled,
-  bool imageGenerationEnabled,
-  bool codeInterpreterEnabled,
-})
+({bool webSearchEnabled, bool imageGenerationEnabled})
 resolveChatFeatureDefaultsForTest({
   required AppSettings appSettings,
   Map<String, dynamic>? userSettings,
@@ -6435,15 +7546,20 @@ final class _PreparedDirectDocuments {
   const _PreparedDirectDocuments({
     required this.files,
     required this.attachmentIds,
+    required this.ephemeralFilePartsByAttachmentId,
   });
 
   final List<Map<String, dynamic>> files;
   final Set<String> attachmentIds;
+  final Map<String, DirectFilePart> ephemeralFilePartsByAttachmentId;
 }
+
+const int _kDirectMaxAggregatePdfBytes = 2 * kDirectMaxLocalDocumentBytes;
 
 Future<_PreparedDirectDocuments> _prepareDirectDocuments(
   dynamic ref, {
   required List<String>? attachmentIds,
+  required bool supportsOpenRouterPdfInputs,
 }) async {
   final attachedStates =
       ref.read(attachedFilesProvider) as List<FileUploadState>;
@@ -6453,13 +7569,15 @@ Future<_PreparedDirectDocuments> _prepareDirectDocuments(
   };
   final references = <String>{};
   final sources = <DirectLocalDocumentSource>[];
+  final pdfStates = <String, FileUploadState>{};
 
   for (final attachmentId in attachmentIds ?? const <String>[]) {
     if (attachmentId.startsWith('data:image/')) continue;
     if (!references.add(attachmentId)) continue;
     final state = stateById[attachmentId];
     if (state == null || state.isImage == true) {
-      if (attachmentId.startsWith(kDirectLocalDocumentAttachmentPrefix)) {
+      if (attachmentId.startsWith(kDirectLocalDocumentAttachmentPrefix) ||
+          attachmentId.startsWith(kDirectOpenRouterPdfAttachmentPrefix)) {
         throw const DirectChatInputException(
           'This local document is no longer available. Attach it again.',
         );
@@ -6468,6 +7586,12 @@ Future<_PreparedDirectDocuments> _prepareDirectDocuments(
       continue;
     }
     if (!attachmentId.startsWith(kDirectLocalDocumentAttachmentPrefix)) {
+      if (supportsOpenRouterPdfInputs &&
+          attachmentId.startsWith(kDirectOpenRouterPdfAttachmentPrefix) &&
+          isDirectOpenRouterPdfFileNameSupported(state.fileName)) {
+        pdfStates[attachmentId] = state;
+        continue;
+      }
       throw const DirectChatInputException(
         'This direct model does not support this attachment.',
       );
@@ -6485,12 +7609,12 @@ Future<_PreparedDirectDocuments> _prepareDirectDocuments(
   final documents = await ref
       .read(directLocalDocumentServiceProvider)
       .prepareAll(sources);
-  if (documents.documents.isEmpty) {
-    return const _PreparedDirectDocuments(files: [], attachmentIds: {});
-  }
-  final signingKey = await ref.read(directDeviceTrustKeyProvider.future);
+  final signingKey = documents.documents.isEmpty
+      ? null
+      : await ref.read(directDeviceTrustKeyProvider.future);
   final files = <Map<String, dynamic>>[];
   final preparedAttachmentIds = <String>{};
+  final ephemeralFileParts = <String, DirectFilePart>{};
   for (final document in documents.documents) {
     final attachmentId = document.sourceId;
     if (attachmentId == null ||
@@ -6504,14 +7628,75 @@ Future<_PreparedDirectDocuments> _prepareDirectDocuments(
       directLocalDocumentDescriptor(
         document,
         attachmentId: attachmentId,
-        signingKey: signingKey,
+        signingKey: signingKey!,
       ),
     );
+  }
+  var aggregatePdfBytes = 0;
+  for (final entry in pdfStates.entries) {
+    final state = entry.value;
+    final projectedBytes = aggregatePdfBytes + await state.file.length();
+    if (projectedBytes > _kDirectMaxAggregatePdfBytes) {
+      throw const DirectChatInputException(
+        'The attached PDFs exceed the Direct attachment size limit.',
+      );
+    }
+    final bytes = await _readBoundedDirectPdf(state.file);
+    aggregatePdfBytes += bytes.length;
+    if (aggregatePdfBytes > _kDirectMaxAggregatePdfBytes) {
+      throw const DirectChatInputException(
+        'The attached PDFs exceed the Direct attachment size limit.',
+      );
+    }
+    final attachmentId = entry.key;
+    preparedAttachmentIds.add(attachmentId);
+    ephemeralFileParts[attachmentId] = DirectFilePart(
+      filename: state.fileName,
+      dataUrl: 'data:application/pdf;base64,${base64Encode(bytes)}',
+    );
+    files.add(<String, dynamic>{
+      'type': 'file',
+      'source': 'direct_openrouter_pdf',
+      'url': attachmentId,
+      'name': state.fileName,
+      'filename': state.fileName,
+      'size': bytes.length,
+      'content_type': 'application/pdf',
+    });
   }
   return _PreparedDirectDocuments(
     files: List<Map<String, dynamic>>.unmodifiable(files),
     attachmentIds: Set<String>.unmodifiable(preparedAttachmentIds),
+    ephemeralFilePartsByAttachmentId: Map<String, DirectFilePart>.unmodifiable(
+      ephemeralFileParts,
+    ),
   );
+}
+
+Future<Uint8List> _readBoundedDirectPdf(File file) async {
+  final builder = BytesBuilder(copy: false);
+  var length = 0;
+  await for (final chunk in file.openRead()) {
+    length += chunk.length;
+    if (length > kDirectMaxLocalDocumentBytes) {
+      throw const DirectChatInputException(
+        'This PDF exceeds the Direct attachment size limit.',
+      );
+    }
+    builder.add(chunk);
+  }
+  final bytes = builder.takeBytes();
+  if (bytes.length < 5 ||
+      bytes[0] != 0x25 ||
+      bytes[1] != 0x50 ||
+      bytes[2] != 0x44 ||
+      bytes[3] != 0x46 ||
+      bytes[4] != 0x2d) {
+    throw const DirectChatInputException(
+      'This attachment is not a valid PDF document.',
+    );
+  }
+  return bytes;
 }
 
 Future<_PreparedHermesTurn> _prepareHermesTurn(
@@ -7194,6 +8379,9 @@ Future<void> _regenerateDirectMessage(
   final enableWebSearch =
       ref.read(webSearchEnabledProvider) &&
       ref.read(webSearchAvailableProvider);
+  final enableImageGeneration =
+      ref.read(imageGenerationEnabledProvider) &&
+      ref.read(imageGenerationAvailableProvider);
   final active = ref.read(activeConversationProvider) as Conversation?;
   if (active == null) throw StateError('No active conversation');
   final directMutationOwner = captureChatMutationOwner(ref, active);
@@ -7228,9 +8416,12 @@ Future<void> _regenerateDirectMessage(
   }
   if (userIndex < 0) return;
 
-  final previousAssistant = existing.lastOrNull?.role == 'assistant'
+  final visiblePreviousAssistant = existing.lastOrNull?.role == 'assistant'
       ? existing.last
       : null;
+  final previousAssistant = visiblePreviousAssistant == null
+      ? null
+      : _directRegenerationCompletedBase(visiblePreviousAssistant);
   final assistantId = previousAssistant?.id ?? const Uuid().v4();
   final metadata = <String, dynamic>{
     ...?previousAssistant?.metadata,
@@ -7372,8 +8563,23 @@ Future<void> _regenerateDirectMessage(
       });
       if (!registry.isLatest(reservation)) return;
     }
+    final replayAnnotationEnvelope =
+        previousAssistant?.metadata?[kOpenRouterFileAnnotationsMetadataKey];
     final requestMessages = withDirectConversationSystemPrompt(
-      messages: existing.sublist(0, userIndex + 1),
+      messages: <ChatMessage>[
+        ...existing.sublist(0, userIndex + 1),
+        if (replayAnnotationEnvelope != null)
+          ChatMessage(
+            id: 'direct-openrouter-regeneration-annotations',
+            role: 'assistant',
+            content: '',
+            timestamp: DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+            metadata: <String, dynamic>{
+              'transport': kDirectTransport,
+              kOpenRouterFileAnnotationsMetadataKey: replayAnnotationEnvelope,
+            },
+          ),
+      ],
       systemPrompt: active.systemPrompt,
     );
     await _dispatchDirectRunFromChat(
@@ -7397,6 +8603,7 @@ Future<void> _regenerateDirectMessage(
       reservation: reservation,
       preflightCancelToken: preflightCancelToken,
       enableWebSearch: enableWebSearch,
+      enableImageGeneration: enableImageGeneration,
       reasoningEffort: reasoningEffort,
     );
   } on _DirectOpenWebUiAuthSessionChanged {
@@ -7452,7 +8659,13 @@ Future<void> _regenerateDirectMessage(
                   .firstOrNull
             : null) ??
         assistant;
-    final stoppedSnapshot = stopped.copyWith(isStreaming: false);
+    // Regeneration replaces the previous answer with a same-id placeholder
+    // before attachment/message preflight. If that preflight is cancelled,
+    // restore the completed answer rather than making the empty replacement
+    // the default visible and durable version.
+    final stoppedSnapshot =
+        previousAssistant?.copyWith(isStreaming: false) ??
+        stopped.copyWith(isStreaming: false);
     if (ownerIsActive) {
       notifier.updateMessageById(assistant.id, (_) => stoppedSnapshot);
     }
@@ -7944,9 +9157,6 @@ Future<void> regenerateMessage(
     final imageGenerationEnabled =
         (forceImageGeneration || ref.read(imageGenerationEnabledProvider)) &&
         ref.read(imageGenerationAvailableProvider);
-    final codeInterpreterEnabled =
-        ref.read(codeInterpreterEnabledProvider) &&
-        ref.read(codeInterpreterAvailableProvider);
 
     final modelItem = _buildLocalModelItem(
       selectedModel,
@@ -8087,7 +9297,6 @@ Future<void> regenerateMessage(
         filterIds: selectedFilterIds.isNotEmpty ? selectedFilterIds : null,
         enableWebSearch: webSearchEnabled,
         enableImageGeneration: imageGenerationEnabled,
-        enableCodeInterpreter: codeInterpreterEnabled,
         modelItem: modelItem,
         sessionIdOverride: socketSessionId,
         toolServers: toolServers,
@@ -8429,7 +9638,6 @@ Future<void> runQueuedCompletion(
   String? terminalId,
   bool enableWebSearch = false,
   bool enableImageGeneration = false,
-  bool enableCodeInterpreter = false,
   String? sessionIdOverride,
   OpenWebUiCompletionOwner? completionOwner,
 }) async {
@@ -8574,7 +9782,6 @@ Future<void> runQueuedCompletion(
       filterIds: selectedFilterIds.isNotEmpty ? selectedFilterIds : null,
       enableWebSearch: enableWebSearch,
       enableImageGeneration: enableImageGeneration,
-      enableCodeInterpreter: enableCodeInterpreter,
       modelItem: modelItem,
       sessionIdOverride: socketSessionId,
       toolServers: toolServers,
@@ -8698,7 +9905,6 @@ Future<void> runHeadlessCompletion(
   String? terminalId,
   bool enableWebSearch = false,
   bool enableImageGeneration = false,
-  bool enableCodeInterpreter = false,
   String? sessionIdOverride,
   OpenWebUiCompletionOwner? completionOwner,
 }) async {
@@ -8810,7 +10016,6 @@ Future<void> runHeadlessCompletion(
     filterIds: filterIds.isNotEmpty ? filterIds : null,
     enableWebSearch: enableWebSearch,
     enableImageGeneration: enableImageGeneration,
-    enableCodeInterpreter: enableCodeInterpreter,
     modelItem: modelItem,
     sessionIdOverride: socketSessionId,
     toolServers: toolServers,
@@ -9530,12 +10735,6 @@ Future<void> durableSend(
   final imageGenerationEnabled =
       ref.read(imageGenerationEnabledProvider) &&
       ref.read(imageGenerationAvailableProvider);
-  final codeInterpreterEnabled =
-      ref.read(codeInterpreterEnabledProvider) &&
-      ref.read(codeInterpreterAvailableProvider);
-  if (codeInterpreterEnabled) {
-    PyodideCodeRunner.instance.warmUp();
-  }
 
   final existingMessages = ref.read(chatMessagesProvider);
   final parentId = _resolveOpenWebUiParentIdForNewUserMessage(existingMessages);
@@ -9624,7 +10823,6 @@ Future<void> durableSend(
       terminalId: terminalIdForCompletion,
       enableWebSearch: webSearchEnabled,
       enableImageGeneration: imageGenerationEnabled,
-      enableCodeInterpreter: codeInterpreterEnabled,
     );
 
     var activeConversation = activeAtSendStart;
@@ -13076,6 +14274,15 @@ Future<_ResolvedDirectRoute?> _resolveDirectRoute(
   return (model: selectedModel, binding: binding, profile: profile);
 }
 
+bool _directRouteIsStillSelected(dynamic ref, _ResolvedDirectRoute route) {
+  final selectedModel = ref.read(selectedModelProvider) as Model?;
+  if (selectedModel == null || selectedModel.id != route.model.id) return false;
+  return identical(
+    ref.read(directModelRegistryProvider).resolve(selectedModel),
+    route.binding,
+  );
+}
+
 String _openWebUiDirectWireModelId(_ResolvedDirectRoute route) {
   final wireModelId = route.binding.openWebUiModelId;
   if (wireModelId == null || wireModelId.isEmpty) {
@@ -13904,7 +15111,9 @@ Future<void> _dispatchDirectRunFromChat(
   required DirectRunReservation reservation,
   required CancelToken preflightCancelToken,
   required bool enableWebSearch,
+  required bool enableImageGeneration,
   required String? reasoningEffort,
+  Map<String, DirectFilePart> ephemeralFilePartsByAttachmentId = const {},
   ChatSendPlaceholderHandle? sendHandle,
 }) async {
   final DirectRunRegistry registry = ref.read(directRunRegistryProvider);
@@ -13967,7 +15176,9 @@ Future<void> _dispatchDirectRunFromChat(
       reservation: reservation,
       preflightCancelToken: preflightCancelToken,
       enableWebSearch: enableWebSearch,
+      enableImageGeneration: enableImageGeneration,
       reasoningEffort: reasoningEffort,
+      ephemeralFilePartsByAttachmentId: ephemeralFilePartsByAttachmentId,
     );
   } finally {
     stopIndex.untrack(indexedRunKey);
@@ -14001,7 +15212,9 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
   required DirectRunReservation reservation,
   required CancelToken preflightCancelToken,
   required bool enableWebSearch,
+  required bool enableImageGeneration,
   required String? reasoningEffort,
+  Map<String, DirectFilePart> ephemeralFilePartsByAttachmentId = const {},
 }) async {
   final notifier =
       ref.read(chatMessagesProvider.notifier) as ChatMessagesNotifier;
@@ -14023,23 +15236,27 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
     return resolved;
   }
 
-  final hasDirectLocalDocuments = requestMessages.any(
-    (message) => (message.files ?? const <Map<String, dynamic>>[]).any(
-      (file) => file['source'] == 'direct_local',
-    ),
+  final needsDirectVerificationKey = requestMessages.any(
+    (message) =>
+        (message.files ?? const <Map<String, dynamic>>[]).any(
+          (file) => file['source'] == 'direct_local',
+        ) ||
+        message.metadata?[kOpenRouterFileAnnotationsMetadataKey] != null,
   );
   final directMessages = await _awaitDirectPreflightOrCancellation(
     registry: registry,
     reservation: reservation,
     cancelToken: preflightCancelToken,
     operation: () async {
-      final verificationKey = hasDirectLocalDocuments
+      final verificationKey = needsDirectVerificationKey
           ? await ref.read(directDeviceTrustKeyProvider.future)
           : null;
       return buildDirectChatMessages(
         messages: requestMessages,
         resolveImage: resolveImage,
         directDocumentVerificationKey: verificationKey,
+        openRouterProfile: route.profile.isOpenRouter ? route.profile : null,
+        ephemeralFilePartsByAttachmentId: ephemeralFilePartsByAttachmentId,
       );
     },
   );
@@ -14052,6 +15269,9 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
     messages: directMessages,
   );
   if (registry.isCancelled(reservation)) {
+    throw const _DirectRunStoppedDuringPreflight();
+  }
+  if (!_directRouteIsStillSelected(ref, route)) {
     throw const _DirectRunStoppedDuringPreflight();
   }
   final DirectProviderAdapter adapter = ref
@@ -14078,6 +15298,16 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
     maxWorkUnits: streamLimits.maxWorkUnits,
   );
   late final DirectCompletionRun run;
+  final consumesImageGenerationAction =
+      route.profile.isOpenRouter &&
+      enableImageGeneration &&
+      ref.read(imageGenerationEnabledProvider);
+  if (consumesImageGenerationAction) {
+    // OpenRouter image generation is a one-shot composer action. Consume it
+    // at the provider submission boundary so canceled preflight keeps the
+    // user's intent, while send and regeneration share the same behavior.
+    ref.read(imageGenerationEnabledProvider.notifier).set(false);
+  }
   try {
     run = adapter.startCompletion(
       route.profile,
@@ -14085,6 +15315,11 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
         remoteModelId: route.binding.remoteModelId,
         messages: directMessages,
         enableWebSearch: enableWebSearch,
+        enableImageGeneration: enableImageGeneration,
+        imageGenerationModel:
+            route.profile.isOpenRouter && enableImageGeneration
+            ? ref.read(appSettingsProvider).openRouterImageGenerationModel
+            : null,
         parameters:
             route.profile.adapterKey == kOllamaAdapterKey ||
                 reasoningEffort == null
@@ -14096,6 +15331,9 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
     // A runtime adapter can supply an arbitrary StackTrace. Throw the
     // normalized failure from this local boundary so downstream diagnostics
     // never persist or log provider-controlled stack text.
+    if (consumesImageGenerationAction) {
+      ref.read(imageGenerationEnabledProvider.notifier).set(true);
+    }
     throw _normalizeDirectDispatcherFailure(
       error,
       sensitiveValues: sensitiveProviderValues,
@@ -14118,6 +15356,7 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
     throw const _DirectRunStoppedDuringPreflight();
   }
   final accumulator = DirectStreamingAccumulator();
+  var generatedImageBytes = 0;
   Object? terminalFailure;
   StackTrace? terminalFailureStack;
   var uiProjectionIsCurrent = false;
@@ -14304,8 +15543,48 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
               ..addWork(normalizedUsage.nodes);
             normalizedEvent = DirectUsageUpdate(normalizedUsage.usage);
             break;
+          case DirectProviderMetadataUpdate():
+            final normalizedMetadata = normalizeDirectUsageMetadataWithCost(
+              event.metadata,
+            );
+            normalizedBudget
+              ..addCharacters(normalizedMetadata.stringCharacters)
+              ..addWork(normalizedMetadata.nodes);
+            normalizedEvent = DirectProviderMetadataUpdate(
+              normalizedMetadata.usage,
+            );
+            break;
+          case DirectFileAnnotationsUpdate():
+            final annotations = normalizeOpenRouterFileAnnotations(
+              event.annotations,
+            );
+            normalizedBudget.add(jsonEncode(annotations));
+            normalizedEvent = DirectFileAnnotationsUpdate(annotations);
+            break;
+          case DirectSourceFound():
+            normalizedBudget
+              ..add(event.url)
+              ..add(event.title ?? '')
+              ..add(event.snippet ?? '');
+            break;
+          case DirectGeneratedImage():
+            final normalizedImage = normalizeDirectGeneratedImage(
+              event,
+              maxDecodedBytes:
+                  kDirectMaxDecodedImageBytes - generatedImageBytes,
+            );
+            generatedImageBytes += normalizedImage.decodedBytes;
+            normalizedEvent = normalizedImage.image;
+            normalizedBudget.add(normalizedImage.image.mediaType);
+            break;
           case DirectStreamDone():
             break;
+        }
+        if (normalizedEvent is DirectStreamError &&
+            accumulator.hasGeneratedImages) {
+          // A generated asset is authoritative. A later parent narration
+          // failure settles the turn without attaching an error to the image.
+          normalizedEvent = const DirectStreamDone();
         }
         accumulator.apply(normalizedEvent);
         final projectedEvent =
@@ -14335,6 +15614,17 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
               assistantMessageId,
               (current) => current.copyWith(usage: accumulator.usage),
             );
+          } else if (projectedEvent is DirectProviderMetadataUpdate) {
+            notifier.updateMessageById(
+              assistantMessageId,
+              (current) => current.copyWith(
+                metadata: <String, dynamic>{
+                  ...?current.metadata,
+                  if (accumulator.providerMetadata != null)
+                    kDirectProviderMetadataKey: accumulator.providerMetadata,
+                },
+              ),
+            );
           } else if (projectedEvent is DirectStreamError) {
             notifier.updateMessageById(
               assistantMessageId,
@@ -14343,12 +15633,24 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
               ),
             );
           } else if (projectedEvent is DirectToolCallStarted ||
-              projectedEvent is DirectToolCallCompleted) {
+              projectedEvent is DirectToolCallCompleted ||
+              projectedEvent is DirectSourceFound) {
             notifier.updateMessageById(
               assistantMessageId,
               (current) => current.copyWith(
                 output: accumulator.toolOutput,
                 sources: accumulator.sources,
+              ),
+            );
+          } else if (projectedEvent is DirectGeneratedImage) {
+            notifier.updateMessageById(
+              assistantMessageId,
+              (current) => current.copyWith(
+                files: mergeDirectGeneratedImageFiles(
+                  current.files,
+                  accumulator.generatedImageFiles,
+                ),
+                usage: accumulator.usage,
               ),
             );
           }
@@ -14393,6 +15695,36 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
           uiProjectionIsCurrent = false;
           uiProjectionToken = null;
         }
+        if (projectedEvent is DirectGeneratedImage) {
+          final assetBase = _isDirectConversationOwnerActive(ref, owner)
+              ? (ref.read(chatMessagesProvider) as List<ChatMessage>)
+                    .where((message) => message.id == assistantMessageId)
+                    .firstOrNull
+              : null;
+          final assetSnapshot = (assetBase ?? assistantSeed).copyWith(
+            content: accumulator.render(done: false),
+            files: mergeDirectGeneratedImageFiles(
+              (assetBase ?? assistantSeed).files,
+              accumulator.generatedImageFiles,
+            ),
+            usage: accumulator.usage,
+            isStreaming: true,
+          );
+          // Local durability is independent of provider processing time. A
+          // slow database write must not consume the stream's duration budget
+          // and discard already-buffered acknowledgement events.
+          streamElapsed.stop();
+          try {
+            await _persistCompletedDirectAssistant(
+              ref,
+              owner: owner,
+              assistant: assetSnapshot,
+              isCurrentGeneration: () => registry.isLatest(reservation),
+            );
+          } finally {
+            streamElapsed.start();
+          }
+        }
         // The normalized terminal event is the protocol boundary. Provider
         // stream closure and transport cleanup are best-effort implementation
         // details and must not keep the completed message shimmering forever.
@@ -14428,7 +15760,40 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
     if (!registry.isLatest(reservation)) return;
     _requireDirectOwnerAuthSession(ref, owner);
 
+    Map<String, dynamic>? signedFileAnnotations;
+    if (route.profile.isOpenRouter && accumulator.fileAnnotations.isNotEmpty) {
+      try {
+        signedFileAnnotations = signedOpenRouterFileAnnotations(
+          annotations: accumulator.fileAnnotations,
+          signingKey: await ref.read(directDeviceTrustKeyProvider.future),
+          profile: route.profile,
+          attachmentIds: openRouterPdfAttachmentIdsForAnnotations(
+            ephemeralFilePartsByAttachmentId: ephemeralFilePartsByAttachmentId,
+            annotations: accumulator.fileAnnotations,
+          ),
+        );
+      } catch (error) {
+        DebugLogger.warning(
+          'file-annotation-signing-failed',
+          scope: 'direct-connections/openrouter',
+          data: {'errorType': error.runtimeType.toString()},
+        );
+      }
+    }
+    // Signing is best-effort and may suspend after the stream's auth listener
+    // has closed. Re-establish both generation and auth ownership before
+    // projecting or persisting provider output.
+    if (!registry.isLatest(reservation)) return;
+    _requireDirectOwnerAuthSession(ref, owner);
+
     final ownerIsActive = _isDirectConversationOwnerActive(ref, owner);
+    if (terminalFailure != null && accumulator.hasGeneratedImages) {
+      DebugLogger.warning(
+        'post-image-event-rejected',
+        scope: 'direct-connections/chat',
+        data: {'errorType': terminalFailure.runtimeType.toString()},
+      );
+    }
     final completedContent = accumulator.render(done: true);
     final visible = ownerIsActive
         ? (ref.read(chatMessagesProvider) as List<ChatMessage>)
@@ -14436,8 +15801,27 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
               .firstOrNull
         : null;
     final base = visible ?? assistantSeed;
+    final completedMetadata =
+        <String, dynamic>{
+            ...?base.metadata,
+            kDirectRawAssistantContentMetadataKey: accumulator.text,
+          }
+          ..remove(kDirectProviderMetadataKey)
+          ..remove(kOpenRouterFileAnnotationsMetadataKey);
+    if (accumulator.providerMetadata != null) {
+      completedMetadata[kDirectProviderMetadataKey] =
+          accumulator.providerMetadata;
+    }
+    if (signedFileAnnotations != null) {
+      completedMetadata[kOpenRouterFileAnnotationsMetadataKey] =
+          signedFileAnnotations;
+    }
     final completed = base.copyWith(
       content: completedContent,
+      files: mergeDirectGeneratedImageFiles(
+        base.files,
+        accumulator.generatedImageFiles,
+      ),
       output: <Map<String, dynamic>>[
         ...accumulator.toolOutput,
         ...?directProviderReplayOutput(
@@ -14450,14 +15834,11 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
         ),
       ],
       sources: accumulator.sources,
-      metadata: <String, dynamic>{
-        ...?base.metadata,
-        kDirectRawAssistantContentMetadataKey: accumulator.text,
-      },
+      metadata: completedMetadata,
       usage: accumulator.usage,
       error: accumulator.error != null
           ? ChatMessageError(content: accumulator.error!.message)
-          : terminalFailure != null
+          : terminalFailure != null && !accumulator.hasGeneratedImages
           ? ChatMessageError(
               content: chatErrorContentForException(terminalFailure),
             )
@@ -14491,7 +15872,7 @@ Future<void> _dispatchDirectRunFromChatWithTrackedOwner(
       rethrow;
     }
     registry.markDurablyPersisted(reservation);
-    if (terminalFailure != null) {
+    if (terminalFailure != null && !accumulator.hasGeneratedImages) {
       Error.throwWithStackTrace(terminalFailure, terminalFailureStack!);
     }
   } finally {
@@ -14533,6 +15914,9 @@ Future<void> _sendMessageInternal(
   final webSearchAtSendStart =
       ref.read(webSearchEnabledProvider) &&
       ref.read(webSearchAvailableProvider);
+  final imageGenerationAtSendStart =
+      ref.read(imageGenerationEnabledProvider) &&
+      ref.read(imageGenerationAvailableProvider);
   final usesHermes =
       selectedModelCandidate != null && isHermesModel(selectedModelCandidate);
   final HermesConfigController? hermesConfigController = usesHermes
@@ -14558,6 +15942,12 @@ Future<void> _sendMessageInternal(
       : null;
   if (!chatMutationTokenStillActive(ref, sendMutationOwner)) {
     throw StateError('The conversation changed while preparing the message.');
+  }
+  if (resolvedDirectRoute != null &&
+      !_directRouteIsStillSelected(ref, resolvedDirectRoute)) {
+    throw StateError(
+      'The selected direct connection changed while preparing the message.',
+    );
   }
   if (usesHermes &&
       (!hermesConfigController!.sessionActionAdmissionIsCurrent(
@@ -14633,10 +16023,21 @@ Future<void> _sendMessageInternal(
         )
       : null;
   final _PreparedDirectDocuments? preparedDirectDocuments = directRoute != null
-      ? await _prepareDirectDocuments(ref, attachmentIds: attachments)
+      ? await _prepareDirectDocuments(
+          ref,
+          attachmentIds: attachments,
+          supportsOpenRouterPdfInputs:
+              directRoute.profile.supportsOpenRouterPdfInputs,
+        )
       : null;
   if (!chatMutationTokenStillActive(ref, sendMutationOwner)) {
     throw StateError('The conversation changed while preparing the message.');
+  }
+  if (resolvedDirectRoute != null &&
+      !_directRouteIsStillSelected(ref, resolvedDirectRoute)) {
+    throw StateError(
+      'The selected direct connection changed while preparing the message.',
+    );
   }
   if (usesHermes &&
       (!hermesConfigController!.sessionActionAdmissionIsCurrent(
@@ -14756,6 +16157,30 @@ Future<void> _sendMessageInternal(
   final DirectRunRegistry? directRegistry = directRoute == null
       ? null
       : ref.read(directRunRegistryProvider);
+  if (directRoute != null && !_directRouteIsStillSelected(ref, directRoute)) {
+    // No durable owner or run reservation exists yet. Roll back the complete
+    // optimistic turn (including its parent edge) instead of leaving an empty,
+    // apparently completed assistant behind.
+    if (openWebUiParentId != null) {
+      messagesNotifier.updateMessageById(openWebUiParentId, (parent) {
+        final childrenIds = message_tree
+            .chatMessageChildrenIds(parent)
+            .where((id) => id != userMessageId)
+            .toList(growable: false);
+        return parent.copyWith(
+          metadata: <String, dynamic>{
+            ...?parent.metadata,
+            'childrenIds': childrenIds,
+          },
+        );
+      });
+    }
+    messagesNotifier.removeMessageById(assistantMessageId);
+    messagesNotifier.removeMessageById(userMessageId);
+    throw StateError(
+      'The selected direct connection changed while preparing the message.',
+    );
+  }
   final directStopIndex = directRoute == null
       ? null
       : ref.read(_directRunStopIndexProvider);
@@ -15123,7 +16548,11 @@ Future<void> _sendMessageInternal(
         reservation: reservation,
         preflightCancelToken: preflightCancelToken,
         enableWebSearch: webSearchAtSendStart,
+        enableImageGeneration: imageGenerationAtSendStart,
         reasoningEffort: reasoningEffortAtSendStart,
+        ephemeralFilePartsByAttachmentId:
+            preparedDirectDocuments?.ephemeralFilePartsByAttachmentId ??
+            const <String, DirectFilePart>{},
         sendHandle: sendHandle,
       );
       if (_isDirectConversationOwnerActive(ref, runOwner) &&
@@ -15575,14 +17004,6 @@ Future<void> _sendMessageInternal(
   final imageGenerationEnabled =
       ref.read(imageGenerationEnabledProvider) &&
       ref.read(imageGenerationAvailableProvider);
-  final codeInterpreterEnabled =
-      ref.read(codeInterpreterEnabledProvider) &&
-      ref.read(codeInterpreterAvailableProvider);
-  if (codeInterpreterEnabled) {
-    // Boot the on-device Pyodide runtime now so it's ready before the model
-    // emits its first execute:python event.
-    PyodideCodeRunner.instance.warmUp();
-  }
 
   // Get selected toggle filter IDs
   final selectedFilterIds = selectedFilterIdsForModel(ref, selectedModel);
@@ -15737,7 +17158,6 @@ Future<void> _sendMessageInternal(
         filterIds: filterIdsForApi,
         enableWebSearch: webSearchEnabled,
         enableImageGeneration: imageGenerationEnabled,
-        enableCodeInterpreter: codeInterpreterEnabled,
         isVoiceMode: isVoiceMode,
         modelItem: modelItem,
         sessionIdOverride: socketSessionId,
@@ -16486,14 +17906,20 @@ final regenerateLastMessageProvider = Provider<Future<void> Function()>((ref) {
 final stopGenerationProvider = Provider<void Function()>((ref) {
   return () {
     var stoppedClientOwnedRun = false;
+    var hadStreamingAssistant = false;
     try {
       final messages = ref.read(chatMessagesProvider);
       if (messages.isNotEmpty &&
           messages.last.role == 'assistant' &&
           messages.last.isStreaming) {
+        hadStreamingAssistant = true;
         final last = messages.last;
 
         if (last.metadata?['transport'] == kDirectTransport) {
+          // Transport metadata remains authoritative after process death even
+          // though the process-local registry is empty. Never let an orphaned
+          // direct checkpoint fall through to an unrelated OpenWebUI stop.
+          stoppedClientOwnedRun = true;
           final registry = ref.read(directRunRegistryProvider);
           final Conversation? active = ref.read(activeConversationProvider);
           final owner = active == null
@@ -16517,7 +17943,6 @@ final stopGenerationProvider = Provider<void Function()>((ref) {
               stop = registry.cancel(cancellationKey);
             }
           }
-          stoppedClientOwnedRun = stop != null;
           _observeDetachedCancellation(
             stop,
             scope: 'direct-connections/cancel',
@@ -16529,6 +17954,17 @@ final stopGenerationProvider = Provider<void Function()>((ref) {
             ref
                 .read(chatMessagesProvider.notifier)
                 .completeStoppedDirectStreamingUi(last.id);
+          } else if (stop == null) {
+            ref
+                .read(chatMessagesProvider.notifier)
+                .finishStreamingMessage(
+                  last.id,
+                  ownerConversationId: active == null
+                      ? null
+                      : chatMutationOwnerScopeForConversation(active),
+                  requireConversationOwner: true,
+                  persistTurn: false,
+                );
           }
         } else if (last.metadata?['transport'] == kHermesTransport) {
           stoppedClientOwnedRun = true;
@@ -16586,6 +18022,8 @@ final stopGenerationProvider = Provider<void Function()>((ref) {
             .cancelActiveMessageStreamPreservingContent();
       }
     } catch (_) {}
+
+    if (!hadStreamingAssistant) return;
 
     // Client-owned direct and Hermes completions never create an OpenWebUI
     // completion task or requestCompletion outbox operation. Do not send a
@@ -16859,6 +18297,8 @@ Map<String, dynamic> _buildLocalModelItem(
         ],
     'capabilities': selectedModel.capabilities,
     'info': meta?['info'],
+    if (meta?['params'] != null) 'params': meta!['params'],
+    if (meta?['base_model_id'] != null) 'base_model_id': meta!['base_model_id'],
     // Routing-critical fields for pipe models
     if (meta?['pipe'] != null) 'pipe': meta!['pipe'],
     if (meta?['actions'] != null) 'actions': meta!['actions'],
@@ -16875,3 +18315,7 @@ Map<String, dynamic> _buildLocalModelItem(
           .toList(),
   };
 }
+
+@visibleForTesting
+Map<String, dynamic> buildLocalModelItemForTest(Model selectedModel) =>
+    _buildLocalModelItem(selectedModel);

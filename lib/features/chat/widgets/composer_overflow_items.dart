@@ -18,7 +18,6 @@ class ComposerOverflowActionIds {
   static const web = 'web';
   static const webSearch = 'webSearch';
   static const imageGeneration = 'imageGeneration';
-  static const codeInterpreter = 'codeInterpreter';
   static const _filterPrefix = 'filter:';
   static const _toolPrefix = 'tool:';
 
@@ -113,8 +112,6 @@ List<ComposerOverflowItem> buildComposerOverflowItems({
   required bool webSearchEnabled,
   required bool imageGenerationAvailable,
   required bool imageGenerationEnabled,
-  required bool codeInterpreterAvailable,
-  required bool codeInterpreterEnabled,
   required List<Tool> availableTools,
   required List<String> selectedToolIds,
   required List<ToggleFilter> availableFilters,
@@ -131,8 +128,6 @@ List<ComposerOverflowItem> buildComposerOverflowItems({
       webSearchEnabled: webSearchEnabled,
       imageGenerationAvailable: imageGenerationAvailable,
       imageGenerationEnabled: imageGenerationEnabled,
-      codeInterpreterAvailable: codeInterpreterAvailable,
-      codeInterpreterEnabled: codeInterpreterEnabled,
     ),
     ...buildComposerOverflowToolItems(
       availableTools: availableTools,
@@ -209,8 +204,6 @@ List<ComposerOverflowItem> buildComposerOverflowFeatureItems({
   required bool webSearchEnabled,
   required bool imageGenerationAvailable,
   required bool imageGenerationEnabled,
-  required bool codeInterpreterAvailable,
-  required bool codeInterpreterEnabled,
 }) {
   final items = <ComposerOverflowItem>[];
 
@@ -243,23 +236,6 @@ List<ComposerOverflowItem> buildComposerOverflowFeatureItems({
         materialIcon: Icons.image,
         sfSymbol: 'sparkles',
         selected: imageGenerationEnabled,
-        dismissesKeyboard: false,
-      ),
-    );
-  }
-
-  if (codeInterpreterAvailable) {
-    items.add(
-      ComposerOverflowItem(
-        id: ComposerOverflowActionIds.codeInterpreter,
-        kind: ComposerOverflowItemKind.toggle,
-        section: ComposerOverflowSection.features,
-        label: l10n.codeInterpreter,
-        subtitle: l10n.codeInterpreterDescription,
-        cupertinoIcon: CupertinoIcons.chevron_left_slash_chevron_right,
-        materialIcon: Icons.code,
-        sfSymbol: 'chevron.left.forwardslash.chevron.right',
-        selected: codeInterpreterEnabled,
         dismissesKeyboard: false,
       ),
     );
@@ -326,9 +302,6 @@ void setComposerOverflowSelection(
     case ComposerOverflowActionIds.imageGeneration:
       ref.read(imageGenerationEnabledProvider.notifier).set(selected);
       return;
-    case ComposerOverflowActionIds.codeInterpreter:
-      ref.read(codeInterpreterEnabledProvider.notifier).set(selected);
-      return;
   }
 
   final filterId = ComposerOverflowActionIds.filterIdFrom(actionId);
@@ -386,8 +359,6 @@ bool? composerOverflowSelectionState(WidgetRef ref, String actionId) {
       return ref.read(webSearchEnabledProvider);
     case ComposerOverflowActionIds.imageGeneration:
       return ref.read(imageGenerationEnabledProvider);
-    case ComposerOverflowActionIds.codeInterpreter:
-      return ref.read(codeInterpreterEnabledProvider);
   }
 
   final filterId = ComposerOverflowActionIds.filterIdFrom(actionId);

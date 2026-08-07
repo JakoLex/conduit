@@ -49,6 +49,8 @@ class SettingsService {
   static const String _highContrastKey = PreferenceKeys.highContrast;
   static const String _darkModeKey = PreferenceKeys.darkMode;
   static const String _defaultModelKey = PreferenceKeys.defaultModel;
+  static const String _openRouterImageGenerationModelKey =
+      PreferenceKeys.openRouterImageGenerationModel;
   // Voice input settings
   static const String _voiceLocaleKey = PreferenceKeys.voiceLocaleId;
   static const String _voiceHoldToTalkKey = PreferenceKeys.voiceHoldToTalk;
@@ -65,8 +67,6 @@ class SettingsService {
       PreferenceKeys.chatWebSearchEnabled;
   static const String _chatImageGenerationEnabledKey =
       PreferenceKeys.chatImageGenerationEnabled;
-  static const String _chatCodeInterpreterEnabledKey =
-      PreferenceKeys.chatCodeInterpreterEnabled;
   // Chat input behavior
   static const String _sendOnEnterKey = PreferenceKeys.sendOnEnterKey;
   // Voice silence duration for auto-stop (milliseconds)
@@ -246,6 +246,18 @@ class SettingsService {
     return PreferencesStore.remove(_defaultModelKey);
   }
 
+  /// Set the model used by OpenRouter's dedicated Image API.
+  static Future<void> setOpenRouterImageGenerationModel(String? modelId) {
+    final normalized = modelId?.trim();
+    if (normalized != null && normalized.isNotEmpty) {
+      return PreferencesStore.put(
+        _openRouterImageGenerationModelKey,
+        normalized,
+      );
+    }
+    return PreferencesStore.remove(_openRouterImageGenerationModelKey);
+  }
+
   /// Load all settings
   static Future<AppSettings> loadSettings() {
     return Future.value(
@@ -296,11 +308,11 @@ class SettingsService {
       _chatImageGenerationEnabledKey,
       settings.chatImageGenerationEnabled,
     );
-    await _putOrRemove(
-      _chatCodeInterpreterEnabledKey,
-      settings.chatCodeInterpreterEnabled,
-    );
     await _putOrRemove(_defaultModelKey, settings.defaultModel);
+    await _putOrRemove(
+      _openRouterImageGenerationModelKey,
+      settings.openRouterImageGenerationModel,
+    );
     await _putOrRemove(
       _voiceLocaleKey,
       normalizeVoiceLocaleId(settings.voiceLocaleId),
@@ -546,16 +558,6 @@ class SettingsService {
     return _putOrRemove(_chatImageGenerationEnabledKey, value);
   }
 
-  static Future<bool?> getChatCodeInterpreterEnabled() {
-    return Future.value(
-      PreferencesStore.getBool(_chatCodeInterpreterEnabledKey),
-    );
-  }
-
-  static Future<void> setChatCodeInterpreterEnabled(bool? value) {
-    return _putOrRemove(_chatCodeInterpreterEnabledKey, value);
-  }
-
   // Chat input behavior
   static Future<bool> getSendOnEnter() {
     final value = _getPreference<bool>(_sendOnEnterKey);
@@ -655,6 +657,9 @@ class SettingsService {
       highContrast: PreferencesStore.get<bool>(_highContrastKey) ?? false,
       darkMode: PreferencesStore.get<bool>(_darkModeKey) ?? true,
       defaultModel: PreferencesStore.get<String>(_defaultModelKey),
+      openRouterImageGenerationModel: PreferencesStore.get<String>(
+        _openRouterImageGenerationModelKey,
+      ),
       voiceLocaleId: normalizeVoiceLocaleId(
         PreferencesStore.get<String>(_voiceLocaleKey),
       ),
@@ -669,9 +674,6 @@ class SettingsService {
       ),
       chatImageGenerationEnabled: PreferencesStore.get<bool>(
         _chatImageGenerationEnabledKey,
-      ),
-      chatCodeInterpreterEnabled: PreferencesStore.get<bool>(
-        _chatCodeInterpreterEnabledKey,
       ),
       sendOnEnter: PreferencesStore.get<bool>(_sendOnEnterKey) ?? false,
       ttsVoice: PreferencesStore.get<String>(PreferenceKeys.ttsVoice),
@@ -744,6 +746,7 @@ class AppSettings {
   final bool highContrast;
   final bool darkMode;
   final String? defaultModel;
+  final String? openRouterImageGenerationModel;
   final String? voiceLocaleId;
   final bool voiceHoldToTalk;
   final bool voiceAutoSendFinal;
@@ -751,7 +754,6 @@ class AppSettings {
   final List<String> quickPills; // e.g., ['web','image']
   final bool? chatWebSearchEnabled;
   final bool? chatImageGenerationEnabled;
-  final bool? chatCodeInterpreterEnabled;
   final bool sendOnEnter;
   final SttPreference sttPreference;
   final String? sttLanguageCode;
@@ -783,6 +785,7 @@ class AppSettings {
     this.highContrast = false,
     this.darkMode = true,
     this.defaultModel,
+    this.openRouterImageGenerationModel,
     this.voiceLocaleId,
     this.voiceHoldToTalk = false,
     this.voiceAutoSendFinal = false,
@@ -790,7 +793,6 @@ class AppSettings {
     this.quickPills = const [],
     this.chatWebSearchEnabled,
     this.chatImageGenerationEnabled,
-    this.chatCodeInterpreterEnabled,
     this.sendOnEnter = false,
     this.sttPreference = SttPreference.deviceOnly,
     this.sttLanguageCode,
@@ -823,6 +825,7 @@ class AppSettings {
     bool? highContrast,
     bool? darkMode,
     Object? defaultModel = const _DefaultValue(),
+    Object? openRouterImageGenerationModel = const _DefaultValue(),
     Object? voiceLocaleId = const _DefaultValue(),
     bool? voiceHoldToTalk,
     bool? voiceAutoSendFinal,
@@ -830,7 +833,6 @@ class AppSettings {
     List<String>? quickPills,
     bool? chatWebSearchEnabled,
     bool? chatImageGenerationEnabled,
-    bool? chatCodeInterpreterEnabled,
     bool? sendOnEnter,
     SttPreference? sttPreference,
     Object? sttLanguageCode = const _DefaultValue(),
@@ -865,6 +867,10 @@ class AppSettings {
       defaultModel: defaultModel is _DefaultValue
           ? this.defaultModel
           : defaultModel as String?,
+      openRouterImageGenerationModel:
+          openRouterImageGenerationModel is _DefaultValue
+          ? this.openRouterImageGenerationModel
+          : openRouterImageGenerationModel as String?,
       voiceLocaleId: voiceLocaleId is _DefaultValue
           ? this.voiceLocaleId
           : voiceLocaleId as String?,
@@ -875,8 +881,6 @@ class AppSettings {
       chatWebSearchEnabled: chatWebSearchEnabled ?? this.chatWebSearchEnabled,
       chatImageGenerationEnabled:
           chatImageGenerationEnabled ?? this.chatImageGenerationEnabled,
-      chatCodeInterpreterEnabled:
-          chatCodeInterpreterEnabled ?? this.chatCodeInterpreterEnabled,
       sendOnEnter: sendOnEnter ?? this.sendOnEnter,
       sttPreference: sttPreference ?? this.sttPreference,
       sttLanguageCode: sttLanguageCode is _DefaultValue
@@ -927,12 +931,13 @@ class AppSettings {
         other.highContrast == highContrast &&
         other.darkMode == darkMode &&
         other.defaultModel == defaultModel &&
+        other.openRouterImageGenerationModel ==
+            openRouterImageGenerationModel &&
         other.voiceLocaleId == voiceLocaleId &&
         other.voiceHoldToTalk == voiceHoldToTalk &&
         other.voiceAutoSendFinal == voiceAutoSendFinal &&
         other.chatWebSearchEnabled == chatWebSearchEnabled &&
         other.chatImageGenerationEnabled == chatImageGenerationEnabled &&
-        other.chatCodeInterpreterEnabled == chatCodeInterpreterEnabled &&
         other.sttPreference == sttPreference &&
         other.sttLanguageCode == sttLanguageCode &&
         other.sendOnEnter == sendOnEnter &&
@@ -969,12 +974,12 @@ class AppSettings {
       highContrast,
       darkMode,
       defaultModel,
+      openRouterImageGenerationModel,
       voiceLocaleId,
       voiceHoldToTalk,
       voiceAutoSendFinal,
       chatWebSearchEnabled,
       chatImageGenerationEnabled,
-      chatCodeInterpreterEnabled,
       sttPreference,
       sttLanguageCode,
       sendOnEnter,
@@ -1137,6 +1142,18 @@ class AppSettingsNotifier extends _$AppSettingsNotifier {
     await SettingsService.setDefaultModel(modelId);
   }
 
+  Future<void> setOpenRouterImageGenerationModel(String? modelId) async {
+    final pendingLoad = _pendingLoad;
+    if (pendingLoad != null) {
+      await pendingLoad;
+      if (!ref.mounted) return;
+    }
+    final normalized = modelId?.trim();
+    final value = normalized == null || normalized.isEmpty ? null : normalized;
+    state = state.copyWith(openRouterImageGenerationModel: value);
+    await SettingsService.setOpenRouterImageGenerationModel(value);
+  }
+
   Future<void> setVoiceLocaleId(String? localeId) async {
     final normalized = SettingsService.normalizeVoiceLocaleId(localeId);
     state = state.copyWith(voiceLocaleId: normalized);
@@ -1182,11 +1199,6 @@ class AppSettingsNotifier extends _$AppSettingsNotifier {
   Future<void> setChatImageGenerationEnabled(bool value) async {
     state = state.copyWith(chatImageGenerationEnabled: value);
     await SettingsService.setChatImageGenerationEnabled(value);
-  }
-
-  Future<void> setChatCodeInterpreterEnabled(bool value) async {
-    state = state.copyWith(chatCodeInterpreterEnabled: value);
-    await SettingsService.setChatCodeInterpreterEnabled(value);
   }
 
   Future<void> setSendOnEnter(bool value) async {

@@ -9,6 +9,8 @@ final class PreferenceKeys {
   static const String highContrast = 'high_contrast';
   static const String darkMode = 'dark_mode';
   static const String defaultModel = 'default_model';
+  static const String openRouterImageGenerationModel =
+      'openrouter_image_generation_model_v1';
   static const String voiceLocaleId = 'voice_locale_id';
   static const String voiceHoldToTalk = 'voice_hold_to_talk';
   static const String voiceAutoSendFinal = 'voice_auto_send_final';
@@ -19,8 +21,6 @@ final class PreferenceKeys {
   static const String chatWebSearchEnabled = 'chat_web_search_enabled';
   static const String chatImageGenerationEnabled =
       'chat_image_generation_enabled';
-  static const String chatCodeInterpreterEnabled =
-      'chat_code_interpreter_enabled';
   static const String sendOnEnterKey = 'send_on_enter';
   static const String activeServerId = 'active_server_id';
 
@@ -34,6 +34,11 @@ final class PreferenceKeys {
   static const String themePalette = 'theme_palette_v1';
   static const String localeCode = 'locale_code_v1';
   static const String reviewerMode = 'reviewer_mode_v1';
+  static const String lastSeenReleaseVersion = 'last_seen_release_version_v1';
+  static const String releaseNotesExistingInstallAtBootstrap =
+      'release_notes_existing_install_at_bootstrap_v1';
+  static const String releaseNotesBannerPreviousVersion =
+      'release_notes_banner_previous_version_v1';
   static const String ttsVoice = 'tts_voice';
   static const String ttsVoiceName = 'tts_voice_name';
   static const String ttsSpeechRate = 'tts_speech_rate';
