@@ -15,7 +15,6 @@ import '../../core/utils/tool_calls_parser.dart';
 import 'background_streaming_handler.dart';
 import 'chat_completion_transport.dart';
 import 'navigation_service.dart';
-import 'pyodide_code_runner.dart';
 
 import '../../shared/widgets/themed_dialogs.dart';
 import '../../shared/theme/theme_extensions.dart';
@@ -367,6 +366,7 @@ class _AssistantServerPatch {
     this.mergeMetadata = false,
     this.isStreaming,
     this.error,
+    this.clearError = false,
   });
 
   final String? content;
@@ -381,6 +381,7 @@ class _AssistantServerPatch {
   final bool mergeMetadata;
   final bool? isStreaming;
   final ChatMessageError? error;
+  final bool clearError;
 }
 
 /// Helper to handle reconnect recovery asynchronously with proper error handling.
@@ -459,6 +460,7 @@ ActiveChatStream attachUnifiedChunkedStreaming({
   required void Function(String) appendToLastMessage,
   required void Function(String) bufferLastMessageContent,
   void Function(String)? bufferProgressiveLastMessageContent,
+  void Function(String Function())? bufferProgressiveLastMessageSnapshot,
   required void Function(String) replaceLastMessageContent,
   required void Function(ChatMessage Function(ChatMessage))
   updateLastMessageWith,
@@ -826,12 +828,15 @@ ActiveChatStream attachUnifiedChunkedStreaming({
   var structuredOutputProfileFinished = false;
   var inReasoningBlock = false;
   var reasoningPrefix = '';
-  final reasoningContent = _StreamingTextAccumulator();
+  var reasoningContent = _StreamingTextAccumulator();
 
   void resetStreamingReasoning() {
     inReasoningBlock = false;
     reasoningPrefix = '';
-    reasoningContent.replace('');
+    // Use a fresh accumulator so a deferred visible snapshot can safely retain
+    // the completed generation until the notifier either realizes or replaces
+    // it.
+    reasoningContent = _StreamingTextAccumulator();
   }
 
   void finishStructuredOutputProfile({required bool abandoned}) {
@@ -1235,10 +1240,24 @@ ActiveChatStream attachUnifiedChunkedStreaming({
       syncRenderedStreamingContentFromState();
       inReasoningBlock = true;
       reasoningPrefix = renderedStreamingContent.value;
-      reasoningContent.replace('');
+      reasoningContent = _StreamingTextAccumulator();
     }
 
     reasoningContent.append(chunk);
+    final deferredSnapshot = bufferProgressiveLastMessageSnapshot;
+    if (deferredSnapshot != null) {
+      final activePrefix = reasoningPrefix;
+      final activeReasoning = reasoningContent;
+      deferredSnapshot(() {
+        final rendered = _prependReasoningDetails(
+          activePrefix,
+          _buildStreamingReasoningDetails(activeReasoning.value, done: false),
+        );
+        renderedStreamingContent.replace(rendered);
+        return rendered;
+      });
+      return;
+    }
     renderedStreamingContent.replace(
       _prependReasoningDetails(
         reasoningPrefix,
@@ -1820,7 +1839,9 @@ ActiveChatStream attachUnifiedChunkedStreaming({
               ? <String, dynamic>{...?current.metadata, ...patch.metadata!}
               : Map<String, dynamic>.from(patch.metadata!);
           final nextIsStreaming = patch.isStreaming ?? current.isStreaming;
-          final nextError = patch.error ?? current.error;
+          final nextError = patch.clearError
+              ? null
+              : patch.error ?? current.error;
           if (current.content == nextContent &&
               listEquals(current.followUps, nextFollowUps) &&
               _statusHistoriesEquivalent(
@@ -1945,10 +1966,14 @@ ActiveChatStream attachUnifiedChunkedStreaming({
 
   bool refreshingSnapshot = false;
   bool queuedSnapshotRefresh = false;
-  Future<void> refreshConversationSnapshot() async {
+  bool queuedAuthoritativeSnapshotRecovery = false;
+  Future<void> refreshConversationSnapshot({
+    bool recoverAuthoritativeState = false,
+  }) async {
     if (isObsoleteStream || ownsStreamContext?.call() == false) return;
     if (refreshingSnapshot) {
       queuedSnapshotRefresh = true;
+      queuedAuthoritativeSnapshotRecovery |= recoverAuthoritativeState;
       return;
     }
     final chatId = activeConversationId;
@@ -2037,13 +2062,31 @@ ActiveChatStream attachUnifiedChunkedStreaming({
               assistant.sources.isNotEmpty || !current.isStreaming
               ? assistant.sources
               : current.sources;
+          final authoritativeTerminal =
+              assistant.error != null ||
+              assistant.metadata?['responseDone'] == true;
+          final preserveActiveLocalStream =
+              current.isStreaming && !authoritativeTerminal;
+          final recoveredStreamingState =
+              !authoritativeTerminal &&
+              (preserveActiveLocalStream || assistant.isStreaming);
           return _AssistantServerPatch(
+            content: recoverAuthoritativeState ? assistant.content : null,
             followUps: nextFollowUps,
             statusHistory: nextStatusHistory,
             sources: nextSources,
             metadata: assistant.metadata,
             mergeMetadata: true,
             usage: effectiveUsage,
+            // Persisted Open WebUI snapshots commonly omit the transient
+            // streaming flag. During replay-gap recovery, preserve an active
+            // local task until an explicit terminal marker/error or the normal
+            // completion watchdog authoritatively settles it.
+            isStreaming: recoverAuthoritativeState
+                ? recoveredStreamingState
+                : null,
+            error: recoverAuthoritativeState ? assistant.error : null,
+            clearError: recoverAuthoritativeState && assistant.error == null,
           );
         },
       );
@@ -2052,8 +2095,15 @@ ActiveChatStream attachUnifiedChunkedStreaming({
     } finally {
       refreshingSnapshot = false;
       if (queuedSnapshotRefresh && !isObsoleteStream) {
+        final recoverQueuedAuthoritativeState =
+            queuedAuthoritativeSnapshotRecovery;
         queuedSnapshotRefresh = false;
-        unawaited(refreshConversationSnapshot());
+        queuedAuthoritativeSnapshotRecovery = false;
+        unawaited(
+          refreshConversationSnapshot(
+            recoverAuthoritativeState: recoverQueuedAuthoritativeState,
+          ),
+        );
       }
     }
   }
@@ -3311,43 +3361,6 @@ ActiveChatStream attachUnifiedChunkedStreaming({
             ack(false);
           }
         }
-      } else if (type == 'execute:python' && payload != null) {
-        if (!matchesCurrentStreamSession(incomingSessionId)) {
-          return;
-        }
-        // Pyodide code-interpreter engine: the backend delegates Python
-        // execution to the client (same as the web app). Run it on-device via
-        // the headless Pyodide runtime and ack {stdout, stderr, result}.
-        if (ack != null) {
-          final map = _asStringMap(payload);
-          final code = map?['code']?.toString() ?? '';
-          DebugLogger.info(
-            'execute:python received',
-            scope: 'tools/pyodide',
-            data: {'codeChars': code.length},
-          );
-          if (code.trim().isEmpty) {
-            try {
-              ack(const PyodidePythonResult().toAck());
-            } catch (_) {}
-          } else {
-            () async {
-              final result = await PyodideCodeRunner.instance.run(code);
-              DebugLogger.info(
-                'execute:python completed',
-                scope: 'tools/pyodide',
-                data: {
-                  'stdoutChars': result.stdout.length,
-                  'stderrChars': result.stderr.length,
-                  'hasError': result.error != null,
-                },
-              );
-              try {
-                ack(result.toAck());
-              } catch (_) {}
-            }();
-          }
-        }
       } else if (type == 'execute' && payload != null) {
         if (!matchesCurrentStreamSession(incomingSessionId)) {
           return;
@@ -3737,6 +3750,14 @@ ActiveChatStream attachUnifiedChunkedStreaming({
       messageId: assistantMessageId,
       requireFocus: false,
       keepsAliveInBackground: true,
+      onReplayGap: (reason) {
+        DebugLogger.log(
+          'socket replay gap; requesting authoritative snapshot',
+          scope: 'streaming/helper',
+          data: {'reason': reason.name},
+        );
+        unawaited(refreshConversationSnapshot(recoverAuthoritativeState: true));
+      },
       handler: chatHandler,
     );
     if (localResourcesDisposed) {

@@ -20,10 +20,6 @@ class EnhancedAttachment extends ConsumerStatefulWidget {
   final bool isUserMessage;
   final bool disableAnimation;
 
-  /// Fit for image attachments. [BoxFit.contain] preserves the original aspect
-  /// ratio (no crop); defaults to [BoxFit.cover].
-  final BoxFit fit;
-
   const EnhancedAttachment({
     super.key,
     required this.attachmentId,
@@ -31,7 +27,6 @@ class EnhancedAttachment extends ConsumerStatefulWidget {
     this.constraints,
     this.isUserMessage = false,
     this.disableAnimation = false,
-    this.fit = BoxFit.cover,
   });
 
   @override
@@ -250,7 +245,6 @@ class _EnhancedAttachmentState extends ConsumerState<EnhancedAttachment> {
         constraints: widget.constraints,
         isUserMessage: widget.isUserMessage,
         disableAnimation: widget.disableAnimation,
-        fit: widget.fit,
       );
     }
 

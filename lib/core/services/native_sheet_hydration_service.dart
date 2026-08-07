@@ -61,6 +61,46 @@ class NativeSheetPresentationAdmission {
   void finish() => _active = false;
 }
 
+@visibleForTesting
+Future<bool> waitForNativeReasoningEffortHydration(
+  Future<Object?> hydration, {
+  Duration timeout = const Duration(seconds: 1),
+}) async {
+  try {
+    await hydration.timeout(timeout);
+    return true;
+  } on TimeoutException {
+    return false;
+  }
+}
+
+@visibleForTesting
+ReasoningEffortPolicy nativeModelSelectorReasoningEffortPolicy(
+  bool hydrated,
+  ReasoningEffortPolicy hydratedPolicy,
+) => hydrated ? hydratedPolicy : ReasoningEffortPolicy.unsupported;
+
+@visibleForTesting
+({ReasoningEffortPolicy policy, String value})
+nativeHydratedServerReasoningEffort({
+  required Model model,
+  required ServerModelReasoningEffort detail,
+  String? personalizationEffort,
+}) {
+  final modelEffort = detail.value ?? modelConfiguredReasoningEffort(model);
+  final policy = model.supportsReasoningEffort || modelEffort != null
+      ? ReasoningEffortPolicy.generic
+      : ReasoningEffortPolicy.unsupported;
+  return (
+    policy: policy,
+    value:
+        policy.effectiveConfiguredEffort(
+          modelEffort ?? personalizationEffort,
+        ) ??
+        kAutomaticReasoningEffort,
+  );
+}
+
 class NativeSheetHydrationService {
   NativeSheetHydrationService(this._ref);
 
@@ -128,12 +168,31 @@ class NativeSheetHydrationService {
       final effortModel = orderedModels
           .where((model) => model.id == selectedModelId)
           .firstOrNull;
-      final allowsCustomEffort =
-          effortModel != null &&
-          reasoningEffortAllowsCustomForModel(_ref.read, effortModel);
-      final effortOptions = effortModel == null
-          ? const <String>[]
-          : <String>[...kReasoningEffortOptions];
+      Future<ServerModelReasoningEffort>? effortHydration;
+      var effortHydrated = effortModel == null;
+      if (effortModel != null) {
+        final pendingEffortHydration = _ref.read(
+          serverModelReasoningEffortProvider(effortModel).future,
+        );
+        effortHydration = pendingEffortHydration;
+        effortHydrated = await waitForNativeReasoningEffortHydration(
+          pendingEffortHydration,
+        );
+        if (!effortHydrated) {
+          DebugLogger.warning(
+            'reasoning-effort-hydration-timeout',
+            scope: 'native-sheet/models',
+            data: {'modelId': effortModel.id},
+          );
+        }
+        if (!context.mounted) return null;
+      }
+      final effortPolicy = nativeModelSelectorReasoningEffortPolicy(
+        effortHydrated,
+        reasoningEffortPolicyForModel(_ref.read, effortModel),
+      );
+      final allowsCustomEffort = effortPolicy.allowsCustom;
+      final effortOptions = effortPolicy.options;
 
       final modelOptions = [
         ...leadingOptions,
@@ -178,7 +237,7 @@ class NativeSheetHydrationService {
         moreModelsTitle: l10n?.moreModels ?? 'More models',
         searchModelsTitle: l10n?.searchModels ?? 'Search models',
         reasoningEffortTitle: l10n?.reasoningEffort ?? 'Effort',
-        reasoningEffortValue: effortModel == null
+        reasoningEffortValue: effortModel == null || !effortHydrated
             ? kAutomaticReasoningEffort
             : reasoningEffortForModel(_ref.read, effortModel),
         reasoningEffortOptions: effortOptions,
@@ -188,7 +247,10 @@ class NativeSheetHydrationService {
           'low': l10n?.reasoningEffortLow ?? 'Low',
           'medium': l10n?.reasoningEffortMedium ?? 'Medium',
           'high': l10n?.reasoningEffortHigh ?? 'High',
+          'minimal': l10n?.reasoningEffortMinimal ?? 'Minimal',
+          'xhigh': l10n?.reasoningEffortExtraHigh ?? 'Extra high',
           'max': l10n?.reasoningEffortMaximum ?? 'Maximum',
+          'none': l10n?.reasoningEffortNone ?? 'None',
         },
         allowsCustomReasoningEffort: allowsCustomEffort,
         customReasoningEffortTitle:
@@ -200,13 +262,60 @@ class NativeSheetHydrationService {
                   .read(personalizationSettingsProvider.notifier)
                   .togglePinnedModel(modelId)
             : null,
-        onReasoningEffortChanged: effortModel == null
+        onReasoningEffortChanged: effortModel == null || !effortPolicy.visible
             ? null
             : (value) =>
                   setReasoningEffortForModel(_ref.read, effortModel, value),
         models: nativePresentationOptions,
         rethrowErrors: rethrowErrors,
       );
+      final lateEffortModel = effortHydrated ? null : effortModel;
+      final lateEffortHydration = effortHydrated ? null : effortHydration;
+      if (lateEffortModel != null && lateEffortHydration != null) {
+        unawaited(
+          lateEffortHydration
+              .then((detail) async {
+                if (!detail.canUsePersonalizationFallback ||
+                    !context.mounted ||
+                    !_modelSelectorHydration.isActive(
+                      activeHydrationGeneration,
+                    ) ||
+                    !identical(_ref.read(apiServiceProvider), api)) {
+                  return;
+                }
+                final hydrated = nativeHydratedServerReasoningEffort(
+                  model: lateEffortModel,
+                  detail: detail,
+                  personalizationEffort: _ref
+                      .read(personalizationSettingsProvider)
+                      .asData
+                      ?.value
+                      .reasoningEffort,
+                );
+                await bridge.updateModelSelectorReasoningEffort(
+                  presentationId: presentationId,
+                  value: hydrated.value,
+                  options: hydrated.policy.options,
+                  allowsCustom: hydrated.policy.allowsCustom,
+                  onReasoningEffortChanged: hydrated.policy.visible
+                      ? (value) => setReasoningEffortForModel(
+                          _ref.read,
+                          lateEffortModel,
+                          value,
+                        )
+                      : null,
+                );
+              })
+              .catchError((Object error, StackTrace stackTrace) {
+                DebugLogger.error(
+                  'native-model-effort-progressive-hydration-failed',
+                  scope: 'native-sheet/model-effort-hydration',
+                  error: error,
+                  stackTrace: stackTrace,
+                );
+              }),
+        );
+      }
       unawaited(
         avatarHydrator
             .hydrateModelOptions(
@@ -303,6 +412,9 @@ class NativeSheetHydrationService {
       case 'default-model':
         await _hydrateNativeDefaultModelDetail(ctx, l10n);
         return;
+      case 'default-image-generation-model':
+        await _hydrateNativeOpenRouterImageGenerationModelDetail(ctx, l10n);
+        return;
       case 'memory-manage':
         await _hydrateNativeMemoryManageDetail(ctx, l10n);
         return;
@@ -373,6 +485,11 @@ class NativeSheetHydrationService {
                 sfSymbol: 'number',
                 kind: NativeSheetItemKind.info,
               ),
+            NativeSheetItemConfig(
+              id: NativeSheetRoutes.releaseNotesManual,
+              title: l10n.releaseNotesTitle,
+              sfSymbol: 'sparkles',
+            ),
             NativeSheetItemConfig(
               id: 'github',
               title: l10n.githubRepository,
@@ -466,6 +583,12 @@ class NativeSheetHydrationService {
 
       final hasOpenWebUiAccount = _ref.read(openWebUiAccountAvailableProvider);
       final appSettings = _ref.read(appSettingsProvider);
+      final openRouterImageGenerationModelItem =
+          buildNativeOpenRouterImageGenerationModelItem(
+            l10n,
+            models: models,
+            selectedModelId: appSettings.openRouterImageGenerationModel,
+          );
       final defaultModelSubtitle =
           resolveNativeSheetModelName(models, appSettings.defaultModel) ??
           l10n.autoSelectDescription;
@@ -482,6 +605,7 @@ class NativeSheetHydrationService {
               subtitle: defaultModelSubtitle,
               sfSymbol: 'wand.and.stars',
             ),
+            ?openRouterImageGenerationModelItem,
             NativeSheetItemConfig(
               id: 'system-prompt',
               title: l10n.yourSystemPrompt,
@@ -514,6 +638,13 @@ class NativeSheetHydrationService {
             title: l10n.defaultModel,
             subtitle: l10n.autoSelectDescription,
           ),
+          if (openRouterImageGenerationModelItem != null)
+            buildNativeLoadingDetail(
+              l10n: l10n,
+              id: 'default-image-generation-model',
+              title: l10n.defaultImageGenerationModel,
+              subtitle: l10n.defaultImageGenerationModelDescription,
+            ),
           buildNativeLoadingDetail(
             l10n: l10n,
             id: 'system-prompt',
@@ -761,6 +892,12 @@ class NativeSheetHydrationService {
       if (!context.mounted) return;
 
       final appSettings = _ref.read(appSettingsProvider);
+      final openRouterImageGenerationModelItem =
+          buildNativeOpenRouterImageGenerationModelItem(
+            l10n,
+            models: models,
+            selectedModelId: appSettings.openRouterImageGenerationModel,
+          );
       final themeMode = _ref.read(appThemeModeProvider);
       final appLocale = _ref.read(appLocaleProvider);
       final activePalette = _ref.read(appThemePaletteProvider);
@@ -869,6 +1006,7 @@ class NativeSheetHydrationService {
               subtitle: defaultModelSubtitle,
               sfSymbol: 'wand.and.stars',
             ),
+            ?openRouterImageGenerationModelItem,
             if (hasOpenWebUiAccount)
               NativeSheetItemConfig(
                 id: 'quick-pills',
@@ -908,6 +1046,13 @@ class NativeSheetHydrationService {
             title: l10n.defaultModel,
             subtitle: l10n.autoSelectDescription,
           ),
+          if (openRouterImageGenerationModelItem != null)
+            buildNativeLoadingDetail(
+              l10n: l10n,
+              id: 'default-image-generation-model',
+              title: l10n.defaultImageGenerationModel,
+              subtitle: l10n.defaultImageGenerationModelDescription,
+            ),
           if (hasOpenWebUiAccount)
             buildNativeLoadingDetail(
               l10n: l10n,
@@ -1294,6 +1439,18 @@ class NativeSheetHydrationService {
       );
       await _patchNativeDetailError('default-model', l10n.failedToLoadModels);
     }
+  }
+
+  Future<void> _hydrateNativeOpenRouterImageGenerationModelDetail(
+    BuildContext context,
+    AppLocalizations l10n,
+  ) async {
+    final value =
+        _ref.read(appSettingsProvider).openRouterImageGenerationModel ?? '';
+    if (!context.mounted) return;
+    await _applyNativeDetail(
+      buildNativeOpenRouterImageGenerationModelDetail(l10n, value: value),
+    );
   }
 
   Future<void> _hydrateNativeAdvancedPromptDetail(

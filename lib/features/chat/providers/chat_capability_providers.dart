@@ -18,12 +18,6 @@ final imageGenerationEnabledProvider =
       ImageGenerationEnabledNotifier.new,
     );
 
-// Code interpreter (execute_code) enabled state - behaves like web search
-final codeInterpreterEnabledProvider =
-    NotifierProvider<CodeInterpreterEnabledNotifier, bool>(
-      CodeInterpreterEnabledNotifier.new,
-    );
-
 // Vision capable models provider
 final visionCapableModelsProvider =
     NotifierProvider<VisionCapableModelsNotifier, List<String>>(
@@ -67,25 +61,6 @@ class ImageGenerationEnabledNotifier extends Notifier<bool> {
           .read(appSettingsProvider.notifier)
           .setChatImageGenerationEnabled(value),
     );
-  }
-}
-
-class CodeInterpreterEnabledNotifier extends Notifier<bool> {
-  @override
-  bool build() => ref.watch(_chatFeatureDefaultsProvider).codeInterpreterEnabled;
-
-  void set(bool value) {
-    state = value;
-    unawaited(
-      ref
-          .read(appSettingsProvider.notifier)
-          .setChatCodeInterpreterEnabled(value),
-    );
-    // Pre-boot the on-device Pyodide runtime so the first execute:python
-    // event doesn't pay the cold-start cost while the server awaits the ack.
-    if (value) {
-      PyodideCodeRunner.instance.warmUp();
-    }
   }
 }
 

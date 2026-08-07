@@ -766,12 +766,21 @@ abstract class NativeSheetHostApi {
 
   bool dismiss();
 
+  bool requestAppStoreReview();
+
   @async
   String? presentModelSelector(PlatformNativeSheetModelSelectorRequest request);
 
   void updateModelSelectorModels(
     String presentationId,
     List<PlatformNativeSheetModelOption> models,
+  );
+
+  void updateModelSelectorReasoningEffort(
+    String presentationId,
+    String value,
+    List<String> options,
+    bool allowsCustom,
   );
 
   @async

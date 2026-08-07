@@ -3453,8 +3453,10 @@ class NativeDropdownHostApiSetup {
 protocol NativeSheetHostApi {
   func presentProfileMenu(config: PlatformNativeProfileSheetConfig, completion: @escaping (Result<Bool, Error>) -> Void)
   func dismiss() throws -> Bool
+  func requestAppStoreReview() throws -> Bool
   func presentModelSelector(request: PlatformNativeSheetModelSelectorRequest, completion: @escaping (Result<String?, Error>) -> Void)
   func updateModelSelectorModels(presentationId: String, models: [PlatformNativeSheetModelOption]) throws
+  func updateModelSelectorReasoningEffort(presentationId: String, value: String, options: [String], allowsCustom: Bool) throws
   func presentOptionsSelector(request: PlatformNativeSheetOptionsSelectorRequest, completion: @escaping (Result<String?, Error>) -> Void)
   func presentDatePicker(request: PlatformNativeSheetDatePickerRequest, completion: @escaping (Result<String?, Error>) -> Void)
   func presentTextEditor(request: PlatformNativeSheetTextEditorRequest, completion: @escaping (Result<PlatformNativeSheetActionResult?, Error>) -> Void)
@@ -3498,6 +3500,19 @@ class NativeSheetHostApiSetup {
     } else {
       dismissChannel.setMessageHandler(nil)
     }
+    let requestAppStoreReviewChannel = FlutterBasicMessageChannel(name: "dev.flutter.pigeon.conduit.NativeSheetHostApi.requestAppStoreReview\(channelSuffix)", binaryMessenger: binaryMessenger, codec: codec)
+    if let api = api {
+      requestAppStoreReviewChannel.setMessageHandler { _, reply in
+        do {
+          let result = try api.requestAppStoreReview()
+          reply(wrapResult(result))
+        } catch {
+          reply(wrapError(error))
+        }
+      }
+    } else {
+      requestAppStoreReviewChannel.setMessageHandler(nil)
+    }
     let presentModelSelectorChannel = FlutterBasicMessageChannel(name: "dev.flutter.pigeon.conduit.NativeSheetHostApi.presentModelSelector\(channelSuffix)", binaryMessenger: binaryMessenger, codec: codec)
     if let api = api {
       presentModelSelectorChannel.setMessageHandler { message, reply in
@@ -3530,6 +3545,24 @@ class NativeSheetHostApiSetup {
       }
     } else {
       updateModelSelectorModelsChannel.setMessageHandler(nil)
+    }
+    let updateModelSelectorReasoningEffortChannel = FlutterBasicMessageChannel(name: "dev.flutter.pigeon.conduit.NativeSheetHostApi.updateModelSelectorReasoningEffort\(channelSuffix)", binaryMessenger: binaryMessenger, codec: codec)
+    if let api = api {
+      updateModelSelectorReasoningEffortChannel.setMessageHandler { message, reply in
+        let args = message as! [Any?]
+        let presentationIdArg = args[0] as! String
+        let valueArg = args[1] as! String
+        let optionsArg = args[2] as! [String]
+        let allowsCustomArg = args[3] as! Bool
+        do {
+          try api.updateModelSelectorReasoningEffort(presentationId: presentationIdArg, value: valueArg, options: optionsArg, allowsCustom: allowsCustomArg)
+          reply(wrapResult(nil))
+        } catch {
+          reply(wrapError(error))
+        }
+      }
+    } else {
+      updateModelSelectorReasoningEffortChannel.setMessageHandler(nil)
     }
     let presentOptionsSelectorChannel = FlutterBasicMessageChannel(name: "dev.flutter.pigeon.conduit.NativeSheetHostApi.presentOptionsSelector\(channelSuffix)", binaryMessenger: binaryMessenger, codec: codec)
     if let api = api {

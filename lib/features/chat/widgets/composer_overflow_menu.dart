@@ -225,20 +225,18 @@ class _ComposerAttachmentKeyboardState
         )
         .toList();
 
-    // Ollama Cloud exposes a permission-aware native web-search tool even
-    // though direct connections cannot use OpenWebUI-managed tools.
+    // Trusted direct providers can expose Conduit-managed server tools even
+    // though they cannot use OpenWebUI-managed tools.
     final webSearchAvailable =
         !widget.localAttachmentsOnly && ref.watch(webSearchAvailableProvider);
     final webSearchEnabled =
         !widget.localAttachmentsOnly && ref.watch(webSearchEnabledProvider);
     final imageGenAvailable =
-        !restrictedMode && ref.watch(imageGenerationAvailableProvider);
+        !widget.localAttachmentsOnly &&
+        ref.watch(imageGenerationAvailableProvider);
     final imageGenEnabled =
-        !restrictedMode && ref.watch(imageGenerationEnabledProvider);
-    final codeInterpreterAvailable =
-        !restrictedMode && ref.watch(codeInterpreterAvailableProvider);
-    final codeInterpreterEnabled =
-        !restrictedMode && ref.watch(codeInterpreterEnabledProvider);
+        !widget.localAttachmentsOnly &&
+        ref.watch(imageGenerationEnabledProvider);
     final featureTiles =
         buildComposerOverflowFeatureItems(
           l10n: l10n,
@@ -246,8 +244,6 @@ class _ComposerAttachmentKeyboardState
           webSearchEnabled: webSearchEnabled,
           imageGenerationAvailable: imageGenAvailable,
           imageGenerationEnabled: imageGenEnabled,
-          codeInterpreterAvailable: codeInterpreterAvailable,
-          codeInterpreterEnabled: codeInterpreterEnabled,
         ).map((item) {
           return _buildOverflowItemTile(
             item: item,

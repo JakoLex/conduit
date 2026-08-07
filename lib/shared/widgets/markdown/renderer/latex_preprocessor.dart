@@ -1,7 +1,4 @@
-import 'package:adaptive_platform_ui/adaptive_platform_ui.dart';
-import 'package:conduit/l10n/app_localizations.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_tex/flutter_tex.dart';
 
 import '../../jovial_svg_image.dart';
@@ -50,13 +47,8 @@ class LatexPreprocessor {
   // Use zero-width spaces to avoid collisions with real
   // content. The prefix distinguishes block from inline.
 
-  // Placeholder tokens deliberately contain NO markdown-special characters
-  // (no `_`, `*`, etc). Underscores previously caused the markdown parser to
-  // tokenize the placeholder at the `_` positions while resolving emphasis
-  // (`*...*` / `**...**`), splitting it into fragments that no longer matched a
-  // known key, so inline math inside italic/bold leaked as the raw token.
-  static const _blockPrefix = '\u200B\u200BLATEXBLOCK';
-  static const _inlinePrefix = '\u200B\u200BLATEXINLINE';
+  static const _blockPrefix = '\u200B\u200BLATEX_BLOCK_';
+  static const _inlinePrefix = '\u200B\u200BLATEX_INLINE_';
   static const _suffix = '\u200B\u200B';
 
   // -- Pre-compiled regex patterns --
@@ -154,30 +146,6 @@ class LatexPreprocessor {
   /// needs to be called.
   bool containsPlaceholder(String text) =>
       text.contains(_blockPrefix) || text.contains(_inlinePrefix);
-
-  /// Restores placeholder tokens in [text] back to dollar-delimited LaTeX
-  /// (`$tex$` for inline, `$$tex$$` for block).
-  ///
-  /// Needed when a substring of the extracted document is captured and later
-  /// re-compiled by a *different* [LatexPreprocessor] — e.g. the body and
-  /// summary of reasoning / tool-call `<details>` blocks, whose markdown is
-  /// re-parsed in [LatexPreprocessor]-unaware isolation. Without this, those
-  /// nested placeholders are orphaned (the new preprocessor never registered
-  /// their keys) and leak as raw `LATEX_INLINE_n` text. Restoring lets the
-  /// re-compile re-extract the original expressions cleanly.
-  String restorePlaceholders(String text) {
-    if (!containsPlaceholder(text)) {
-      return text;
-    }
-    var result = text;
-    _blockExpressions.forEach((key, tex) {
-      result = result.replaceAll(key, '\$\$$tex\$\$');
-    });
-    _inlineExpressions.forEach((key, tex) {
-      result = result.replaceAll(key, '\$$tex\$');
-    });
-    return result;
-  }
 
   /// Splits [text] on LaTeX placeholders into segments.
   ///
@@ -284,10 +252,7 @@ class LatexPreprocessor {
             },
           );
 
-    return _CopyableLatex(
-      tex: tex,
-      child: _wrapLatexWidget(math, isBlock: isBlock),
-    );
+    return _wrapLatexWidget(math, isBlock: isBlock);
   }
 
   static Widget _wrapLatexWidget(Widget child, {required bool isBlock}) {
@@ -314,38 +279,6 @@ class LatexPreprocessor {
     if (match == null) return fontSize * 1.5;
     final exValue = double.tryParse(match.group(1)!) ?? 1.5;
     return exValue * fontSize * 0.5;
-  }
-}
-
-/// Wraps a rendered LaTeX widget so tapping it copies the LaTeX source to the
-/// clipboard (matching Open WebUI), with a brief confirmation toast.
-class _CopyableLatex extends StatelessWidget {
-  const _CopyableLatex({required this.tex, required this.child});
-
-  final String tex;
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () => _copy(context),
-      child: child,
-    );
-  }
-
-  void _copy(BuildContext context) {
-    final trimmed = tex.trim();
-    if (trimmed.isEmpty) return;
-    Clipboard.setData(ClipboardData(text: trimmed));
-    if (!context.mounted) return;
-    final l10n = AppLocalizations.of(context);
-    AdaptiveSnackBar.show(
-      context,
-      message: l10n?.copiedToClipboard ?? 'Copied to clipboard',
-      type: AdaptiveSnackBarType.success,
-      duration: const Duration(seconds: 2),
-    );
   }
 }
 

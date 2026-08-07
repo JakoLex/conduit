@@ -240,8 +240,6 @@ class _UserMessageBubbleState extends ConsumerState<UserMessageBubble> {
                   attachmentId: imageUrl,
                   isUserMessage: true,
                   isMarkdownFormat: false,
-                  // Single image: keep the original aspect ratio (no crop).
-                  fit: BoxFit.contain,
                   constraints: const BoxConstraints(
                     maxWidth: 280,
                     maxHeight: 350,
@@ -379,8 +377,6 @@ class _UserMessageBubbleState extends ConsumerState<UserMessageBubble> {
               child: EnhancedAttachment(
                 attachmentId: attachmentIds[0],
                 isUserMessage: true,
-                // Single image: keep the original aspect ratio (no crop).
-                fit: BoxFit.contain,
                 constraints: const BoxConstraints(
                   maxWidth: 280,
                   maxHeight: 350,

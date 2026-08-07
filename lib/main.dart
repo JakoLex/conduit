@@ -24,6 +24,7 @@ import 'core/services/native_sheet_bridge.dart';
 import 'core/services/native_sheet_hydration_service.dart';
 import 'core/services/navigation_service.dart';
 import 'core/services/performance_profiler.dart';
+import 'core/services/raster_media_policy.dart';
 import 'core/services/carplay_service.dart';
 import 'core/services/readiness_gated_secure_storage.dart';
 import 'core/services/settings_service.dart';
@@ -33,10 +34,13 @@ import 'core/utils/current_localizations.dart';
 import 'features/chat/services/request_completion_runner.dart';
 import 'features/chat/providers/text_to_speech_provider.dart';
 import 'features/chat/providers/chat_providers.dart' show restoreDefaultModel;
+import 'features/release_notes/release_notes_bootstrap.dart';
+import 'features/release_notes/release_notes_coordinator.dart';
+import 'features/release_notes/data/release_notes_repository.dart';
+import 'features/release_notes/release_notes_presenter.dart';
 import 'features/tools/providers/tools_providers.dart';
 import 'core/utils/debug_logger.dart';
 import 'core/utils/system_ui_style.dart';
-import 'shared/widgets/markdown/renderer/latex_rendering_server.dart';
 import 'core/models/tool.dart';
 
 import 'package:conduit/l10n/app_localizations.dart';
@@ -49,6 +53,8 @@ const bool _enableFlutterDriverExtension = bool.fromEnvironment(
   'ENABLE_FLUTTER_DRIVER_EXTENSION',
   defaultValue: false,
 );
+
+const _nativeSheetFollowUpDelay = Duration(milliseconds: 700);
 
 Locale? _localeFromNativeTag(String code) {
   final normalized = code.replaceAll('_', '-');
@@ -107,6 +113,7 @@ void main() {
   runZonedGuarded(
     () async {
       WidgetsFlutterBinding.ensureInitialized();
+      RasterMediaPolicy.configureGlobalImageCache();
       // Measure the complete Dart-side startup path, including the first plugin
       // calls. Package metadata is not required to paint the auth/theme shell;
       // ConduitUserAgent has a safe fallback until this best-effort update lands.
@@ -207,6 +214,7 @@ void main() {
       // Copy Hive-resident preferences into shared_preferences (PR-1 of the
       // Hive removal). Runs once; gated + crash-safe.
       await HivePrefsMigrator(hiveBoxes: hiveBoxes).migrateIfNeeded();
+      await captureReleaseNotesInstallProvenance();
       _startupTimeline?.instant('migration_complete');
 
       // Bound time-to-first-paint even if the platform call stalls. Provider
@@ -435,6 +443,14 @@ class _ConduitAppState extends ConsumerState<ConduitApp> {
         return;
       }
 
+      if (event.id == NativeSheetRoutes.releaseNotesManual) {
+        await _dismissNativeSheetBeforeFollowUp();
+        final context = NavigationService.context;
+        if (context == null || !context.mounted) return;
+        await _showManualReleaseNotes(context);
+        return;
+      }
+
       if (event.id.startsWith('tts-voice-pick:')) {
         await _handleNativeTtsVoicePick(event);
         return;
@@ -525,6 +541,12 @@ class _ConduitAppState extends ConsumerState<ConduitApp> {
                 .read(appSettingsProvider.notifier)
                 .setDefaultModel(modelId);
             await restoreDefaultModel(ref);
+          }
+        case 'default-image-generation-model':
+          if (value is String) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setOpenRouterImageGenerationModel(value);
           }
         case 'stt-silence-duration':
           final ms = switch (value) {
@@ -780,6 +802,34 @@ class _ConduitAppState extends ConsumerState<ConduitApp> {
     _nativeSheetDraftValues.remove('confirm-password');
   }
 
+  Future<void> _showManualReleaseNotes(BuildContext context) async {
+    final packageInfo = await ref.read(packageInfoProvider.future);
+    if (!context.mounted) return;
+
+    final allNotes = await const ReleaseNotesRepository().load(
+      Localizations.localeOf(context),
+    );
+    if (!context.mounted) return;
+    final notes = latestBundledReleaseNotesForVersion(
+      currentVersion: packageInfo.version,
+      notes: allNotes,
+    );
+    if (notes.isEmpty) return;
+
+    await showReleaseNotesSheet(
+      context: context,
+      currentVersion: packageInfo.version,
+      notes: notes,
+    );
+  }
+
+  Future<void> _dismissNativeSheetBeforeFollowUp() async {
+    await NativeSheetBridge.instance.dismiss();
+    // The platform channel returns before UIKit finishes dismissing the sheet.
+    // Presenting the next sheet inside that animation window can no-op on iOS.
+    await Future<void>.delayed(_nativeSheetFollowUpDelay);
+  }
+
   Future<void> _handleNativeTtsVoicePick(
     NativeSheetControlChanged event,
   ) async {
@@ -847,11 +897,6 @@ class _ConduitAppState extends ConsumerState<ConduitApp> {
   void _initializeAppState() {
     DebugLogger.auth('init', scope: 'app');
     ref.read(appStartupFlowProvider.notifier).start();
-    // Warm the MathJax rendering server now (post first-frame) so LaTeX is
-    // ready before the first formula is shown. Without this the server starts
-    // lazily during the first render and the initial formulas could fall back
-    // to raw source until the app was restarted.
-    LatexRenderingServer.prewarm();
   }
 
   @override
@@ -928,7 +973,9 @@ class _ConduitAppState extends ConsumerState<ConduitApp> {
 
           return Theme(
             data: materialTheme,
-            child: _KeyboardDismissOnScroll(child: safeChild),
+            child: ReleaseNotesCoordinator(
+              child: _KeyboardDismissOnScroll(child: safeChild),
+            ),
           );
         },
       ),
